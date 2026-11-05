@@ -91,7 +91,7 @@ if [ ! -f "$SYS/lib/libgnutls.a" ] || [ "$(cat "$WORK/.gnutls" 2>/dev/null)" != 
         --disable-full-test-suite --disable-valgrind-tests --with-default-trust-store-file= \
         --disable-dependency-tracking > configure.log 2>&1 || fail gnutls-configure config.log
      grep -E 'getentropy|getrandom' config.log | grep -E 'result|cv_func' | head -4
-     nice -n 19 make -j"$JOBS" > make.log 2>&1 || { grep -E 'error|Error' make.log | head -40; exit 1; }
+     nice -n 19 make -k -j"$JOBS" > make.log 2>&1 || { grep -E "error:|undefined" make.log | sort -u | cut -c1-300 | head -60; exit 1; }
      make install > /dev/null 2>&1 || fail gnutls-install make.log)
     echo "$GNUTLS_SHA256$(stamp gnutls)" > "$WORK/.gnutls"
     echo "gnutls $GNUTLS_VERSION: $(ls -l "$SYS/lib/libgnutls.a" | awk '{print $5}') bytes"
