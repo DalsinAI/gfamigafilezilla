@@ -10,6 +10,25 @@
 #include <netdb.h>
 #include <time.h>
 #include <wchar.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <pthread.h>
+/* pthread.h's cancellation-point wrappers are function-like macros
+ * (read(...) and the like) that break "::read" and members named read or
+ * close, as the GFOpenWX Toolkit's amigacompat.h says; nothing here is
+ * ever cancelled, so they go. */
+#undef close
+#undef fsync
+#undef read
+#undef write
+#undef sleep
+#undef usleep
+#undef creat
+#undef fcntl
+#undef open
+#undef nanosleep
+#undef readv
+#undef writev
 #ifdef __cplusplus
 extern "C" {
 #endif
