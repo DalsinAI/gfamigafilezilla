@@ -51,7 +51,8 @@ cp "$HERE/deps/amiga/include/fzamiga.h" "$SYS/include/"
 # ---- GMP (generic C for now: its m68k assembly is a later speed step)
 if [ ! -f "$SYS/lib/libgmp.a" ] || [ "$(cat "$WORK/.gmp" 2>/dev/null)" != "$GMP_SHA256$(stamp gmp)" ]; then
     fetch "$GMP_URL" "$GMP_SHA256" gmp.tar.xz; unpack gmp.tar.xz gmp
-    (cd "$WORK/gmp" && CC="$XCC" CFLAGS="$CF" LDFLAGS="$LF" CC_FOR_BUILD=gcc ./configure --host=m68k-amigaos \
+    # C17: its configure checks call functions declared with ()
+    (cd "$WORK/gmp" && CC="$XCC" CFLAGS="$CF -std=gnu17" LDFLAGS="$LF" CC_FOR_BUILD=gcc ./configure --host=m68k-amigaos \
         --build="$HOSTB" --prefix="$SYS" --disable-shared --enable-static --disable-assembly --disable-cxx \
         > configure.log 2>&1 || fail gmp-configure config.log
      nice -n 19 make -j"$JOBS" > make.log 2>&1 || fail gmp make.log
