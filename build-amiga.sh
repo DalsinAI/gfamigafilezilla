@@ -3,8 +3,8 @@
 # (fpuauto), on the GFOpenWX Toolkit. Stages, each again only when its
 # inputs change, so a run that stops at the time cap goes on next run:
 #   1 the stove probe, fpuauto, GMP, Nettle, GnuTLS (scripts/build-crypto.sh)
-#   2 libfilezilla, Argon2, fzssh (scripts/build-fz.sh)
-#   (next: the toolkit SDK, SQLite, FileZilla)
+#   2 libfilezilla, Argon2, fzssh, SQLite (scripts/build-fz.sh)
+#   3 the toolkit SDK, then FileZilla (scripts/build-filezilla.sh)
 #   STOVE=.../stoves/os32-gcc16-open6 OUT=out ./build-amiga.sh
 # Everything third-party is fetched at the versions filezilla.lock gives.
 # Copyright (c) 2026 AmiCradle Team
@@ -57,5 +57,21 @@ echo "crypto: $(( $(date +%s) - t0 )) s"
 # ---- 2: libfilezilla, Argon2, fzssh
 TC="$TC" WORK="$WORK" SYS="$SYS" JOBS=$JOBS sh "$HERE/scripts/build-fz.sh"
 echo "libfilezilla and fzssh: $(( $(date +%s) - t0 )) s"
+
+# ---- 3: the toolkit's SDK (when its commit changed), then FileZilla
+fetch gfopenwxtoolkit "$WXT_REPO" "$WXT_COMMIT"
+WXT="$WORK/deps/gfopenwxtoolkit"; WXB="$WORK/gfopenwx"
+if [ ! -x "$WXB/out/sdk/bin/wx-config" ] || [ "$(cat "$WXB/.rev" 2>/dev/null)" != "$WXT_COMMIT" ]; then
+    echo "toolkit $WXT_COMMIT: building its SDK"
+    st=0; STOVE="$STOVE" WORK="$WXB" OUT="$WXB/out" JOBS=$JOBS sh "$WXT/build-amiga.sh" > "$WORK/wx.log" 2>&1 || st=$?
+    [ "$st" = 0 ] || { tail -40 "$WORK/wx.log"; exit 1; }
+    [ -x "$WXB/out/sdk/bin/wx-config" ] || { tail -20 "$WORK/wx.log"; echo "toolkit SDK not finished this run"; exit 0; }
+    echo "$WXT_COMMIT" > "$WXB/.rev"
+    echo "toolkit: $(( $(date +%s) - t0 )) s"
+fi
+left=$(( ${BUDGET_TOTAL:-840} - ($(date +%s) - t0) ))
+[ "$left" -gt 60 ] || { echo "no time left for FileZilla this run"; exit 0; }
+TC="$TC" WORK="$WORK" SYS="$SYS" JOBS=$JOBS WXCONFIG="$WXB/out/sdk/bin/wx-config" FPUSPECS="$FA/fpuauto.specs" \
+    FPULIB="$FAL" OUT="$OUT" BUDGET=$left sh "$HERE/scripts/build-filezilla.sh"
 ls -l "$SYS/lib"/*.a
 echo "total: $(( $(date +%s) - t0 )) s"
