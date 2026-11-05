@@ -1,0 +1,47 @@
+# fzssh 1.4.0 (its crypt, core and client parts) and Argon2 as static
+# libraries, in place of fzssh's meson build. Run by scripts/build-fz.sh
+# with SRC (fzssh's tree), A2 (Argon2's tree), OBJ, SYS (the sysroot with
+# libfilezilla, Nettle and GMP), TC.
+# Copyright (c) 2026 AmiCradle Team
+
+CC  := $(TC)/bin/m68k-amigaos-gcc
+CXX := $(TC)/bin/m68k-amigaos-g++
+AR  := $(TC)/bin/m68k-amigaos-ar
+OPT := -m68040 -O2 -noixemul -fno-delete-null-pointer-checks
+CXXFLAGS := $(OPT) -std=gnu++20 -include fzamiga.h -I$(OBJ)/include -I$(SRC)/lib -I$(SYS)/include -I$(OBJ) -Wall -Wno-unused
+CFLAGS   := $(OPT) -std=gnu99 -I$(A2)/include -I$(A2)/src -DARGON2_NO_THREADS
+
+CRYPT  := crypt/bcrypt crypt/blowfish crypt/mlkem crypt/mlkem_impl crypt/util
+CORE   := asn1 buffer_util cipher ecc dh connection_protocol mac mpz pubkey privkey privkey_import \
+          transport sftp ssh userauth version
+CLIENT := client/agent client/client client/connection_protocol client/sftp_client client/transport client/userauth
+A2SRC  := argon2 core encoding ref blake2/blake2b
+
+all: $(SYS)/lib/libfzssh.a $(SYS)/lib/libargon2.a
+
+$(OBJ)/crypt/%.o: $(SRC)/lib/crypt/%.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -DBUILDING_FZSSH_CRYPT -c $< -o $@
+$(OBJ)/client/%.o: $(SRC)/lib/client/%.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -DBUILDING_FZSSH_CLIENT -c $< -o $@
+$(OBJ)/core/%.o: $(SRC)/lib/%.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -DBUILDING_FZSSH -c $< -o $@
+$(OBJ)/argon2/%.o: $(A2)/src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+FZOBJ := $(CRYPT:crypt/%=$(OBJ)/crypt/%.o) $(CORE:%=$(OBJ)/core/%.o) $(CLIENT:client/%=$(OBJ)/client/%.o)
+$(FZOBJ): $(OBJ)/include/fzssh/version.hpp $(OBJ)/config.hpp
+
+$(SYS)/lib/libfzssh.a: $(FZOBJ)
+	rm -f $@; $(AR) rcs $@ $^
+	mkdir -p $(SYS)/include/fzssh/sftp
+	cp $(SRC)/lib/fzssh/*.hpp $(OBJ)/include/fzssh/version.hpp $(SYS)/include/fzssh/
+	cp $(SRC)/lib/fzssh/sftp/*.hpp $(SYS)/include/fzssh/sftp/
+$(SYS)/lib/libargon2.a: $(A2SRC:%=$(OBJ)/argon2/%.o)
+	rm -f $@; $(AR) rcs $@ $^
+	cp $(A2)/include/argon2.h $(SYS)/include/
+
+.PHONY: all

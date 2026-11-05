@@ -1,0 +1,38 @@
+# What this port builds on: fetched at build time, never shipped.
+# Tarballs are pinned by sha256 (Ubuntu's pool keeps upstream's releases as
+# .orig tarballs), git sources by commit.
+U=http://archive.ubuntu.com/ubuntu/pool
+# FileZilla 3.71.0 (GPL v2 or later)
+FZ_VERSION=3.71.0
+FZ_URL=$U/universe/f/filezilla/filezilla_3.71.0.orig.tar.xz
+FZ_SHA256=bb107bafc2d8fedaf3d9dbb032b967611d4e29a298b10afa3b8bdff15592cc9b
+# libfilezilla 0.57.0 (GPL v2 or later)
+LFZ_VERSION=0.57.0
+LFZ_URL=$U/universe/libf/libfilezilla/libfilezilla_0.57.0.orig.tar.xz
+LFZ_SHA256=3a61251357ad7522e73b8d7348356e87092a1cd7c33d36f045fbea4730b8ff0b
+# fzssh 1.4.0: FileZilla's SFTP client library (GPL v2 or later)
+FZSSH_VERSION=1.4.0
+FZSSH_URL=$U/universe/f/fzssh/fzssh_1.4.0.orig.tar.xz
+FZSSH_SHA256=0c53178298364404e1fe4ce3d50267cf1238e52b414a6a53356bc43b37811338
+# GnuTLS 3.8.13 (LGPL v2.1 or later)
+GNUTLS_VERSION=3.8.13
+GNUTLS_URL=$U/main/g/gnutls28/gnutls28_3.8.13.orig.tar.xz
+GNUTLS_SHA256=ffed8ec1bf09c2426d4f14aae377de4753b53e537d685e604e99a8b16ca9c97e
+# Nettle 3.10.2 (LGPL v3 or GPL v2 or later)
+NETTLE_VERSION=3.10.2
+NETTLE_URL=$U/main/n/nettle/nettle_3.10.2.orig.tar.gz
+NETTLE_SHA256=fe9ff51cb1f2abb5e65a6b8c10a92da0ab5ab6eaf26e7fc2b675c45f1fb519b5
+# GMP 6.3.0 (LGPL v3 or GPL v2 or later)
+GMP_VERSION=6.3.0
+GMP_URL=$U/main/g/gmp/gmp_6.3.0+dfsg.orig.tar.xz
+GMP_SHA256=bd2966e6d277f79328e894a5a9f3ba3fbf2ed2be81def5f48623e30c23fb1572
+# Argon2 20190702 (CC0 or Apache 2.0): fzssh reads PuTTY's v3 key files with it
+ARGON2_VERSION=20190702
+ARGON2_URL=$U/main/a/argon2/argon2_0~20190702+dfsg.orig.tar.xz
+ARGON2_SHA256=815f1017b5b0033204778c2e32443257274bc5d9dd16d355c4f7db8189e23dcc
+# GFOpenWX Toolkit (wxWidgets on GFOpenLayout)
+WXT_REPO=https://github.com/DalsinAI/gfopenwxtoolkit
+WXT_COMMIT=e75e16f8278a2c93a23d4ba0fbf2b098c59c0ec4
+# fpuauto (amicradle-guest common/fpuauto): the FPU when there is one
+FPUAUTO_REPO=https://github.com/DalsinAI/amicradle-guest
+FPUAUTO_COMMIT=462f3a3ccb4cea314e1bb7f7cfaebda266073233
