@@ -1,11 +1,14 @@
 /* libccompat.c - the C library calls libfilezilla and FileZilla use that
- * libnix lacks: timegm(), wcsnlen() and the restartable UTF-8 conversions
+ * libnix lacks: timegm(), wcsnlen(), getprogname() and the restartable UTF-8 conversions
  * mbsrtowcs()/wcsrtombs() (the programs run their strings as UTF-8).
  * Copyright (c) 2026 AmiCradle Team */
 #include <errno.h>
 #include <string.h>
 #include <time.h>
 #include <wchar.h>
+#include <exec/tasks.h>
+#include <dos/dosextens.h>
+#include <proto/exec.h>
 #include "fzamiga.h"
 
 time_t timegm(struct tm *tm)
@@ -77,4 +80,26 @@ size_t wcsrtombs(char *dst, const wchar_t **src, size_t len, mbstate_t *ps)
         if (c == 0) { if (dst) *src = NULL; return n; }
         n += (size_t)k;
     }
+}
+
+/* the program's name: its CLI command name when run from a shell, else its
+ * task's name */
+const char *getprogname(void)
+{
+    static char name[64];
+    struct Process *me = (struct Process *)FindTask(NULL);
+    if (!name[0]) {
+        const char *n = me->pr_Task.tc_Node.ln_Name;
+        if (me->pr_CLI) {
+            struct CommandLineInterface *cli = (struct CommandLineInterface *)BADDR(me->pr_CLI);
+            const unsigned char *b = (const unsigned char *)BADDR(cli->cli_CommandName);
+            if (b && b[0]) {
+                size_t k = b[0] < sizeof name - 1 ? b[0] : sizeof name - 1;
+                memcpy(name, b + 1, k); name[k] = 0;
+            }
+        }
+        if (!name[0] && n) { strncpy(name, n, sizeof name - 1); }
+        if (!name[0]) strcpy(name, "FileZilla");
+    }
+    return name;
 }

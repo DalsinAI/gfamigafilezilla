@@ -42,6 +42,7 @@ int inet_pton(int af, const char *src, void *dst);
 const char *inet_ntop(int af, const void *src, char *dst, socklen_t size);
 int socketpair(int domain, int type, int protocol, int sv[2]);
 time_t timegm(struct tm *tm);
+const char *getprogname(void);
 size_t wcsnlen(const wchar_t *s, size_t maxlen);
 size_t mbsrtowcs(wchar_t *dst, const char **src, size_t len, mbstate_t *ps);
 size_t wcsrtombs(char *dst, const wchar_t **src, size_t len, mbstate_t *ps);

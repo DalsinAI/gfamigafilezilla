@@ -82,7 +82,9 @@ fi
 # ---- GnuTLS: the TLS library alone (no tools, p11-kit, IDN or compression)
 if [ ! -f "$SYS/lib/libgnutls.a" ] || [ "$(cat "$WORK/.gnutls" 2>/dev/null)" != "$GNUTLS_SHA256$(stamp gnutls)" ]; then
     fetch "$GNUTLS_URL" "$GNUTLS_SHA256" gnutls.tar.xz; unpack gnutls.tar.xz gnutls
-    (cd "$WORK/gnutls" && CC="$XCC" CFLAGS="$CF -I$SYS/include" LDFLAGS="$LF" \
+    # _GNU_SOURCE: the stove's headers declare vasprintf, nanosleep and the
+    # BSD types only with it, and gnulib replaces what it can't see
+    (cd "$WORK/gnutls" && CC="$XCC" CFLAGS="$CF -D_GNU_SOURCE -I$SYS/include" LDFLAGS="$LF" \
         LIBS="-lfzamiga -lsocket -lpthread" ./configure --host=m68k-amigaos --build="$HOSTB" --prefix="$SYS" \
         --disable-shared --enable-static --with-included-libtasn1 --with-included-unistring --without-p11-kit \
         --without-idn --without-zlib --without-brotli --without-zstd --without-tpm --without-tpm2 \
@@ -91,8 +93,10 @@ if [ ! -f "$SYS/lib/libgnutls.a" ] || [ "$(cat "$WORK/.gnutls" 2>/dev/null)" != 
         --disable-full-test-suite --disable-valgrind-tests --with-default-trust-store-file= \
         --disable-dependency-tracking > configure.log 2>&1 || fail gnutls-configure config.log
      grep -E 'getentropy|getrandom' config.log | grep -E 'result|cv_func' | head -4
-     nice -n 19 make -k -j"$JOBS" > make.log 2>&1 || { grep -E "error:|undefined" make.log | sort -u | cut -c1-300 | head -60; exit 1; }
-     make install > /dev/null 2>&1 || fail gnutls-install make.log)
+     # the library alone: gnulib's copy for it (gl) and lib, not src/ and its gnulib
+     { nice -n 19 make -k -j"$JOBS" -C gl && nice -n 19 make -k -j"$JOBS" -C lib; } > make.log 2>&1 \
+         || { grep -E "error:|undefined" make.log | sort -u | cut -c1-300 | head -60; exit 1; }
+     make -C lib install > /dev/null 2>&1 || fail gnutls-install make.log)
     echo "$GNUTLS_SHA256$(stamp gnutls)" > "$WORK/.gnutls"
     echo "gnutls $GNUTLS_VERSION: $(ls -l "$SYS/lib/libgnutls.a" | awk '{print $5}') bytes"
 fi
