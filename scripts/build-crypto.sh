@@ -51,6 +51,11 @@ cp "$HERE/deps/amiga/include/fzamiga.h" "$SYS/include/"
 # ---- GMP (generic C for now: its m68k assembly is a later speed step)
 if [ ! -f "$SYS/lib/libgmp.a" ] || [ "$(cat "$WORK/.gmp" 2>/dev/null)" != "$GMP_SHA256$(stamp gmp)" ]; then
     fetch "$GMP_URL" "$GMP_SHA256" gmp.tar.xz; unpack gmp.tar.xz gmp
+    # Debian's tarball leaves out the manual; an empty doc/ for configure
+    if [ ! -f "$WORK/gmp/doc/Makefile.in" ]; then
+        mkdir -p "$WORK/gmp/doc"
+        printf 'all install install-data install-exec install-strip uninstall check clean distclean mostlyclean maintainer-clean:\n\t@:\n.PHONY: all\n' > "$WORK/gmp/doc/Makefile.in"
+    fi
     # C17: its configure checks call functions declared with ()
     (cd "$WORK/gmp" && CC="$XCC" CFLAGS="$CF -std=gnu17" LDFLAGS="$LF" CC_FOR_BUILD=gcc ./configure --host=m68k-amigaos \
         --build="$HOSTB" --prefix="$SYS" --disable-shared --enable-static --disable-assembly --disable-cxx \
