@@ -36,3 +36,6 @@ WXT_COMMIT=a0b873661e0e3e0fc7753254b30538c4c21be855
 # fpuauto (amicradle-guest common/fpuauto): the FPU when there is one
 FPUAUTO_REPO=https://github.com/DalsinAI/amicradle-guest
 FPUAUTO_COMMIT=462f3a3ccb4cea314e1bb7f7cfaebda266073233
+# SQLite (public domain): the amalgamation Audacity 3.7.9 keeps in lib-src/sqlite
+SQLITE_GIT=https://github.com/audacity/audacity.git
+SQLITE_COMMIT=86d74c770974b25188ca2f23bcce47c1181bd08a

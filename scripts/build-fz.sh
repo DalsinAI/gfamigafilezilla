@@ -73,5 +73,36 @@ CFG
     nice -n 19 make -k -j"$JOBS" -f "$HERE/scripts/Makefile.fzssh" SRC="$WORK/fzssh" A2="$WORK/argon2" OBJ="$O" \
         SYS="$SYS" TC="$TC" > "$WORK/fzssh.log" 2>&1 || { grep -E 'error|Error' "$WORK/fzssh.log" | cut -c1-300 | head -60; exit 1; }
     echo "$FZSSH_SHA256$ARGON2_SHA256$(stamp fzssh)$(sha256sum < "$HERE/scripts/Makefile.fzssh" | cut -c1-16)" > "$WORK/.fzssh"
+    # one library for fzssh's three (crypt, core, client), under the name
+    # FileZilla's configure asks pkg-config for
+    printf 'prefix=%s\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n\nName: libfzssh-client\nDescription: fzssh client\nVersion: %s\nRequires: libfilezilla nettle hogweed\nLibs: -L${libdir} -lfzssh -largon2\nCflags: -I${includedir}\n' "$SYS" "$FZSSH_VERSION" > "$SYS/lib/pkgconfig/libfzssh-client.pc"
     echo "fzssh $FZSSH_VERSION: $(ls -l "$SYS/lib/libfzssh.a" | awk '{print $5}') bytes"
+fi
+
+# ---- SQLite (FileZilla's queue and settings), with our file system layer
+if [ ! -f "$SYS/lib/libsqlite3.a" ] || [ "$(cat "$WORK/.sqlite" 2>/dev/null)" != "$SQLITE_COMMIT$(stamp sqlite)$(sha256sum < "$HERE/deps/amiga/sqlite_amiga.c" | cut -c1-16)" ]; then
+    Q="$WORK/sqlite-src"
+    if [ "$(cat "$Q/.commit" 2>/dev/null)" != "$SQLITE_COMMIT" ]; then
+        rm -rf "$Q"; mkdir -p "$Q"; git -C "$Q" init -q
+        git -C "$Q" fetch -q --depth 1 --filter=blob:none "$SQLITE_GIT" "$SQLITE_COMMIT"
+        git -C "$Q" checkout -q FETCH_HEAD -- lib-src/sqlite
+        echo "$SQLITE_COMMIT" > "$Q/.commit"
+    fi
+    rm -rf "$WORK/sqlite"; cp -R "$Q/lib-src/sqlite" "$WORK/sqlite"
+    for p in "$HERE"/patches/sqlite-*.patch; do
+        patch -s -d "$WORK/sqlite" -p1 < "$p" || { echo "patch failed: $p"; exit 1; }
+    done
+    O="$WORK/obj/sqlite"; rm -rf "$O"; mkdir -p "$O"
+    # no mmap (no shared-memory WAL index: a rollback journal), temporary
+    # tables in memory (no /tmp), our layer made the default at start
+    QF="$OPT -DSQLITE_OMIT_WAL -DSQLITE_MAX_MMAP_SIZE=0 -DSQLITE_TEMP_STORE=3 -DSQLITE_THREADSAFE=1 \
+        -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_DEFAULT_FOREIGN_KEYS=1 -DSQLITE_EXTRA_INIT=fz_amiga_sqlite_init"
+    m68k-amigaos-gcc $QF -c "$WORK/sqlite/sqlite3.c" -o "$O/sqlite3.o" > "$WORK/sqlite.log" 2>&1 || fail sqlite "$WORK/sqlite.log"
+    m68k-amigaos-gcc $OPT -I"$WORK/sqlite" -c "$HERE/deps/amiga/sqlite_amiga.c" -o "$O/sqlite_amiga.o" >> "$WORK/sqlite.log" 2>&1 || fail sqlite "$WORK/sqlite.log"
+    rm -f "$SYS/lib/libsqlite3.a"; m68k-amigaos-ar rcs "$SYS/lib/libsqlite3.a" "$O"/*.o
+    cp "$WORK/sqlite/sqlite3.h" "$WORK/sqlite/sqlite3ext.h" "$SYS/include/" 2>/dev/null || cp "$WORK/sqlite/sqlite3.h" "$SYS/include/"
+    SV=$(sed -n 's/^#define SQLITE_VERSION *"\(.*\)"/\1/p' "$WORK/sqlite/sqlite3.h")
+    printf 'prefix=%s\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n\nName: SQLite\nDescription: SQL database engine\nVersion: %s\nLibs: -L${libdir} -lsqlite3\nCflags: -I${includedir}\n' "$SYS" "$SV" > "$SYS/lib/pkgconfig/sqlite3.pc"
+    echo "$SQLITE_COMMIT$(stamp sqlite)$(sha256sum < "$HERE/deps/amiga/sqlite_amiga.c" | cut -c1-16)" > "$WORK/.sqlite"
+    echo "sqlite $SV: $(ls -l "$SYS/lib/libsqlite3.a" | awk '{print $5}') bytes"
 fi
