@@ -81,7 +81,7 @@ if [ "$st" != 0 ]; then
     echo "-- before collect2:"; grep -v -E "warning:|duplicate section|^libtool:|^ *[a-z0-9_+-]*-gcc|^ *[a-z0-9_+-]*-g\+\+" make.log | grep -B25 "collect2:" | cut -c1-400 | tail -40
     # an archive member pulled in for one symbol that also brings a main():
     # what it defines, so we know which symbol to give ourselves
-    grep -o "/[^ ]*\.a([^)]*\.o)" make.log | grep -B0 . | sort -u | head -3 | while read -r m; do
+    grep "multiple definition" make.log | grep -o "/[^ ]*\.a([^)]*\.o)" | sort -u | head -3 | while read -r m; do
         a=${m%%(*}; o=${m#*(}; o=${o%)}
         echo "-- $o in $a defines:"; (cd /tmp && m68k-amigaos-ar p "$a" "$o" > fz-member.o && m68k-amigaos-nm fz-member.o | grep -E " [TDBC] " | head -30; rm -f fz-member.o)
     done
