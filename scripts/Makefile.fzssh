@@ -8,7 +8,7 @@ CC  := $(TC)/bin/m68k-amigaos-gcc
 CXX := $(TC)/bin/m68k-amigaos-g++
 AR  := $(TC)/bin/m68k-amigaos-ar
 OPT := -m68040 -O2 -noixemul -fno-delete-null-pointer-checks
-CXXFLAGS := $(OPT) -std=gnu++20 -include fzamiga.h -I$(OBJ)/include -I$(SRC)/lib -I$(SYS)/include -I$(OBJ) -Wall -Wno-unused
+CXXFLAGS := $(OPT) -std=gnu++20 -include fzamiga.h -I$(OBJ)/include -I$(SRC)/lib -I$(SYS)/include -I$(A2)/include -I$(OBJ) -Wall -Wno-unused
 CFLAGS   := $(OPT) -std=gnu99 -I$(A2)/include -I$(A2)/src -DARGON2_NO_THREADS
 
 CRYPT  := crypt/bcrypt crypt/blowfish crypt/mlkem crypt/mlkem_impl crypt/util

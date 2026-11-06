@@ -97,7 +97,7 @@ int fstatat(int fd, const char *name, struct stat *st, int flags)
     return (flags & AT_SYMLINK_NOFOLLOW) ? lstat(path, st) : stat(path, st);
 }
 
-int utimensat(int fd, const char *name, const struct timespec t[2], int flags)
+__stdargs int utimensat(int fd, const char *name, const struct timespec *t, int flags)
 {
     char path[1024];
     struct timeval tv[2];
@@ -110,7 +110,7 @@ int utimensat(int fd, const char *name, const struct timespec t[2], int flags)
     return utimes(path, tv);
 }
 
-int futimens(int fd, const struct timespec t[2])
+__stdargs int futimens(int fd, const struct timespec *t)
 {
     char path[1024];
     StdFileDes *sfd = _lx_fhfromfd(fd);

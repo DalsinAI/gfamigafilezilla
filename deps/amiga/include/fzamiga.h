@@ -63,8 +63,8 @@ void fz_amiga_dir_forget(DIR *d);
 int dirfd(DIR *d);
 DIR *fdopendir(int fd);
 int fstatat(int fd, const char *name, struct stat *st, int flags);
-int utimensat(int fd, const char *name, const struct timespec t[2], int flags);
-int futimens(int fd, const struct timespec t[2]);
+__stdargs int utimensat(int fd, const char *name, const struct timespec *t, int flags);
+__stdargs int futimens(int fd, const struct timespec *t);
 /* dosrun.c */
 int fz_amiga_run_detached(const char *cmdline);
 #ifndef AT_FDCWD
