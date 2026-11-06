@@ -30,15 +30,18 @@ GMP_SHA256=bd2966e6d277f79328e894a5a9f3ba3fbf2ed2be81def5f48623e30c23fb1572
 ARGON2_VERSION=20190702
 ARGON2_URL=$U/main/a/argon2/argon2_0~20190702+dfsg.orig.tar.xz
 ARGON2_SHA256=815f1017b5b0033204778c2e32443257274bc5d9dd16d355c4f7db8189e23dcc
-# GFOpenWX Toolkit (wxWidgets on GFOpenLayout): main 7fb2de8 (toolbar and
-# wizards, PR #4) plus team3/wx-paths-threads-20261106 at 89b8a62, whose
-# C-locale defaults stop the empty decimal point assert at FileZilla's
-# start. Back to main once that branch is merged.
+# GFOpenWX Toolkit (wxWidgets on GFOpenLayout). Until its branches are
+# merged, the SDK is the wx ports' combined lab SDK: main 7fb2de8 plus
+# own-libraries 952e903, wx-paths-threads 37db2f8 (C-locale defaults,
+# volume paths), #6 e64c124, #7 340e3e5 and e42f0c0, built by Cradle job
+# j20261106T134404-c36718 (amicradle-guest 5359470). WXT_COMMIT is the
+# branch with FileZilla's fixes; back to main and an SDK built here once
+# they are all merged.
 WXT_REPO=https://github.com/DalsinAI/gfopenwxtoolkit
-WXT_COMMIT=89b8a622422dc246102b09d628c60efd3457b833
+WXT_COMMIT=37db2f8ee199d41ca5ab495a5c13fd47dd4ae8e6
 # that toolkit's SDK as a Cradle job built it (empty: build it here)
-WXT_SDK_JOB=
-WXT_SDK_SHA256=
+WXT_SDK_JOB=j20261106T134404-c36718
+WXT_SDK_SHA256=68948c6f6941a69335c3116bd5efb490fbd2523c56991586ce9e742585cc68c9
 # fpuauto (amicradle-guest common/fpuauto): the FPU when there is one
 FPUAUTO_REPO=https://github.com/DalsinAI/amicradle-guest
 FPUAUTO_COMMIT=462f3a3ccb4cea314e1bb7f7cfaebda266073233
