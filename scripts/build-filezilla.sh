@@ -88,4 +88,6 @@ if [ "$st" != 0 ]; then
     exit 1
 fi
 cp src/interface/filezilla "$OUT/FileZilla"
+# 247 MB with its symbols; the program itself is far smaller
+m68k-amigaos-strip "$OUT/FileZilla"
 ls -l "$OUT/FileZilla"
