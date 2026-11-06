@@ -4,13 +4,15 @@
 #       the program: a double-click runs it with the stack it needs
 #   python3 make-icon.py install OUT/Install-FileZilla.info
 #       the installer script: a double-click runs it with Installer
+#   python3 make-icon.py drawer OUT/FileZilla-drawer.info
+#       the FileZilla drawer itself (packed as FileZilla.info beside it)
 # Copyright (c) 2026 AmiCradle Team
 import struct
 import sys
 
 W, H, DEPTH = 48, 26, 2
 STACK = 1048576
-WBTOOL, WBPROJECT = 3, 4
+WBDRAWER, WBTOOL, WBPROJECT = 2, 3, 4
 
 # 0 grey, 1 black, 2 white, 3 blue (the Workbench pens)
 def picture():
@@ -54,6 +56,7 @@ def main():
     kind, path = sys.argv[1], sys.argv[2]
     data = planes(picture())
     tool = b"SYS:Utilities/Installer\0" if kind == "install" else b""
+    drawer = kind == "drawer"
     gadget = struct.pack(">IhhHHHHHIIIIIHI",
                          0, 0, 0, W, H + 1,
                          0x0004,          # GFLG_GADGIMAGE, complement when selected
@@ -61,16 +64,29 @@ def main():
                          0x0001,          # BOOLGADGET
                          1, 0, 0, 0, 0, 0,
                          1)               # UserData 1: a 2.x icon
+    wbtype = WBDRAWER if drawer else (WBPROJECT if tool else WBTOOL)
     disk = struct.pack(">HH", 0xE310, 1) + gadget + struct.pack(">BBIIiiIII",
-                         WBPROJECT if tool else WBTOOL, 0,
+                         wbtype, 0,
                          1 if tool else 0, 0,     # default tool, no tool types
                          -0x80000000, -0x80000000,   # NO_ICON_POSITION
-                         0, 0, STACK)
+                         1 if drawer else 0,      # drawer data follows
+                         0, 0 if drawer else STACK)
     assert len(disk) == 78, len(disk)
+    if drawer:
+        # the drawer's window: NewWindow (48 bytes), then CurrentX/Y
+        newwin = struct.pack(">hhhhBBIIIIIIIhhHHH",
+                             50, 40, 520, 260, 255, 255, 0, 0,
+                             0, 0, 0, 0, 0, 90, 40, 0xFFFF, 0xFFFF, 1)
+        assert len(newwin) == 48, len(newwin)
+        dd = newwin + struct.pack(">ii", 0, 0)
+    else:
+        dd = b""
     image = struct.pack(">hhHHHIBBI", 0, 0, W, H, DEPTH, 1, 3, 0, 0)
     extra = struct.pack(">I", len(tool)) + tool if tool else b""
+    if drawer:
+        extra += struct.pack(">IH", 0, 0)   # 2.x drawer flags and view mode: Workbench's defaults
     with open(path, "wb") as f:
-        f.write(disk + image + data + extra)
+        f.write(disk + dd + image + data + extra)
 
 if __name__ == "__main__":
     main()

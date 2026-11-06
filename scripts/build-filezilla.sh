@@ -118,6 +118,8 @@ echo "resources: $(find "$OUT/resources" -type f | wc -l) files"
 # the drawer as it ships: icons, the installer script, the notes and licences
 python3 -I "$HERE/scripts/make-icon.py" tool "$OUT/FileZilla.info"
 python3 -I "$HERE/scripts/make-icon.py" install "$OUT/Install-FileZilla.info"
+# the drawer's own icon: the archive puts it beside the drawer as FileZilla.info
+python3 -I "$HERE/scripts/make-icon.py" drawer "$OUT/FileZilla-drawer.info"
 cp "$HERE/package/Install-FileZilla" "$HERE/package/README.txt" "$OUT/"
 cp "$SRC/COPYING" "$OUT/COPYING-FileZilla.txt"
 cp "$WORK/fzssh/agpl3.txt" "$OUT/COPYING-fzssh.txt"
