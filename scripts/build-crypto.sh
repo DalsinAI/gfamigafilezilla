@@ -82,9 +82,9 @@ fi
 # ---- GnuTLS: the TLS library alone (no tools, p11-kit, IDN or compression)
 if [ ! -f "$SYS/lib/libgnutls.a" ] || [ "$(cat "$WORK/.gnutls" 2>/dev/null)" != "$GNUTLS_SHA256$(stamp gnutls)" ]; then
     fetch "$GNUTLS_URL" "$GNUTLS_SHA256" gnutls.tar.xz; unpack gnutls.tar.xz gnutls
-    # _GNU_SOURCE: the stove's headers declare vasprintf, nanosleep and the
-    # BSD types only with it, and gnulib replaces what it can't see
-    (cd "$WORK/gnutls" && CC="$XCC" CFLAGS="$CF -D_GNU_SOURCE -include $HERE/deps/amiga/include/fzdecl.h -I$SYS/include" LDFLAGS="$LF" \
+    # _GNU_SOURCE: the stove's headers declare the BSD types only with it,
+    # and gnulib replaces what it can't see
+    (cd "$WORK/gnutls" && CC="$XCC" CFLAGS="$CF -D_GNU_SOURCE -I$SYS/include" LDFLAGS="$LF" \
         LIBS="-lfzamiga -lsocket -lpthread" ./configure --host=m68k-amigaos --build="$HOSTB" --prefix="$SYS" \
         --disable-shared --enable-static --with-included-libtasn1 --with-included-unistring --without-p11-kit \
         --without-idn --without-zlib --without-brotli --without-zstd --without-tpm --without-tpm2 \
