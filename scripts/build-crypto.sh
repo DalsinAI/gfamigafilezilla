@@ -46,7 +46,7 @@ for c in getentropy netcompat libccompat; do
         || { echo "deps/amiga/$c.c failed"; exit 1; }
 done
 rm -f "$SYS/lib/libfzamiga.a"; "$TC/bin/m68k-amigaos-ar" rcs "$SYS/lib/libfzamiga.a" "$A"/*.o
-cp "$HERE/deps/amiga/include/fzamiga.h" "$SYS/include/"
+cp "$HERE/deps/amiga/include/fzamiga.h" "$HERE/deps/amiga/include/fzdecl.h" "$SYS/include/"
 
 # ---- GMP (generic C for now: its m68k assembly is a later speed step)
 if [ ! -f "$SYS/lib/libgmp.a" ] || [ "$(cat "$WORK/.gmp" 2>/dev/null)" != "$GMP_SHA256$(stamp gmp)" ]; then
@@ -84,7 +84,7 @@ if [ ! -f "$SYS/lib/libgnutls.a" ] || [ "$(cat "$WORK/.gnutls" 2>/dev/null)" != 
     fetch "$GNUTLS_URL" "$GNUTLS_SHA256" gnutls.tar.xz; unpack gnutls.tar.xz gnutls
     # _GNU_SOURCE: the stove's headers declare vasprintf, nanosleep and the
     # BSD types only with it, and gnulib replaces what it can't see
-    (cd "$WORK/gnutls" && CC="$XCC" CFLAGS="$CF -D_GNU_SOURCE -I$SYS/include" LDFLAGS="$LF" \
+    (cd "$WORK/gnutls" && CC="$XCC" CFLAGS="$CF -D_GNU_SOURCE -include $HERE/deps/amiga/include/fzdecl.h -I$SYS/include" LDFLAGS="$LF" \
         LIBS="-lfzamiga -lsocket -lpthread" ./configure --host=m68k-amigaos --build="$HOSTB" --prefix="$SYS" \
         --disable-shared --enable-static --with-included-libtasn1 --with-included-unistring --without-p11-kit \
         --without-idn --without-zlib --without-brotli --without-zstd --without-tpm --without-tpm2 \

@@ -1,8 +1,11 @@
 /* libccompat.c - the C library calls libfilezilla and FileZilla use that
- * libnix lacks: timegm(), wcsnlen(), getprogname() and the restartable UTF-8 conversions
+ * libnix lacks: timegm(), wcsnlen(), getprogname(), vasprintf() and the restartable UTF-8 conversions
  * mbsrtowcs()/wcsrtombs() (the programs run their strings as UTF-8).
  * Copyright (c) 2026 AmiCradle Team */
 #include <errno.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <wchar.h>
@@ -102,4 +105,15 @@ const char *getprogname(void)
         if (!name[0]) strcpy(name, "FileZilla");
     }
     return name;
+}
+
+/* vasprintf: the length first, then the string */
+int vasprintf(char **strp, const char *fmt, va_list ap)
+{
+    va_list aq; int n;
+    va_copy(aq, ap);
+    n = vsnprintf(NULL, 0, fmt, aq);
+    va_end(aq);
+    if (n < 0 || !(*strp = malloc((size_t)n + 1))) { *strp = NULL; return -1; }
+    return vsnprintf(*strp, (size_t)n + 1, fmt, ap);
 }

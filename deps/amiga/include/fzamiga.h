@@ -10,6 +10,7 @@
 #include <netdb.h>
 #include <time.h>
 #include <wchar.h>
+#include "fzdecl.h"
 #include <unistd.h>
 #include <fcntl.h>
 #include <pthread.h>
