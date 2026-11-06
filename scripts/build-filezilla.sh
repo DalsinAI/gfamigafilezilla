@@ -115,4 +115,11 @@ rm -rf "$WORK/stage" "$OUT/resources"
 make -C src/interface/resources install DESTDIR="$WORK/stage" > install.log 2>&1 || { tail -20 install.log; exit 1; }
 cp -R "$WORK/stage/FileZilla/share/filezilla/resources" "$OUT/resources"
 echo "resources: $(find "$OUT/resources" -type f | wc -l) files"
+# the drawer as it ships: icons, the installer script, the notes and licences
+python3 -I "$HERE/scripts/make-icon.py" tool "$OUT/FileZilla.info"
+python3 -I "$HERE/scripts/make-icon.py" install "$OUT/Install-FileZilla.info"
+cp "$HERE/package/Install-FileZilla" "$HERE/package/README.txt" "$OUT/"
+cp "$SRC/COPYING" "$OUT/COPYING-FileZilla.txt"
+cp "$WORK/fzssh/agpl3.txt" "$OUT/COPYING-fzssh.txt"
+cp "$HERE/LICENSE" "$OUT/LICENSE-port.txt"
 ls -l "$OUT/FileZilla"
