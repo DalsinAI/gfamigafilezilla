@@ -2,8 +2,8 @@
 # Builds FileZilla 3.71.0 for AmigaOS 3: 68040, the FPU when there is one
 # (fpuauto), on the GFOpenWX Toolkit. Stages, each again only when its
 # inputs change, so a run that stops at the time cap goes on next run:
-#   1 the stove probe, fpuauto, GMP, Nettle, GnuTLS (scripts/build-crypto.sh)
-#   2 libfilezilla, Argon2, fzssh, SQLite (scripts/build-fz.sh)
+#   1 the stove probe, fpuauto, the GFOpenTLS and GFOpenCrypto link stubs (scripts/build-crypto.sh)
+#   2 libfilezilla, fzssh, SQLite (scripts/build-fz.sh)
 #   3 the toolkit SDK, then FileZilla (scripts/build-filezilla.sh)
 #   STOVE=.../stoves/os32-gcc16-open6 OUT=out ./build-amiga.sh
 # Everything third-party is fetched at the versions filezilla.lock gives.
@@ -50,7 +50,7 @@ if [ "$(cat "$FAL/.commit" 2>/dev/null)" != "$FPUAUTO_COMMIT" ]; then
     echo "$FPUAUTO_COMMIT" > "$FAL/.commit"
 fi
 
-# ---- 1: GMP, Nettle, GnuTLS
+# ---- 1: the GFOpenTLS and GFOpenCrypto link stubs
 TC="$TC" WORK="$WORK" SYS="$SYS" JOBS=$JOBS sh "$HERE/scripts/build-crypto.sh"
 echo "crypto: $(( $(date +%s) - t0 )) s"
 
