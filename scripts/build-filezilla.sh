@@ -48,7 +48,7 @@ if [ ! -f config.status ]; then
     LDFLAGS="-L$SYS/lib -specs=$FPUSPECS -L$FPULIB" LIBS="-lfzamiga -lsocket -lpthread -latomic" \
     PKG_CONFIG="pkg-config --static" ac_cv_func_timegm=yes ./configure --host=m68k-amigaos --build="$HOSTB" --prefix=/FileZilla \
         --with-wx-config="$WXCONFIG" --disable-shared --enable-static --disable-locales --disable-manualupdatecheck \
-        --disable-autoupdatecheck --without-dbus --disable-storj --disable-precomp --without-pugixml --with-idn-lib=-lfzamiga \
+        --disable-autoupdatecheck --without-dbus --disable-storj --disable-precomp --with-pugixml=builtin --with-idn-lib=-lfzamiga \
         --disable-dependency-tracking > configure.log 2>&1 || {
         echo "== filezilla configure failed"; tail -15 configure.log
         grep -n -B3 -E "error:|Error " config.log | tail -50; rm -f config.status; exit 1; }
