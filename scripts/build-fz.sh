@@ -1,6 +1,6 @@
 #!/bin/sh
-# libfilezilla, Argon2 and fzssh for AmigaOS 3 (68040), static, into the
-# sysroot build-crypto.sh made. Each again only when its tarball or its
+# libfilezilla and fzssh for AmigaOS 3 (68040), static, on GFOpenTLS and
+# GFOpenCrypto, into the sysroot build-crypto.sh made. Each again only when its tarball or its
 # patches change.
 #   TC=.../prefix WORK=build SYS=build/sysroot scripts/build-fz.sh
 # Copyright (c) 2026 AmiCradle Team
@@ -41,6 +41,9 @@ if [ ! -f "$SYS/lib/libfilezilla.a" ] || [ ! -f "$SYS/lib/libfilezilla.la" ] || 
         CFLAGS="$OPT -include fzamiga.h -I$SYS/include" CXXFLAGS="$OPT -include fzamiga.h -I$SYS/include" \
         LDFLAGS="-L$SYS/lib" LIBS="-lfzamiga -lsocket -lpthread -latomic" PKG_CONFIG="pkg-config --static" \
         ac_cv_func_timegm=yes \
+        GMP_CFLAGS=-DFZ_NO_GMP GMP_LIBS=-lm NETTLE_CFLAGS="-I$SYS/include" NETTLE_LIBS="-lgfopencrypto" \
+        HOGWEED_CFLAGS="-I$SYS/include" HOGWEED_LIBS=-lm GNUTLS_CFLAGS="-I$SYS/include" \
+        GNUTLS_LIBS="-lgfopentls -lgfopencrypto" \
         ./configure --host=m68k-amigaos --build="$HOSTB" --prefix="$SYS" --disable-shared --enable-static \
         --disable-locales --disable-doxygen-doc --disable-dependency-tracking > configure.log 2>&1 \
         || fail libfilezilla-configure configure.log
@@ -53,9 +56,8 @@ if [ ! -f "$SYS/lib/libfilezilla.a" ] || [ ! -f "$SYS/lib/libfilezilla.la" ] || 
     echo "libfilezilla $LFZ_VERSION: $(ls -l "$SYS/lib/libfilezilla.a" | awk '{print $5}') bytes"
 fi
 
-# ---- Argon2 and fzssh, with our make file
-if [ ! -f "$SYS/lib/libfzssh.a" ] || [ "$(cat "$WORK/.fzssh" 2>/dev/null)" != "$FZSSH_SHA256$ARGON2_SHA256$(stamp fzssh)$(sha256sum < "$HERE/scripts/Makefile.fzssh" | cut -c1-16)" ]; then
-    fetch "$ARGON2_URL" "$ARGON2_SHA256" argon2.tar.xz; unpack argon2.tar.xz argon2
+# ---- fzssh, with our make file
+if [ ! -f "$SYS/lib/libfzssh.a" ] || [ "$(cat "$WORK/.fzssh" 2>/dev/null)" != "$FZSSH_SHA256$(stamp fzssh)$(sha256sum < "$HERE/scripts/Makefile.fzssh" | cut -c1-16)" ]; then
     fetch "$FZSSH_URL" "$FZSSH_SHA256" fzssh.tar.xz; unpack fzssh.tar.xz fzssh
     O="$WORK/obj/fzssh"; rm -rf "$O"; mkdir -p "$O/include/fzssh"
     V=$FZSSH_VERSION; MA=${V%%.*}; R=${V#*.}; MI=${R%%.*}; MC=${R#*.}
@@ -73,12 +75,12 @@ if [ ! -f "$SYS/lib/libfzssh.a" ] || [ "$(cat "$WORK/.fzssh" 2>/dev/null)" != "$
 #define PACKAGE_VERSION_SUFFIX
 #define PACKAGE_VERSION_SUFFIX_S ""
 CFG
-    nice -n 19 make -k -j"$JOBS" -f "$HERE/scripts/Makefile.fzssh" SRC="$WORK/fzssh" A2="$WORK/argon2" OBJ="$O" \
+    nice -n 19 make -k -j"$JOBS" -f "$HERE/scripts/Makefile.fzssh" SRC="$WORK/fzssh" OBJ="$O" \
         SYS="$SYS" TC="$TC" > "$WORK/fzssh.log" 2>&1 || { grep -E 'error|Error' "$WORK/fzssh.log" | cut -c1-300 | head -60; exit 1; }
-    echo "$FZSSH_SHA256$ARGON2_SHA256$(stamp fzssh)$(sha256sum < "$HERE/scripts/Makefile.fzssh" | cut -c1-16)" > "$WORK/.fzssh"
+    echo "$FZSSH_SHA256$(stamp fzssh)$(sha256sum < "$HERE/scripts/Makefile.fzssh" | cut -c1-16)" > "$WORK/.fzssh"
     # one library for fzssh's three (crypt, core, client), under the name
     # FileZilla's configure asks pkg-config for
-    printf 'prefix=%s\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n\nName: libfzssh-client\nDescription: fzssh client\nVersion: %s\nRequires: libfilezilla nettle hogweed\nLibs: -L${libdir} -lfzssh -largon2\nCflags: -I${includedir}\n' "$SYS" "$FZSSH_VERSION" > "$SYS/lib/pkgconfig/libfzssh-client.pc"
+    printf 'prefix=%s\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n\nName: libfzssh-client\nDescription: fzssh client\nVersion: %s\nRequires: libfilezilla gfopencrypto\nLibs: -L${libdir} -lfzssh\nCflags: -I${includedir}\n' "$SYS" "$FZSSH_VERSION" > "$SYS/lib/pkgconfig/libfzssh-client.pc"
     echo "fzssh $FZSSH_VERSION: $(ls -l "$SYS/lib/libfzssh.a" | awk '{print $5}') bytes"
 fi
 

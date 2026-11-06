@@ -7,7 +7,9 @@ Work in progress: it builds and links; it has not yet been run on an Amiga.
 ## What is in it
 
 - FileZilla 3.71.0, libfilezilla 0.57.0 and fzssh 1.4.0 (SFTP), with
-  GnuTLS 3.8.13, Nettle 3.10.2, GMP 6.3.0, Argon2 and SQLite, all static.
+  all static, on our own shared libraries: GFOpenTLS (gfopentls.library 1.5)
+  for FTPS, GFOpenCrypto (gfopencrypto.library 2.4) for SFTP and the rest of
+  the cryptography, and GFOpenSQLite (SQLite 3.53.4).
 - The GFOpenWX Toolkit (wxWidgets on GFOpenLayout) at the commit
   `filezilla.lock` names.
 - Our own code for what libnix lacks (`deps/amiga`): getentropy, socket

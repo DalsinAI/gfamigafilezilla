@@ -1,7 +1,8 @@
 #!/bin/sh
-# GMP, Nettle and GnuTLS for AmigaOS 3 (68040), static, into one sysroot,
-# with our getentropy() (deps/amiga) as their seed. Each again only when
-# its pinned tarball changes.
+# Our Amiga glue (deps/amiga) and the GFOpenTLS and GFOpenCrypto link stubs
+# for AmigaOS 3 (68040) into one sysroot: libfilezilla and fzssh call
+# gfopentls.library and gfopencrypto.library through them. The stubs again
+# only when their pinned commit changes.
 #   TC=.../prefix WORK=build SYS=build/sysroot scripts/build-crypto.sh
 # Copyright (c) 2026 AmiCradle Team
 set -eu
@@ -48,55 +49,24 @@ done
 rm -f "$SYS/lib/libfzamiga.a"; "$TC/bin/m68k-amigaos-ar" rcs "$SYS/lib/libfzamiga.a" "$A"/*.o
 cp "$HERE/deps/amiga/include/fzamiga.h" "$HERE/deps/amiga/include/fzdecl.h" "$HERE/deps/amiga/include/iconv.h" "$HERE/deps/amiga/include/idna.h" "$HERE/deps/amiga/include/idn-free.h" "$SYS/include/"
 
-# ---- GMP (generic C for now: its m68k assembly is a later speed step)
-if [ ! -f "$SYS/lib/libgmp.a" ] || [ "$(cat "$WORK/.gmp" 2>/dev/null)" != "$GMP_SHA256$(stamp gmp)" ]; then
-    fetch "$GMP_URL" "$GMP_SHA256" gmp.tar.xz; unpack gmp.tar.xz gmp
-    # Debian's tarball leaves out the manual; an empty doc/ for configure
-    if [ ! -f "$WORK/gmp/doc/Makefile.in" ]; then
-        mkdir -p "$WORK/gmp/doc"
-        printf 'all install install-data install-exec install-strip uninstall check clean distclean mostlyclean maintainer-clean:\n\t@:\n.PHONY: all\n' > "$WORK/gmp/doc/Makefile.in"
+# ---- GFOpenTLS and GFOpenCrypto: headers and link stubs (no floating point)
+if [ ! -f "$SYS/lib/libgfopentls.a" ] || [ "$(cat "$WORK/.gfopentls" 2>/dev/null)" != "$GFOPENTLS_COMMIT" ]; then
+    G="$WORK/gfopentls"
+    if [ "$(cat "$G/.commit" 2>/dev/null)" != "$GFOPENTLS_COMMIT" ]; then
+        rm -rf "$G"; git clone -q "$GFOPENTLS_REPO" "$G" && git -C "$G" fetch -q origin "$GFOPENTLS_COMMIT" 2>/dev/null || :
+        git -C "$G" checkout -q "$GFOPENTLS_COMMIT" || { echo "gfopentls $GFOPENTLS_COMMIT not found"; exit 1; }
+        echo "$GFOPENTLS_COMMIT" > "$G/.commit"
     fi
-    # C17: its configure checks call functions declared with ()
-    (cd "$WORK/gmp" && CC="$XCC" CFLAGS="$CF -std=gnu17" LDFLAGS="$LF" CC_FOR_BUILD=gcc ./configure --host=m68k-amigaos \
-        --build="$HOSTB" --prefix="$SYS" --disable-shared --enable-static --disable-assembly --disable-cxx \
-        > configure.log 2>&1 || fail gmp-configure config.log
-     nice -n 19 make -j"$JOBS" > make.log 2>&1 || fail gmp make.log
-     make install > /dev/null 2>&1 || fail gmp-install make.log)
-    echo "$GMP_SHA256$(stamp gmp)" > "$WORK/.gmp"
-    echo "gmp $GMP_VERSION: $(ls -l "$SYS/lib/libgmp.a" | awk '{print $5}') bytes"
-fi
-
-# ---- Nettle and hogweed (no assembly for the 68k in Nettle)
-if [ ! -f "$SYS/lib/libhogweed.a" ] || [ "$(cat "$WORK/.nettle" 2>/dev/null)" != "$NETTLE_SHA256$(stamp nettle)" ]; then
-    fetch "$NETTLE_URL" "$NETTLE_SHA256" nettle.tar.gz; unpack nettle.tar.gz nettle
-    (cd "$WORK/nettle" && CC="$XCC" CFLAGS="$CF -I$SYS/include" LDFLAGS="$LF" CC_FOR_BUILD=gcc ./configure \
-        --host=m68k-amigaos --build="$HOSTB" --prefix="$SYS" --libdir="$SYS/lib" --disable-shared --enable-static \
-        --disable-assembler --disable-documentation --disable-openssl --disable-fat \
-        --with-include-path="$SYS/include" --with-lib-path="$SYS/lib" > configure.log 2>&1 || fail nettle-configure config.log
-     nice -n 19 make -j"$JOBS" libnettle.a libhogweed.a > make.log 2>&1 || fail nettle make.log
-     make install-headers install-static install-pkgconfig > /dev/null 2>&1 || fail nettle-install make.log)
-    echo "$NETTLE_SHA256$(stamp nettle)" > "$WORK/.nettle"
-    echo "nettle $NETTLE_VERSION: $(ls -l "$SYS/lib/libnettle.a" "$SYS/lib/libhogweed.a" | awk '{printf "%s ", $5}')bytes"
-fi
-
-# ---- GnuTLS: the TLS library alone (no tools, p11-kit, IDN or compression)
-if [ ! -f "$SYS/lib/libgnutls.a" ] || [ "$(cat "$WORK/.gnutls" 2>/dev/null)" != "$GNUTLS_SHA256$(stamp gnutls)" ]; then
-    fetch "$GNUTLS_URL" "$GNUTLS_SHA256" gnutls.tar.xz; unpack gnutls.tar.xz gnutls
-    # _GNU_SOURCE: the stove's headers declare the BSD types only with it,
-    # and gnulib replaces what it can't see
-    (cd "$WORK/gnutls" && CC="$XCC" CFLAGS="$CF -D_GNU_SOURCE -I$SYS/include" LDFLAGS="$LF" \
-        LIBS="-lfzamiga -lsocket -lpthread" ./configure --host=m68k-amigaos --build="$HOSTB" --prefix="$SYS" \
-        --disable-shared --enable-static --with-included-libtasn1 --with-included-unistring --without-p11-kit \
-        --without-idn --without-zlib --without-brotli --without-zstd --without-tpm --without-tpm2 \
-        --disable-tools --disable-tests --disable-doc --disable-manpages --disable-nls --disable-cxx \
-        --disable-hardware-acceleration --disable-padlock --disable-libdane --disable-ktls \
-        --disable-full-test-suite --disable-valgrind-tests --with-default-trust-store-file= \
-        --disable-dependency-tracking > configure.log 2>&1 || fail gnutls-configure config.log
-     grep -E 'getentropy|getrandom' config.log | grep -E 'result|cv_func' | head -4
-     # the library alone: gnulib's copy for it (gl) and lib, not src/ and its gnulib
-     { nice -n 19 make -k -j"$JOBS" -C gl && nice -n 19 make -k -j"$JOBS" -C lib; } > make.log 2>&1 \
-         || { grep -E "error:|undefined|\*\*\*" make.log | sort -u | cut -c1-300 | head -60; tail -25 make.log | cut -c1-300; exit 1; }
-     make -C lib install > /dev/null 2>&1 || fail gnutls-install make.log)
-    echo "$GNUTLS_SHA256$(stamp gnutls)" > "$WORK/.gnutls"
-    echo "gnutls $GNUTLS_VERSION: $(ls -l "$SYS/lib/libgnutls.a" | awk '{print $5}') bytes"
+    rm -rf "$G/out"
+    (cd "$G" && STOVE="$(dirname "$TC")" OUT="$G/out" ./build-amiga.sh) > "$WORK/gfopentls.log" 2>&1 || fail gfopentls "$WORK/gfopentls.log"
+    grep "FPU check" "$WORK/gfopentls.log" || :
+    rm -f "$SYS/lib/libgfopentls.a" "$SYS/lib/libgfopencrypto.a"
+    cp "$G/out/lib/soft-float/libgfopentls.a" "$G/out/lib/soft-float/libgfopencrypto.a" "$SYS/lib/"
+    for d in clib gfopencrypto inline libraries proto; do
+        mkdir -p "$SYS/include/$d"; cp "$G/include/$d/"*.h "$SYS/include/$d/"
+    done
+    printf 'prefix=%s\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n\nName: gfopencrypto\nDescription: GFOpenCrypto link stub (gfopencrypto.library 2.4)\nVersion: 2.4\nLibs: -L${libdir} -lgfopencrypto\nCflags: -I${includedir}\n' "$SYS" > "$SYS/lib/pkgconfig/gfopencrypto.pc"
+    printf 'prefix=%s\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n\nName: gfopentls\nDescription: GFOpenTLS link stub (gfopentls.library 1.5)\nVersion: 1.5\nRequires: gfopencrypto\nLibs: -L${libdir} -lgfopentls\nCflags: -I${includedir}\n' "$SYS" > "$SYS/lib/pkgconfig/gfopentls.pc"
+    echo "$GFOPENTLS_COMMIT" > "$WORK/.gfopentls"
+    echo "gfopentls stubs: $(ls -l "$SYS/lib/libgfopentls.a" "$SYS/lib/libgfopencrypto.a" | awk '{printf "%s ", $5}')bytes"
 fi
