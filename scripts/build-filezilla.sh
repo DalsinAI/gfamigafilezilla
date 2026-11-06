@@ -47,6 +47,14 @@ for p in "$HERE"/patches/filezilla-*.patch; do
     # a patch to configure itself means configuring again
     grep -q '^+++ b/configure' "$p" && rm -f "$SRC/config.status"
 done
+# Boost.Regex, headers only
+BR="$WORK/boost-regex"
+if [ "$(cat "$BR/.commit" 2>/dev/null)" != "$BREGEX_COMMIT" ]; then
+    rm -rf "$BR"; mkdir -p "$BR"; git -C "$BR" init -q
+    git -C "$BR" fetch -q --depth 1 "$BREGEX_GIT" "$BREGEX_COMMIT"
+    git -C "$BR" checkout -q FETCH_HEAD -- include
+    echo "$BREGEX_COMMIT" > "$BR/.commit"
+fi
 cd "$SRC"
 if [ ! -f config.status ]; then
     CC="m68k-amigaos-gcc $SPECS" CXX="m68k-amigaos-g++ $SPECS" \
