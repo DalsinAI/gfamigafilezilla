@@ -67,6 +67,8 @@ if [ ! -f config.status ]; then
         echo "== filezilla configure failed"; tail -15 configure.log
         grep -n -B3 -E "error:|Error " config.log | tail -50; rm -f config.status; exit 1; }
 fi
+# libtool archives made before libfilezilla dropped -lcrypt still carry it
+find . -name "*.la" -exec sed -i "s/ -lcrypt//g" {} +
 echo "filezilla: make (for ${BUDGET:-?} s)"
 st=0
 timeout "${BUDGET:-600}" nice -n 19 make -k -j"$JOBS" > make.log 2>&1 || st=$?
