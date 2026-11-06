@@ -1,0 +1,11 @@
+--- a/configure	2026-11-06 00:53:35.581231704 +0000
++++ b/configure	2026-11-06 00:53:35.606642782 +0000
+@@ -18991,7 +18991,7 @@
+ fi
+ 
+ if test "$enable_static" != "no"; then
+-  as_fn_error $? "libfilezilla does not support --enable-static" "$LINENO" 5
++  : # AmigaOS has no shared libraries: build it static
+ fi
+ 
+ if ! test "$localesonly" = "yes"; then

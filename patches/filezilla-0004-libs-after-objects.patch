@@ -1,0 +1,21 @@
+--- a/src/interface/Makefile.in
++++ b/src/interface/Makefile.in
+@@ -345,14 +345,16 @@
+ 	filezilla-xrc_helper.$(OBJEXT) $(am__objects_1) \
+ 	$(am__objects_2) $(am__objects_3) $(am__objects_4)
+ filezilla_OBJECTS = $(am_filezilla_OBJECTS)
+-filezilla_LDADD = $(LDADD)
++# libraries after the objects: a static libsocket member that holds only
++# main() must not be pulled in before FileZilla's own main() is seen
++filezilla_LDADD = $(LDADD) $(filezilla_LDFLAGS)
+ AM_V_lt = $(am__v_lt_@AM_V@)
+ am__v_lt_ = $(am__v_lt_@AM_DEFAULT_V@)
+ am__v_lt_0 = --silent
+ am__v_lt_1 = 
+ filezilla_LINK = $(LIBTOOL) $(AM_V_lt) --tag=CXX $(AM_LIBTOOLFLAGS) \
+ 	$(LIBTOOLFLAGS) --mode=link $(CXXLD) $(filezilla_CXXFLAGS) \
+-	$(CXXFLAGS) $(filezilla_LDFLAGS) $(LDFLAGS) -o $@
++	$(CXXFLAGS) $(LDFLAGS) -o $@
+ AM_V_P = $(am__v_P_@AM_V@)
+ am__v_P_ = $(am__v_P_@AM_DEFAULT_V@)
+ am__v_P_0 = false

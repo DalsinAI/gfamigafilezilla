@@ -1,0 +1,55 @@
+--- a/lib/unix/poller.cpp	2026-11-05 22:31:46.406406710 +0000
++++ b/lib/unix/poller.cpp	2026-11-05 22:31:46.544624317 +0000
+@@ -3,6 +3,10 @@
+ 
+ #ifdef HAVE_EVENTFD
+ #include <sys/eventfd.h>
++#elif defined(__AMIGA__)
++// AmigaOS: the waits poll sockets only (WaitSelect), so the wake-up is a
++// pair of loopback sockets rather than a pipe
++#include <sys/socket.h>
+ #else
+ #include "../libfilezilla/glue/unix.hpp"
+ #endif
+@@ -41,9 +45,16 @@
+ 	}
+ #else
+ 	if (pipe_[0] == -1) {
++#ifdef __AMIGA__
++		if (socketpair(AF_INET, SOCK_STREAM, 0, pipe_) != 0) {
++			pipe_[0] = pipe_[1] = -1;
++			return errno ? errno : EIO;
++		}
++#else
+ 		if (!create_pipe(pipe_)) {
+ 			return errno;
+ 		}
++#endif
+ 	}
+ #endif
+ 	return 0;
+@@ -85,8 +96,12 @@
+ #ifdef HAVE_EVENTFD
+ 		int damn_spurious_warning = read(event_fd_, buffer, 8);
+ #else
++#ifdef __AMIGA__
++		int damn_spurious_warning = recv(pipe_[0], buffer, 100, 0);
++#else
+ 		int damn_spurious_warning = read(pipe_[0], buffer, 100);
+ #endif
++#endif
+ 		(void)damn_spurious_warning; // We do not care about return value and this is definitely correct!
+ 	}
+ 	return res > 0;
+@@ -111,7 +126,11 @@
+ 
+ 		int ret;
+ 		do {
++#ifdef __AMIGA__
++			ret = send(pipe_[1], &tmp, 1, 0);
++#else
+ 			ret = write(pipe_[1], &tmp, 1);
++#endif
+ 		} while (ret == -1 && errno == EINTR);
+ #endif
+ 	}

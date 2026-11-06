@@ -1,0 +1,12 @@
+# libm in every link, after libgcc too: libnix's soft double maths
+# (__subdf3, __gedf2 and the rest, through the mathieee libraries) is in
+# libm, libgcc's conversions call it, and some configure scripts (GMP's)
+# link their tests with no -lm; libstubs after it opens the mathieee
+# libraries libm calls. Passed with -specs=.
+%rename lib fz_base_lib
+*lib:
+-lm %(fz_base_lib)
+
+%rename libgcc fz_base_libgcc
+*libgcc:
+%(fz_base_libgcc) -lm -lstubs %(fz_base_libgcc)

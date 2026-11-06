@@ -1,0 +1,83 @@
+AmigaOS: the GFOpenWX Toolkit's log view, header reparenting, and no animation control (only the update dialog, off in this build, uses it).
+
+diff -ruN fa/src/interface/StatusView.cpp fb/src/interface/StatusView.cpp
+--- a/src/interface/StatusView.cpp	2026-11-06 03:16:11.554290028 +0000
++++ b/src/interface/StatusView.cpp	2026-11-06 03:16:11.613230108 +0000
+@@ -239,7 +239,7 @@
+ 	}
+ 
+ 	m_formattedMessage += message;
+-#if defined(__WXGTK__)
++#if defined(__WXGTK__) || defined(__WXOPENLAYOUT__)
+ 	// AppendText always calls SetInsertionPointEnd, which is very expensive.
+ 	// This check however is negligible.
+ 	if (m_pTextCtrl->GetInsertionPoint() != m_pTextCtrl->GetLastPosition()) {
+diff -ruN fa/src/interface/themeprovider.cpp fb/src/interface/themeprovider.cpp
+--- a/src/interface/themeprovider.cpp	2026-11-06 03:16:11.554487633 +0000
++++ b/src/interface/themeprovider.cpp	2026-11-06 03:16:11.617436508 +0000
+@@ -269,12 +269,14 @@
+ 	return ret;
+ }
+ 
++#if wxUSE_ANIMATIONCTRL
+ wxAnimation CTheme::LoadAnimation(std::wstring const& name, wxSize const& size)
+ {
+ 	std::wstring path = path_ + fz::sprintf(L"%dx%d/%s.gif", size.x, size.y, name);
+ 
+ 	return wxAnimation(path);
+ }
++#endif
+ 
+ CThemeProvider::CThemeProvider(COptions& options)
+ 	: COptionChangeEventHandler(this)
+@@ -393,6 +395,7 @@
+ 	return empty;
+ }
+ 
++#if wxUSE_ANIMATIONCTRL
+ wxAnimation CThemeProvider::CreateAnimation(wxArtID const& id, wxSize const& size)
+ {
+ 	if (id.Left(4) != _T("ART_")) {
+@@ -427,6 +430,7 @@
+ 
+ 	return anim;
+ }
++#endif
+ 
+ std::vector<std::wstring> CThemeProvider::GetThemes()
+ {
+diff -ruN fa/src/interface/themeprovider.h fb/src/interface/themeprovider.h
+--- a/src/interface/themeprovider.h	2026-11-06 03:16:11.554543207 +0000
++++ b/src/interface/themeprovider.h	2026-11-06 03:16:11.616686513 +0000
+@@ -34,7 +34,9 @@
+ 	bool Load(std::wstring const& theme, std::vector<wxSize> sizes);
+ 
+ 	wxBitmap const& LoadBitmap(CLocalPath const& cacheDir, std::wstring const& name, wxSize const& size, bool allowContentScale = true);
++#if wxUSE_ANIMATIONCTRL
+ 	wxAnimation LoadAnimation(std::wstring const& name, wxSize const& size);
++#endif
+ 
+ 	static wxSize StringToSize(std::wstring const&);
+ 
+@@ -98,7 +100,9 @@
+ 
+ 	static CThemeProvider* Get();
+ 
++#if wxUSE_ANIMATIONCTRL
+ 	wxAnimation CreateAnimation(wxArtID const& id, wxSize const& size);
++#endif
+ 
+ 	virtual wxBitmap CreateBitmap(wxArtID const& id, wxArtClient const& client, wxSize const& size) override {
+ 		return CreateBitmap(id, client, size, false);
+diff -ruN fa/src/interface/viewheader.cpp fb/src/interface/viewheader.cpp
+--- a/src/interface/viewheader.cpp	2026-11-06 03:16:11.554432040 +0000
++++ b/src/interface/viewheader.cpp	2026-11-06 03:16:11.615772699 +0000
+@@ -255,7 +255,7 @@
+ 
+ void CViewHeader::Reparent(CViewHeader** pViewHeader, wxWindow* parent)
+ {
+-#if defined __WXMSW__ || defined __WXGTK__ || \
++#if defined __WXMSW__ || defined __WXGTK__ || defined __WXOPENLAYOUT__ || \
+ 	(defined __WXMAC__ && !(defined __WXMAC_CLASSIC__))
+ 	((wxWindow*)*pViewHeader)->Reparent(parent);
+ #else

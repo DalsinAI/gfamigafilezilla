@@ -1,0 +1,373 @@
+diff -ruN pa/lib/aio/aio.cpp pb/lib/aio/aio.cpp
+--- a/lib/aio/aio.cpp	2026-11-06 01:28:44.787456119 +0000
++++ b/lib/aio/aio.cpp	2026-11-06 01:29:10.650031485 +0000
+@@ -145,6 +145,9 @@
+ 			logger_.log(logmsg::debug_warning, "MapViewOfFile failed with error %u", err);
+ 			return;
+ 		}
++#elif defined(__AMIGA__)
++		// AmigaOS: one address space, so plain memory serves as "shared".
++		memory_ = new(std::nothrow) uint8_t[memory_size_];
+ #else
+ #if HAVE_MEMFD_CREATE
+ 		shm_ = memfd_create("aio_buffer_pool", MFD_CLOEXEC|MFD_ALLOW_SEALING);
+diff -ruN pa/lib/glue/unix.cpp pb/lib/glue/unix.cpp
+--- a/lib/glue/unix.cpp	2026-11-06 01:28:44.788226929 +0000
++++ b/lib/glue/unix.cpp	2026-11-06 01:30:05.158210745 +0000
+@@ -72,7 +72,12 @@
+ #else
+ 	forkblock b;
+ #endif
++#ifdef __AMIGA__
++	// No AF_UNIX in bsdsocket.library: our socketpair() is a loopback TCP pair.
++	bool ret = socketpair(AF_INET, flags, 0, fds) == 0;
++#else
+ 	bool ret = socketpair(AF_UNIX, flags, 0, fds) == 0;
++#endif
+ 	if (!ret) {
+ 		fds[0] = -1;
+ 		fds[1] = -1;
+@@ -87,6 +92,21 @@
+ 	return ret;
+ }
+ 
++#ifdef __AMIGA__
++// Passing descriptors needs AF_UNIX: not on AmigaOS, and only the server uses it.
++int send_fd(int, fz::buffer &, int, int & error)
++{
++	error = ENOSYS;
++	return -1;
++}
++
++int read_fd(int, fz::buffer &, int & fd, int & error)
++{
++	fd = -1;
++	error = ENOSYS;
++	return -1;
++}
++#else
+ int send_fd(int socket, fz::buffer & buf, int fd, int & error)
+ {
+ 	if (buf.empty()) {
+@@ -207,6 +227,8 @@
+ 	return res;
+ }
+ 
++#endif
++
+ int set_nonblocking(int fd, bool non_blocking)
+ {
+ 	int flags = fcntl(fd, F_GETFL);
+diff -ruN pa/lib/impersonation.cpp pb/lib/impersonation.cpp
+--- a/lib/impersonation.cpp	2026-11-06 01:28:44.791749266 +0000
++++ b/lib/impersonation.cpp	2026-11-06 01:29:46.748193788 +0000
+@@ -72,7 +72,76 @@
+ 
+ }
+ 
+-#if FZ_UNIX || FZ_MAC
++#if defined(__AMIGA__)
++
++// AmigaOS 3 has one user: no other user to act as. FileZilla (the client)
++// never asks; these answer "not possible" for anything that does.
++namespace fz {
++class impersonation_token_impl final
++{
++};
++
++impersonation_token::impersonation_token(fz::user const&, fz::native_string const*, logger_interface&, impersonation_options const&)
++{
++}
++
++impersonation_capabilities impersonation_token::get_capabilities(std::initializer_list<impersonation_capability>)
++{
++	return {};
++}
++
++bool impersonation_token::operator==(impersonation_token const& op) const
++{
++	return !impl_ && !op.impl_;
++}
++
++bool impersonation_token::operator<(impersonation_token const&) const
++{
++	return false;
++}
++
++native_string impersonation_token::username() const
++{
++	return {};
++}
++
++native_string impersonation_token::home() const
++{
++	return {};
++}
++
++std::size_t impersonation_token::hash() const noexcept
++{
++	return 0;
++}
++
++std::string impersonation_token::uid() const
++{
++	return {};
++}
++
++bool set_process_impersonation(impersonation_token const&)
++{
++	return false;
++}
++
++native_string current_username()
++{
++	return {};
++}
++
++std::string get_user_id(native_string const&)
++{
++	return {};
++}
++
++native_string get_user_name(std::string const&)
++{
++	return {};
++}
++}
++
++#elif FZ_UNIX || FZ_MAC
+ 
+ #include <charconv>
+ #include <cstdint>
+diff -ruN pa/lib/local_filesys.cpp pb/lib/local_filesys.cpp
+--- a/lib/local_filesys.cpp	2026-11-06 01:28:44.792917268 +0000
++++ b/lib/local_filesys.cpp	2026-11-06 01:33:35.739625170 +0000
+@@ -144,7 +144,9 @@
+ result get_file_info_impl(result(*do_stat)(struct stat & buf, char const* path, DIR* dir, bool follow), char const* path, DIR* dir, bool &is_link, local_filesys::type& type, int64_t* size, datetime* modification_time, int *mode, bool follow_links)
+ {
+ 	struct stat buf{};
++#ifndef __AMIGA__
+ 	static_assert(sizeof(buf.st_size) >= 8, "The st_size member of struct stat must be 8 bytes or larger.");
++#endif
+ 
+ 	auto result = do_stat(buf, path, dir, false);
+ 	if (!result) {
+@@ -476,6 +478,14 @@
+ 	}
+ 
+ 	dir_ = opendir(path.c_str());
++#ifdef __AMIGA__
++	// libnix's DIR has no descriptor: dircompat.c keeps its path for fstatat()
++	if (dir_ && fz_amiga_dir_register(dir_, path.c_str()) < 0) {
++		closedir(dir_);
++		dir_ = nullptr;
++		errno = EMFILE;
++	}
++#endif
+ 	if (!dir_) {
+ 		int const err = errno;
+ 		switch (err) {
+@@ -559,6 +569,9 @@
+ 	cur_ = nullptr;
+ #else
+ 	if (dir_) {
++#ifdef __AMIGA__
++		fz_amiga_dir_forget(dir_);
++#endif
+ 		closedir(dir_);
+ 		dir_ = nullptr;
+ 	}
+@@ -1063,7 +1076,11 @@
+ 	}
+ 	target.resize(PATH_MAX);
+ 	auto res = realpath(path.c_str(), target.data());
++#ifdef __AMIGA__
++	if (!res) {
++#else
+ 	if (!res || *res != '/') {
++#endif
+ 		return {};
+ 	}
+ 	target.resize(strlen(target.data()));
+@@ -1207,6 +1224,13 @@
+ }
+ }
+ 
++#ifdef __AMIGA__
++// The parent of "VOL:x" is "VOL:", keeping the colon
++#define FZ_PARENT_CUT(w, p) ((p) != native_string::npos && (w)[p] == ':' ? (p) + 1 : (p))
++#else
++#define FZ_PARENT_CUT(w, p) (p)
++#endif
++
+ result mkdir(native_string const& absolute_path, bool recurse, mkdir_permissions permissions, native_string* last_created)
+ {
+ 	// Step 0: Require an absolute path
+@@ -1241,6 +1265,13 @@
+ 		}
+ 		min_len = offset + 2;
+ 	}
++#elif defined(__AMIGA__)
++	// AmigaDOS: an absolute path is "VOL:..." and the shortest is "VOL:"
++	size_t const colon = absolute_path.find(':');
++	if (colon == native_string::npos || colon == 0) {
++		return {result::invalid};
++	}
++	size_t const min_len = colon + 1;
+ #else
+ 	if (absolute_path.empty() || absolute_path[0] != '/') {
+ 		return {result::invalid};
+@@ -1269,6 +1300,8 @@
+ 		while (work.size() > min_len && !found) {
+ 	#ifdef FZ_WINDOWS
+ 			size_t pos = work.find_last_of(L"\\/");
++	#elif defined(__AMIGA__)
++			size_t pos = work.find_last_of("/:");
+ 	#else
+ 			size_t pos = work.rfind('/');
+ 	#endif
+@@ -1278,7 +1311,7 @@
+ 
+ 			if (pos + 1 < work.size()) {
+ 				segments.push_back(work.substr(pos + 1));
+-				work = work.substr(0, pos);
++				work = work.substr(0, FZ_PARENT_CUT(work, pos));
+ 				auto t = fz::local_filesys::get_file_type(work.empty() ? fzT("/") : work, true);
+ 
+ 				if (t == fz::local_filesys::dir) {
+@@ -1290,7 +1323,7 @@
+ 				}
+ 			}
+ 			else {
+-				work = work.substr(0, pos);
++				work = work.substr(0, FZ_PARENT_CUT(work, pos));
+ 			}
+ 		}
+ 		if (!found) {
+@@ -1299,6 +1332,9 @@
+ 
+ 		// Step 3: Create the segments
+ 		for (size_t i = 0; i < segments.size(); ++i) {
++#ifdef __AMIGA__
++			if (work.empty() || (work.back() != ':' && work.back() != '/'))
++#endif
+ 			work += local_filesys::path_separator;
+ 			work += segments[segments.size() - i - 1];
+ 			result r = do_mkdir(work, ((i + 1) == segments.size()) ? permissions : mkdir_permissions::normal);
+diff -ruN pa/lib/process.cpp pb/lib/process.cpp
+--- a/lib/process.cpp	2026-11-06 01:28:44.793511052 +0000
++++ b/lib/process.cpp	2026-11-06 01:28:44.930830613 +0000
+@@ -417,6 +417,68 @@
+ 	std::optional<async_pipe> async_pipe_;
+ };
+ 
++#elif defined(__AMIGA__)
++
++// AmigaOS: no fork(), no pipes to a child. FileZilla only needs fz::process
++// for Storj, which this build leaves out, so spawning reports failure;
++// spawn_detached_process() below runs the command through AmigaDOS.
++#include "libfilezilla/mutex.hpp"
++#include <fzamiga.h>
++
++#include <atomic>
++
++namespace fz {
++
++namespace {
++std::atomic<unsigned int> forkblocks_{};
++mutex forkblock_mtx_;
++
++// AmigaDOS quoting: inside "...", a quote is *" and a star is **.
++std::string amiga_quote(native_string const& arg)
++{
++	std::string ret = "\"";
++	for (char c : arg) {
++		if (c == '"' || c == '*') {
++			ret += '*';
++		}
++		else if (c == '\n') {
++			ret += "*N";
++			continue;
++		}
++		ret += c;
++	}
++	ret += '"';
++	return ret;
++}
++}
++
++class process::impl
++{
++public:
++	impl(process &) {}
++	impl(process &, thread_pool &, event_handler &) {}
++
++	bool spawn(native_string const&, std::vector<native_string>::const_iterator const&, std::vector<native_string>::const_iterator const&, io_redirection, std::vector<int> const& = std::vector<int>(), impersonation_token const* = nullptr, logger_interface & = get_null_logger())
++	{
++		return false;
++	}
++
++	bool kill(bool = true, duration const& = {})
++	{
++		return false;
++	}
++
++	rwresult read(void*, unsigned int)
++	{
++		return rwresult{rwresult::invalid, 0};
++	}
++
++	rwresult write(void const*, unsigned int)
++	{
++		return rwresult{rwresult::invalid, 0};
++	}
++};
++
+ #else
+ 
+ #include "libfilezilla/glue/unix.hpp"
+@@ -1162,6 +1224,13 @@
+ 	reset_handle(pi.hProcess);
+ 	reset_handle(pi.hThread);
+ 	return true;
++#elif defined(__AMIGA__)
++	std::string cmdline = amiga_quote(cmd_with_args[0]);
++	for (auto it = cmd_with_args.cbegin() + 1; it != cmd_with_args.cend(); ++it) {
++		cmdline += ' ';
++		cmdline += amiga_quote(*it);
++	}
++	return fz_amiga_run_detached(cmdline.c_str()) == 0;
+ #else
+ 	if (cmd_with_args[0][0] != '/') {
+ 		return false;
+@@ -1287,9 +1356,14 @@
+ }
+ 
+ 
++#ifndef __AMIGA__
+ int const atfork_registered = []() {
+ 	return pthread_atfork(&atfork_lock_forkblock, &atfork_unlock_forkblock, &atfork_check_forkblocks);
+ }();
++#else
++// No fork() on AmigaOS: nothing to guard against.
++[[maybe_unused]] void (*const atfork_handlers[])() = {&atfork_lock_forkblock, &atfork_unlock_forkblock, &atfork_check_forkblocks};
++#endif
+ }
+ #endif
+ 
+diff -ruN pa/lib/tls_layer_impl.cpp pb/lib/tls_layer_impl.cpp
+--- a/lib/tls_layer_impl.cpp	2026-11-06 01:28:44.794808778 +0000
++++ b/lib/tls_layer_impl.cpp	2026-11-06 01:29:03.789182072 +0000
+@@ -29,6 +29,12 @@
+ 	reinterpret_cast<decltype(&f)>(get_gnutls_dll()[ #f ])
+ }
+ 
++#elif defined(__AMIGA__)
++
++// Static GnuTLS built without PKCS#11: the optional calls are not there.
++#define dynamic_gnutls_func(f) \
++	static_cast<decltype(&f)>(nullptr)
++
+ #else
+ 
+ #include <dlfcn.h>

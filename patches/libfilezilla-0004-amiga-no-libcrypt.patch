@@ -1,0 +1,11 @@
+--- a/lib/Makefile.in
++++ b/lib/Makefile.in
+@@ -120,7 +120,7 @@
+ @FZ_WINDOWS_FALSE@	libfilezilla/glue/unix.hpp
+ 
+ @FZ_MAC_TRUE@am__append_6 = -framework CoreServices
+-@FZ_UNIX_TRUE@am__append_7 = -lcrypt
++@FZ_UNIX_TRUE@am__append_7 =
+ subdir = lib
+ ACLOCAL_M4 = $(top_srcdir)/aclocal.m4
+ am__aclocal_m4_deps = $(top_srcdir)/m4/ax_append_flag.m4 \

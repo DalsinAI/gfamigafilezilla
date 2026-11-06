@@ -1,0 +1,181 @@
+--- a/src/commonui/fz_paths.cpp
++++ b/src/commonui/fz_paths.cpp
+@@ -25,8 +25,13 @@
+ namespace {
+ static std::wstring TryDirectory(std::wstring path, std::wstring const& suffix, bool check_exists)
+ {
++#ifdef __AMIGA__
++	if (!path.empty() && path.find(':') != std::wstring::npos) {
++		if (path.back() != '/' && path.back() != ':') {
++#else
+ 	if (!path.empty() && path[0] == '/') {
+ 		if (path[path.size() - 1] != '/') {
++#endif
+ 			path += '/';
+ 		}
+ 
+@@ -103,7 +108,11 @@
+ 	if (!ret.SetPath(GetEnv("TMPDIR"))) {
+ 		if (!ret.SetPath(GetEnv("TMP"))) {
+ 			if (!ret.SetPath(GetEnv("TEMP"))) {
++#ifdef __AMIGA__
++				ret.SetPath(L"T:");
++#else
+ 				ret.SetPath(L"/tmp");
++#endif
+ 			}
+ 		}
+ 	}
+@@ -144,6 +153,15 @@
+ 	if (cfg.empty()) {
+ 		cfg = TryDirectory(GetEnv("HOME"), L".filezilla/", false);
+ 	}
++#ifdef __AMIGA__
++	if (cfg.empty()) {
++		// no HOME: the settings live beside the program, in Settings/
++		cfg = GetOwnExecutableDir();
++		if (!cfg.empty()) {
++			cfg += L"Settings/";
++		}
++	}
++#endif
+ 	ret.SetPath(cfg);
+ #endif
+ 	return ret;
+@@ -219,6 +237,11 @@
+ 			return executable.substr(0, pos + 1);
+ 		}
+ 	}
++#elif defined(__AMIGA__)
++	char buf[512];
++	if (fz_amiga_progdir(buf, sizeof buf) > 0) {
++		return fz::to_wstring(std::string(buf));
++	}
+ #else
+ 	std::string path;
+ 	path.resize(4095);
+--- a/src/engine/local_path.cpp
++++ b/src/engine/local_path.cpp
+@@ -17,6 +17,15 @@
+ wchar_t const CLocalPath::path_separator = '/';
+ #endif
+ 
++#ifdef __AMIGA__
++// AmigaDOS paths: "Work:" is a volume's root, "Work:a/b/" a directory in
++// it. The ':' ends the root the way '/' ends every other segment, and a
++// root has no parent here.
++namespace {
++inline bool amiga_sep(wchar_t c) { return c == '/' || c == ':'; }
++}
++#endif
++
+ CLocalPath::CLocalPath(std::wstring const& path, std::wstring* file)
+ {
+ 	SetPath(path, file);
+@@ -124,6 +133,22 @@
+ 			path_out.clear();
+ 			return false;
+ 		}
++#elif defined(__AMIGA__)
++		{
++			// SetPath only accepts absolute paths: a volume or assign, then ':'
++			wchar_t const* colon = in;
++			while (*colon && *colon != ':' && *colon != '/') {
++				++colon;
++			}
++			if (*colon != ':' || colon == in) {
++				path_out.clear();
++				return false;
++			}
++			while (in <= colon) {
++				*out++ = *in++;
++			}
++			segments.push_back(out);
++		}
+ #else
+ 		if (*in++ != '/') {
+ 			// SetPath only accepts absolute paths
+@@ -257,6 +282,9 @@
+ 
+ bool CLocalPath::HasParent() const
+ {
++#ifdef __AMIGA__
++	return !m_path->empty() && m_path->back() != ':';
++#endif
+ #ifdef FZ_WINDOWS
+ 	// C:\f\ has parent
+ 	// C:\ does not
+@@ -307,7 +335,11 @@
+ 	const int min = 0;
+ #endif
+ 	for (int i = (int)m_path->size() - 2; i >= min; --i) {
++#ifdef __AMIGA__
++		if (amiga_sep((*m_path)[i])) {
++#else
+ 		if ((*m_path)[i] == path_separator) {
++#endif
+ 			if (last_segment) {
+ 				*last_segment = m_path->substr(i + 1, m_path->size() - i - 2);
+ 			}
+@@ -338,7 +370,11 @@
+ 	const int min = 0;
+ #endif
+ 	for (int i = (int)path.size() - 2; i >= min; --i) {
++#ifdef __AMIGA__
++		if (amiga_sep(path[i])) {
++#else
+ 		if (path[i] == path_separator) {
++#endif
+ 			if (last_segment) {
+ 				*last_segment = path.substr(i + 1, path.size() - i - 2);
+ 			}
+@@ -400,6 +436,25 @@
+ 		// Relative to current directory
+ 		return SetPath(*m_path + new_path, file);
+ 	}
++#elif defined(__AMIGA__)
++	{
++		size_t const colon = new_path.find(':');
++		if (colon != std::wstring::npos && new_path.find('/') > colon) {
++			if (colon == 0) {
++				// ":x" is x on the current volume
++				if (m_path->empty()) {
++					return false;
++				}
++				return SetPath(m_path->substr(0, m_path->find(':')) + new_path, file);
++			}
++			// Absolute new_path
++			return SetPath(new_path, file);
++		}
++		if (m_path->empty()) {
++			return false;
++		}
++		return SetPath(*m_path + new_path, file);
++	}
+ #else
+ 	if (!new_path.empty() && new_path[0] == path_separator) {
+ 		// Absolute new_path
+@@ -495,7 +550,11 @@
+ 	return true;
+ #else
+ 	std::string path = fz::to_string(*m_path);
++#ifdef __AMIGA__
++	if (path.size() > 1 && path.back() == '/') {
++#else
+ 	if (path.size() > 1) {
++#endif
+ 		path.pop_back();
+ 	}
+ 
+@@ -649,7 +708,11 @@
+ 	const int min = 0;
+ #endif
+ 	for (int i = (int)m_path->size() - 2; i >= min; i--) {
++#ifdef __AMIGA__
++		if (amiga_sep((*m_path)[i])) {
++#else
+ 		if ((*m_path)[i] == path_separator) {
++#endif
+ 			return m_path->substr(i + 1, m_path->size() - i - 2);
+ 		}
+ 	}
