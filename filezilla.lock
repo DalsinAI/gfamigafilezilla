@@ -30,10 +30,12 @@ GMP_SHA256=bd2966e6d277f79328e894a5a9f3ba3fbf2ed2be81def5f48623e30c23fb1572
 ARGON2_VERSION=20190702
 ARGON2_URL=$U/main/a/argon2/argon2_0~20190702+dfsg.orig.tar.xz
 ARGON2_SHA256=815f1017b5b0033204778c2e32443257274bc5d9dd16d355c4f7db8189e23dcc
-# GFOpenWX Toolkit (wxWidgets on GFOpenLayout), main with the frame toolbar
-# and wizards (PR #4).
+# GFOpenWX Toolkit (wxWidgets on GFOpenLayout): main 7fb2de8 (toolbar and
+# wizards, PR #4) plus team3/wx-paths-threads-20261106 at 89b8a62, whose
+# C-locale defaults stop the empty decimal point assert at FileZilla's
+# start. Back to main once that branch is merged.
 WXT_REPO=https://github.com/DalsinAI/gfopenwxtoolkit
-WXT_COMMIT=7fb2de8eb56eac123103f5cbff0cd787ab937268
+WXT_COMMIT=89b8a622422dc246102b09d628c60efd3457b833
 # fpuauto (amicradle-guest common/fpuauto): the FPU when there is one
 FPUAUTO_REPO=https://github.com/DalsinAI/amicradle-guest
 FPUAUTO_COMMIT=462f3a3ccb4cea314e1bb7f7cfaebda266073233

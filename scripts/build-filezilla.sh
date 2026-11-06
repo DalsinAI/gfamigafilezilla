@@ -25,9 +25,16 @@ fetch() { # url sha file
 SRC="$WORK/filezilla"
 # The tree and its objects are kept between runs. When the patches applied
 # so far are unchanged, only new ones go on (make then rebuilds just what
-# they touch); a changed or dropped patch, or a new FileZilla, starts afresh.
+# they touch); a changed or dropped patch, a new FileZilla or a toolkit
+# with other headers starts afresh. A toolkit whose headers are the same
+# only means linking again.
 applied="$SRC/.applied"
-want=$(echo "$FZ_SHA256 $WXT_COMMIT"; for p in "$HERE"/patches/filezilla-*.patch; do [ -f "$p" ] && echo "${p##*/} $(sha256sum < "$p" | cut -c1-16)"; done)
+WXINC=$(find "$(dirname "$WXCONFIG")/../include" -type f | LC_ALL=C sort | xargs cat | sha256sum | cut -c1-16)
+want=$(echo "$FZ_SHA256 $WXINC"; for p in "$HERE"/patches/filezilla-*.patch; do [ -f "$p" ] && echo "${p##*/} $(sha256sum < "$p" | cut -c1-16)"; done)
+# (trees made before the header check named toolkit 7fb2de8, whose headers
+# are those of every toolkit pinned since: take them as they are)
+[ "$(head -1 "$applied" 2>/dev/null)" = "$FZ_SHA256 7fb2de8eb56eac123103f5cbff0cd787ab937268" ] && \
+    sed -i "1s/.*/$FZ_SHA256 $WXINC/" "$applied" && echo 7fb2de8eb56eac123103f5cbff0cd787ab937268 > "$SRC/.toolkit"
 have=$(cat "$applied" 2>/dev/null || :)
 case "$want" in
     "$have"*) [ -n "$have" ] || fresh=1 ;;
@@ -36,7 +43,11 @@ esac
 if [ -n "${fresh:-}" ]; then
     fetch "$FZ_URL" "$FZ_SHA256" filezilla.tar.xz
     rm -rf "$SRC"; mkdir -p "$SRC"; tar xf "$D/filezilla.tar.xz" -C "$SRC" --strip-components=1
-    echo "$FZ_SHA256 $WXT_COMMIT" > "$applied"
+    echo "$FZ_SHA256 $WXINC" > "$applied"
+fi
+if [ "$(cat "$SRC/.toolkit" 2>/dev/null)" != "$WXT_COMMIT" ]; then
+    rm -f "$SRC/src/interface/filezilla"
+    echo "$WXT_COMMIT" > "$SRC/.toolkit"
 fi
 for p in "$HERE"/patches/filezilla-*.patch; do
     [ -f "$p" ] || continue
