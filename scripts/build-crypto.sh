@@ -95,7 +95,7 @@ if [ ! -f "$SYS/lib/libgnutls.a" ] || [ "$(cat "$WORK/.gnutls" 2>/dev/null)" != 
      grep -E 'getentropy|getrandom' config.log | grep -E 'result|cv_func' | head -4
      # the library alone: gnulib's copy for it (gl) and lib, not src/ and its gnulib
      { nice -n 19 make -k -j"$JOBS" -C gl && nice -n 19 make -k -j"$JOBS" -C lib; } > make.log 2>&1 \
-         || { grep -E "error:|undefined" make.log | sort -u | cut -c1-300 | head -60; exit 1; }
+         || { grep -E "error:|undefined|\*\*\*" make.log | sort -u | cut -c1-300 | head -60; tail -25 make.log | cut -c1-300; exit 1; }
      make -C lib install > /dev/null 2>&1 || fail gnutls-install make.log)
     echo "$GNUTLS_SHA256$(stamp gnutls)" > "$WORK/.gnutls"
     echo "gnutls $GNUTLS_VERSION: $(ls -l "$SYS/lib/libgnutls.a" | awk '{print $5}') bytes"
