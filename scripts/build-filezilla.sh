@@ -22,25 +22,31 @@ fetch() { # url sha file
         mv "$D/$3.part" "$D/$3"
     fi
 }
-PSUM=$( (cat "$HERE"/patches/filezilla-*.patch 2>/dev/null; echo "$FZ_SHA256") | sha256sum | cut -c1-16)
 SRC="$WORK/filezilla"
-if [ "$(cat "$SRC/.patched" 2>/dev/null)" != "$PSUM" ]; then
+# The tree and its objects are kept between runs. When the patches applied
+# so far are unchanged, only new ones go on (make then rebuilds just what
+# they touch); a changed or dropped patch, or a new FileZilla, starts afresh.
+applied="$SRC/.applied"
+want=$(echo "$FZ_SHA256 $WXT_COMMIT"; for p in "$HERE"/patches/filezilla-*.patch; do [ -f "$p" ] && echo "${p##*/} $(sha256sum < "$p" | cut -c1-16)"; done)
+have=$(cat "$applied" 2>/dev/null || :)
+case "$want" in
+    "$have"*) [ -n "$have" ] || fresh=1 ;;
+    *) fresh=1 ;;
+esac
+if [ -n "${fresh:-}" ]; then
     fetch "$FZ_URL" "$FZ_SHA256" filezilla.tar.xz
     rm -rf "$SRC"; mkdir -p "$SRC"; tar xf "$D/filezilla.tar.xz" -C "$SRC" --strip-components=1
-    for p in "$HERE"/patches/filezilla-*.patch; do
-        [ -f "$p" ] || continue
-        patch -s -d "$SRC" -p1 < "$p" || { echo "patch failed: $p"; exit 1; }
-    done
-    echo "$PSUM" > "$SRC/.patched"
+    echo "$FZ_SHA256 $WXT_COMMIT" > "$applied"
 fi
-# Boost.Regex, headers only
-BR="$WORK/boost-regex"
-if [ "$(cat "$BR/.commit" 2>/dev/null)" != "$BREGEX_COMMIT" ]; then
-    rm -rf "$BR"; mkdir -p "$BR"; git -C "$BR" init -q
-    git -C "$BR" fetch -q --depth 1 "$BREGEX_GIT" "$BREGEX_COMMIT"
-    git -C "$BR" checkout -q FETCH_HEAD -- include
-    echo "$BREGEX_COMMIT" > "$BR/.commit"
-fi
+for p in "$HERE"/patches/filezilla-*.patch; do
+    [ -f "$p" ] || continue
+    line="${p##*/} $(sha256sum < "$p" | cut -c1-16)"
+    grep -qxF "$line" "$applied" && continue
+    patch -s -d "$SRC" -p1 < "$p" || { echo "patch failed: $p"; rm -f "$applied"; exit 1; }
+    echo "$line" >> "$applied"
+    # a patch to configure itself means configuring again
+    grep -q '^+++ b/configure' "$p" && rm -f "$SRC/config.status"
+done
 cd "$SRC"
 if [ ! -f config.status ]; then
     CC="m68k-amigaos-gcc $SPECS" CXX="m68k-amigaos-g++ $SPECS" \
