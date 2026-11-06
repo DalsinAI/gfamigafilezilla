@@ -1,0 +1,37 @@
+; Install-FileZilla: puts the FileZilla drawer where you choose.
+; Designed, tested and delivered by The AmiCradle Team.
+; Copyright (c) 2026 AmiCradle Team
+
+(set #version "0.1.0-rc1")
+(welcome (cat "FileZilla " #version " for AmigaOS 3"))
+
+(if (< (database "cpu") "68040")
+    (abort "FileZilla needs a 68040 or 68060."))
+
+(set #dest
+    (askdir
+        (prompt "Where should the FileZilla drawer go?")
+        (help @askdir-help)
+        (default "Work:")))
+(set #drawer (tackon #dest "FileZilla"))
+
+(makedir #drawer (infos))
+(copyfiles
+    (prompt "Copying FileZilla")
+    (help @copyfiles-help)
+    (source "")
+    (dest #drawer)
+    (pattern "~(Install-FileZilla#?)")
+    (infos))
+(copyfiles (source "resources") (dest (tackon #drawer "resources")) (all))
+
+(set #missing "")
+(if (not (exists "LIBS:z.library"))
+    (set #missing (cat #missing "\n  LIBS:z.library")))
+(if (not (exists "SYS:Classes/DataTypes/gfopenpng.datatype"))
+    (set #missing (cat #missing "\n  gfopenpng.datatype (its icons and images)")))
+(if (<> #missing "")
+    (message (cat "FileZilla also needs these, which GFOpenUp installs:" #missing)))
+
+(set @default-dest #drawer)
+(exit (cat "FileZilla is in " #drawer ".") (quiet))
