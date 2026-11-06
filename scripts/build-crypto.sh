@@ -41,7 +41,7 @@ fail() { # what, log: the log's end and, from configure, its checks that failed
 
 # ---- our getentropy() and the rest libnix lacks
 A="$WORK/fzamiga"; mkdir -p "$A"
-for c in getentropy netcompat libccompat iconv dircompat dosrun idna wordexp; do
+for c in getentropy netcompat libccompat iconv dircompat dosrun idna wordexp volumes; do
     "$TC/bin/m68k-amigaos-gcc" $CF -Wall -I"$HERE/deps/amiga/include" -c "$HERE/deps/amiga/$c.c" -o "$A/$c.o" \
         || { echo "deps/amiga/$c.c failed"; exit 1; }
 done

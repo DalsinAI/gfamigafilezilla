@@ -49,6 +49,14 @@ if [ "$(cat "$SRC/.toolkit" 2>/dev/null)" != "$WXT_COMMIT" ]; then
     rm -f "$SRC/src/interface/filezilla"
     echo "$WXT_COMMIT" > "$SRC/.toolkit"
 fi
+# libfilezilla's headers changed (a patch to one of its classes): make
+# tracks no header dependencies here, so every object is built again
+LFZINC=$(find "$SYS/include/libfilezilla" -type f | LC_ALL=C sort | xargs cat | sha256sum | cut -c1-16)
+if [ "$(cat "$SRC/.lfzinc" 2>/dev/null)" != "$LFZINC" ]; then
+    find "$SRC" \( -name "*.o" -o -name "*.lo" -o -name "*.a" \) -delete
+    rm -f "$SRC/src/interface/filezilla"
+    echo "$LFZINC" > "$SRC/.lfzinc"
+fi
 for p in "$HERE"/patches/filezilla-*.patch; do
     [ -f "$p" ] || continue
     line="${p##*/} $(sha256sum < "$p" | cut -c1-16)"
@@ -108,4 +116,13 @@ rm -rf "$WORK/stage" "$OUT/resources"
 make -C src/interface/resources install DESTDIR="$WORK/stage" > install.log 2>&1 || { tail -20 install.log; exit 1; }
 cp -R "$WORK/stage/FileZilla/share/filezilla/resources" "$OUT/resources"
 echo "resources: $(find "$OUT/resources" -type f | wc -l) files"
+# the drawer as it ships: icons, the installer script, the notes and licences
+python3 -I "$HERE/scripts/make-icon.py" tool "$OUT/FileZilla.info"
+python3 -I "$HERE/scripts/make-icon.py" install "$OUT/Install-FileZilla.info"
+# the drawer's own icon: the archive puts it beside the drawer as FileZilla.info
+python3 -I "$HERE/scripts/make-icon.py" drawer "$OUT/FileZilla-drawer.info"
+cp "$HERE/package/Install-FileZilla" "$HERE/package/README.txt" "$OUT/"
+cp "$SRC/COPYING" "$OUT/COPYING-FileZilla.txt"
+cp "$WORK/fzssh/agpl3.txt" "$OUT/COPYING-fzssh.txt"
+cp "$HERE/LICENSE" "$OUT/LICENSE-port.txt"
 ls -l "$OUT/FileZilla"
