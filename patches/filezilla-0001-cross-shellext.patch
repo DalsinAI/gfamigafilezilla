@@ -1,0 +1,13 @@
+AmigaOS: the (empty) shell extension sub-configure is a cross build too.
+
+--- a/configure	2026-11-06 02:19:36.776097994 +0000
++++ b/configure	2026-11-06 02:19:36.781252507 +0000
+@@ -20904,7 +20904,7 @@
+   "$ac_abs_confdir/src/fzshellext/configure" --prefix="$prefix" --exec-prefix="$exec_prefix" --host=x86_64-w64-mingw32 || exit 1
+ else
+   cd "$OLD_DIR/src/fzshellext/64" || exit 1
+-  "$ac_abs_confdir/src/fzshellext/configure" --disable-shellext || exit 1
++  "$ac_abs_confdir/src/fzshellext/configure" --disable-shellext --host="$host_alias" --build="$build_alias" || exit 1
+ fi
+ cd "$OLD_DIR"
+ 
