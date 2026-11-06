@@ -48,7 +48,10 @@ FPUAUTO_COMMIT=462f3a3ccb4cea314e1bb7f7cfaebda266073233
 # SQLite (public domain): the amalgamation Audacity 3.7.9 keeps in lib-src/sqlite
 SQLITE_GIT=https://github.com/audacity/audacity.git
 SQLITE_COMMIT=86d74c770974b25188ca2f23bcce47c1181bd08a
-# Boost.Regex in its header-only standalone mode, for FileZilla's filters
-# (libstdc++'s std::regex recurses per character: GCC bug 86164). Boost 1.89.0.
-BREGEX_GIT=https://github.com/boostorg/regex.git
-BREGEX_COMMIT=f439e22ae41fa647bd7de16c2d92deb232593985
+# Boost from our shared Boost (DalsinAI/gfopenboost, one Amiga config):
+# FileZilla's filters use Boost.Regex in its header-only standalone mode
+# (libstdc++'s std::regex recurses per character: GCC bug 86164), so only
+# the SDK's headers are taken.
+GFBOOST_VERSION=1.89.0-rc1
+GFBOOST_URL=https://github.com/DalsinAI/gfopenboost/releases/download/v1.89.0-rc1/gfopenboost-1.89.0-sdk.tar.xz
+GFBOOST_SHA256=a6cad796bc9f7ac84e81704bef6553f63588255eb7012512d0359654507be52a

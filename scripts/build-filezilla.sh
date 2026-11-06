@@ -58,13 +58,14 @@ for p in "$HERE"/patches/filezilla-*.patch; do
     # a patch to configure itself means configuring again
     grep -q '^+++ b/configure' "$p" && rm -f "$SRC/config.status"
 done
-# Boost.Regex, headers only
-BR="$WORK/boost-regex"
-if [ "$(cat "$BR/.commit" 2>/dev/null)" != "$BREGEX_COMMIT" ]; then
-    rm -rf "$BR"; mkdir -p "$BR"; git -C "$BR" init -q
-    git -C "$BR" fetch -q --depth 1 "$BREGEX_GIT" "$BREGEX_COMMIT"
-    git -C "$BR" checkout -q FETCH_HEAD -- include
-    echo "$BREGEX_COMMIT" > "$BR/.commit"
+# Boost's headers from our shared Boost SDK (Boost.Regex is used header-only)
+BR="$WORK/gfopenboost"
+if [ "$(cat "$BR/.sha" 2>/dev/null)" != "$GFBOOST_SHA256" ]; then
+    fetch "$GFBOOST_URL" "$GFBOOST_SHA256" gfopenboost-sdk.tar.xz
+    rm -rf "$BR"; mkdir -p "$BR"
+    tar xJf "$D/gfopenboost-sdk.tar.xz" -C "$BR" --strip-components=1 --wildcards '*/include/*'
+    echo "$GFBOOST_SHA256" > "$BR/.sha"
+    rm -f "$SRC/config.status"
 fi
 cd "$SRC"
 if [ ! -f config.status ]; then
