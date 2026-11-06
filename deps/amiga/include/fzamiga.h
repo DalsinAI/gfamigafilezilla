@@ -32,6 +32,11 @@
 #undef nanosleep
 #undef readv
 #undef writev
+/* exec/lists.h (through the socket headers) has function-like macros named
+ * like the toolkit's wxComboBox::IsListEmpty() and the like; nothing here
+ * uses them. */
+#undef IsListEmpty
+#undef IsMsgPortEmpty
 #ifdef __cplusplus
 extern "C" {
 #endif
