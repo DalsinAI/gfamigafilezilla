@@ -49,14 +49,6 @@ if [ "$(cat "$SRC/.toolkit" 2>/dev/null)" != "$WXT_COMMIT" ]; then
     rm -f "$SRC/src/interface/filezilla"
     echo "$WXT_COMMIT" > "$SRC/.toolkit"
 fi
-# libfilezilla's headers changed (a patch to one of its classes): make
-# tracks no header dependencies here, so every object is built again
-LFZINC=$(find "$SYS/include/libfilezilla" -type f | LC_ALL=C sort | xargs cat | sha256sum | cut -c1-16)
-if [ "$(cat "$SRC/.lfzinc" 2>/dev/null)" != "$LFZINC" ]; then
-    find "$SRC" \( -name "*.o" -o -name "*.lo" -o -name "*.a" \) -delete
-    rm -f "$SRC/src/interface/filezilla"
-    echo "$LFZINC" > "$SRC/.lfzinc"
-fi
 for p in "$HERE"/patches/filezilla-*.patch; do
     [ -f "$p" ] || continue
     line="${p##*/} $(sha256sum < "$p" | cut -c1-16)"
