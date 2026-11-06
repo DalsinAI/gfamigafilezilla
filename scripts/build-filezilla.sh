@@ -77,6 +77,8 @@ if [ "$st" != 0 ]; then
     grep -E "error:|undefined reference|Error [0-9]" make.log | grep -v "/bin/ld:" | sort -u | cut -c1-300 | head -40
     # the linker's own words: which symbols, which libraries
     grep -E "/bin/ld: " make.log | sed 's|.*/bin/ld: ||' | sed 's|^[^ ]*/\([^/ ]*\.o\)|\1|' | sort | uniq -c | sort -rn | cut -c1-260 | head -100
+    # and the final link's whole say, before collect2
+    echo "-- before collect2:"; grep -v -E "warning:|duplicate section|^libtool:|^ *[a-z0-9_+-]*-gcc|^ *[a-z0-9_+-]*-g\+\+" make.log | grep -B25 "collect2:" | cut -c1-400 | tail -40
     exit 1
 fi
 cp src/interface/filezilla "$OUT/FileZilla"
