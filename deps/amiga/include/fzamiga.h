@@ -14,6 +14,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <dirent.h>
+#include <sys/stat.h>
 /* pthread.h's cancellation-point wrappers are function-like macros
  * (read(...) and the like) that break "::read" and members named read or
  * close, as the GFOpenWX Toolkit's amigacompat.h says; nothing here is
@@ -47,6 +49,58 @@ const char *getprogname(void);
 size_t wcsnlen(const wchar_t *s, size_t maxlen);
 size_t mbsrtowcs(wchar_t *dst, const char **src, size_t len, mbstate_t *ps);
 size_t wcsrtombs(char *dst, const wchar_t **src, size_t len, mbstate_t *ps);
+size_t mbsnrtowcs(wchar_t *dst, const char **src, size_t nms, size_t len, mbstate_t *ps);
+size_t wcsnrtombs(char *dst, const wchar_t **src, size_t nwc, size_t len, mbstate_t *ps);
+int wcsncasecmp(const wchar_t *a, const wchar_t *b, size_t n);
+int wcscasecmp(const wchar_t *a, const wchar_t *b);
+/* libnix has these; the headers show them only to POSIX 2008 or GNU source */
+int ftruncate(int fd, off_t length);
+char *realpath(const char *path, char *resolved);
+ssize_t readlink(const char *path, char *buf, size_t size);
+/* dircompat.c: directories by token (libnix's DIR has no descriptor) */
+int fz_amiga_dir_register(DIR *d, const char *path);
+void fz_amiga_dir_forget(DIR *d);
+int dirfd(DIR *d);
+DIR *fdopendir(int fd);
+int fstatat(int fd, const char *name, struct stat *st, int flags);
+int utimensat(int fd, const char *name, const struct timespec t[2], int flags);
+int futimens(int fd, const struct timespec t[2]);
+/* dosrun.c */
+int fz_amiga_run_detached(const char *cmdline);
+#ifndef AT_FDCWD
+#define AT_FDCWD -2
+#endif
+#ifndef AT_SYMLINK_NOFOLLOW
+#define AT_SYMLINK_NOFOLLOW 2
+#endif
+#ifndef UTIME_NOW
+#define UTIME_NOW -2L
+#define UTIME_OMIT -1L
+#endif
+/* nothing is exec()ed on AmigaOS: no descriptor to close on exec */
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+/* bsdsocket.library speaks IPv4 only; these let IPv6 code build and fail
+ * at run time as on a host without IPv6 */
+#ifndef IPPROTO_IPV6
+#define IPPROTO_IPV6 41
+#endif
+#ifndef IPV6_V6ONLY
+#define IPV6_V6ONLY 27
+#endif
+#ifndef _SS_SIZE
+#define _SS_SIZE 128
+struct sockaddr_storage {
+    union {
+        struct sockaddr __ss_sa;
+        struct sockaddr_in __ss_in;
+        struct sockaddr_in6 __ss_in6;
+        char __ss_pad[_SS_SIZE];
+    };
+};
+#define ss_family __ss_sa.sa_family
+#endif
 #ifndef NI_MAXHOST
 #define NI_MAXHOST 1025
 #define NI_MAXSERV 32

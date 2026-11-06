@@ -1,6 +1,7 @@
 /* libccompat.c - the C library calls libfilezilla and FileZilla use that
- * libnix lacks: timegm(), wcsnlen(), getprogname(), vasprintf() and the restartable UTF-8 conversions
- * mbsrtowcs()/wcsrtombs() (the programs run their strings as UTF-8).
+ * libnix lacks: timegm(), wcsnlen(), wcs(n)casecmp(), getprogname(), vasprintf() and the
+ * restartable UTF-8 conversions mbs(n)rtowcs()/wcs(n)rtombs() (the programs run their strings
+ * as UTF-8).
  * Copyright (c) 2026 AmiCradle Team */
 #include <errno.h>
 #include <stdarg.h>
@@ -46,26 +47,43 @@ static int utf8_in(const unsigned char *s, unsigned long *cp)
     *cp = c; return n;
 }
 
-size_t mbsrtowcs(wchar_t *dst, const char **src, size_t len, mbstate_t *ps)
+/* the restartable conversions, with mbsnrtowcs()/wcsnrtombs() limiting the
+ * input: at most nms bytes or nwc wide characters are read. A sequence cut
+ * by the limit is left for the next call, as POSIX says. */
+size_t mbsnrtowcs(wchar_t *dst, const char **src, size_t nms, size_t len, mbstate_t *ps)
 {
-    const unsigned char *s = (const unsigned char *)*src; size_t n = 0;
+    const unsigned char *s = (const unsigned char *)*src; size_t n = 0, left = nms;
     (void)ps;
     while (!dst || n < len) {
-        unsigned long cp; int k = utf8_in(s, &cp);
+        unsigned long cp; int k, need;
+        if (!left) break;
+        need = s[0] < 0x80 ? 1 : (s[0] & 0xe0) == 0xc0 ? 2 : (s[0] & 0xf0) == 0xe0 ? 3 : (s[0] & 0xf8) == 0xf0 ? 4 : 1;
+        if ((size_t)need > left) {
+            /* the bytes there must still be a valid start, else it is bad now */
+            size_t i; int bad = 0;
+            for (i = 1; i < left; i++) if ((s[i] & 0xc0) != 0x80) bad = 1;
+            if (!bad) break;
+        }
+        k = utf8_in(s, &cp);
         if (k < 0) { errno = EILSEQ; if (dst) *src = (const char *)s; return (size_t)-1; }
         if (k == 0) { if (dst) { dst[n] = 0; *src = NULL; } return n; }
         if (dst) dst[n] = (wchar_t)cp;
-        n++; s += k;
+        n++; s += k; left -= (size_t)k;
     }
-    *src = (const char *)s;
+    if (dst) *src = (const char *)s;
     return n;
 }
 
-size_t wcsrtombs(char *dst, const wchar_t **src, size_t len, mbstate_t *ps)
+size_t mbsrtowcs(wchar_t *dst, const char **src, size_t len, mbstate_t *ps)
+{
+    return mbsnrtowcs(dst, src, (size_t)-1, len, ps);
+}
+
+size_t wcsnrtombs(char *dst, const wchar_t **src, size_t nwc, size_t len, mbstate_t *ps)
 {
     const wchar_t *w = *src; size_t n = 0;
     (void)ps;
-    for (;; w++) {
+    for (; nwc; w++, nwc--) {
         unsigned long c = (unsigned long)*w; unsigned char b[4]; int k;
         if (c < 0x80) { b[0] = (unsigned char)c; k = 1; }
         else if (c < 0x800) { b[0] = (unsigned char)(0xc0 | c >> 6); b[1] = (unsigned char)(0x80 | (c & 0x3f)); k = 2; }
@@ -83,6 +101,35 @@ size_t wcsrtombs(char *dst, const wchar_t **src, size_t len, mbstate_t *ps)
         if (c == 0) { if (dst) *src = NULL; return n; }
         n += (size_t)k;
     }
+    if (dst) *src = w;
+    return n;
+}
+
+size_t wcsrtombs(char *dst, const wchar_t **src, size_t len, mbstate_t *ps)
+{
+    return wcsnrtombs(dst, src, (size_t)-1, len, ps);
+}
+
+/* case-blind compare: ASCII and Latin-1 letters, what an Amiga's own names use */
+static unsigned long fold(unsigned long c)
+{
+    if ((c >= 'A' && c <= 'Z') || (c >= 0xc0 && c <= 0xde && c != 0xd7)) return c + 32;
+    return c;
+}
+
+int wcsncasecmp(const wchar_t *a, const wchar_t *b, size_t n)
+{
+    for (; n; a++, b++, n--) {
+        unsigned long x = fold((unsigned long)*a), y = fold((unsigned long)*b);
+        if (x != y) return x < y ? -1 : 1;
+        if (!x) break;
+    }
+    return 0;
+}
+
+int wcscasecmp(const wchar_t *a, const wchar_t *b)
+{
+    return wcsncasecmp(a, b, (size_t)-1);
 }
 
 /* the program's name: its CLI command name when run from a shell, else its
