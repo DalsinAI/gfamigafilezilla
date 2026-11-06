@@ -35,6 +35,7 @@ fail() {
     exit 1; }
 
 # ---- libfilezilla
+rm -f "$SYS/lib/libfilezilla.la"
 if [ ! -f "$SYS/lib/libfilezilla.a" ] || [ "$(cat "$WORK/.lfz" 2>/dev/null)" != "$LFZ_SHA256$(stamp libfilezilla)" ]; then
     fetch "$LFZ_URL" "$LFZ_SHA256" libfilezilla.tar.xz; unpack libfilezilla.tar.xz libfilezilla
     (cd "$WORK/libfilezilla" && CC="m68k-amigaos-gcc $SPECS" CXX="m68k-amigaos-g++ $SPECS" \
@@ -46,7 +47,9 @@ if [ ! -f "$SYS/lib/libfilezilla.a" ] || [ "$(cat "$WORK/.lfz" 2>/dev/null)" != 
         || fail libfilezilla-configure configure.log
      grep -E '^#define (HAVE_|FZ_)' config.h 2>/dev/null | head -40 || :
      nice -n 19 make -k -j"$JOBS" -C lib > make.log 2>&1 || { grep -E 'error|Error' make.log | cut -c1-300 | head -60; exit 1; }
-     make -C lib install > /dev/null 2>&1 || fail libfilezilla-install make.log)
+     make -C lib install > /dev/null 2>&1 || fail libfilezilla-install make.log
+     # libtool's .la would hand FileZilla's link Unix-only -lcrypt; pkg-config has the rest
+     rm -f "$SYS/lib/libfilezilla.la")
     echo "$LFZ_SHA256$(stamp libfilezilla)" > "$WORK/.lfz"
     echo "libfilezilla $LFZ_VERSION: $(ls -l "$SYS/lib/libfilezilla.a" | awk '{print $5}') bytes"
 fi
