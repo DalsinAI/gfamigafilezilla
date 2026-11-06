@@ -1,0 +1,107 @@
+AmigaOS: "/" lists the mounted volumes (SYS:, Work:, ...) as directories,
+so FileZilla's local tree and file list start from the volumes, as
+Windows' start from the drives. The names come from fz_amiga_volumes()
+(deps/amiga/volumes.c).
+
+--- a/lib/libfilezilla/local_filesys.hpp
++++ b/lib/libfilezilla/local_filesys.hpp
+@@ -6,6 +6,8 @@
+ #include "time.hpp"
+ #include "file.hpp"
+ 
++#include <vector>
++
+ #ifdef FZ_WINDOWS
+ #include "glue/windows.hpp"
+ #else
+@@ -140,6 +142,12 @@
+ #else
+ 	DIR* dir_{};
+ #endif
++#ifdef __AMIGA__
++	// "/" is the list of mounted volumes ("SYS:", "Work:", ...)
++	std::vector<native_string> volumes_;
++	size_t volume_next_{};
++	bool volumes_open_{};
++#endif
+ 
+ 	// State for directory enumeration
+ 	bool dirs_only_{};
+--- a/lib/local_filesys.cpp
++++ b/lib/local_filesys.cpp
+@@ -477,6 +477,21 @@
+ 		path.pop_back();
+ 	}
+ 
++#ifdef __AMIGA__
++	if (path == "/") {
++		char buf[4096];
++		int const n = fz_amiga_volumes(buf, sizeof(buf));
++		char const* p = buf;
++		for (int i = 0; i < n; ++i) {
++			volumes_.emplace_back(p);
++			p += strlen(p) + 1;
++		}
++		volume_next_ = 0;
++		volumes_open_ = true;
++		return {result::ok};
++	}
++#endif
++
+ 	dir_ = opendir(path.c_str());
+ #ifdef __AMIGA__
+ 	// libnix's DIR has no descriptor: dircompat.c keeps its path for fstatat()
+@@ -568,6 +583,10 @@
+ 	buffer_.clear();
+ 	cur_ = nullptr;
+ #else
++#ifdef __AMIGA__
++	volumes_.clear();
++	volumes_open_ = false;
++#endif
+ 	if (dir_) {
+ #ifdef __AMIGA__
+ 		fz_amiga_dir_forget(dir_);
+@@ -716,6 +735,15 @@
+ 	name.clear();
+ 	return false;
+ #else
++#ifdef __AMIGA__
++	if (volumes_open_) {
++		if (volume_next_ >= volumes_.size()) {
++			return false;
++		}
++		name = volumes_[volume_next_++];
++		return true;
++	}
++#endif
+ 	if (!dir_) {
+ 		return false;
+ 	}
+@@ -868,6 +896,26 @@
+ 
+ 	return false;
+ #else
++#ifdef __AMIGA__
++	if (volumes_open_) {
++		if (volume_next_ >= volumes_.size()) {
++			return false;
++		}
++		name = volumes_[volume_next_++];
++		is_link = false;
++		t = dir;
++		if (size) {
++			*size = -1;
++		}
++		if (modification_time) {
++			*modification_time = datetime();
++		}
++		if (mode) {
++			*mode = 0;
++		}
++		return true;
++	}
++#endif
+ 	if (!dir_) {
+ 		return false;
+ 	}
