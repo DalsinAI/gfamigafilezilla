@@ -41,12 +41,12 @@ fail() { # what, log: the log's end and, from configure, its checks that failed
 
 # ---- our getentropy() and the rest libnix lacks
 A="$WORK/fzamiga"; mkdir -p "$A"
-for c in getentropy netcompat libccompat; do
+for c in getentropy netcompat libccompat iconv; do
     "$TC/bin/m68k-amigaos-gcc" $CF -Wall -I"$HERE/deps/amiga/include" -c "$HERE/deps/amiga/$c.c" -o "$A/$c.o" \
         || { echo "deps/amiga/$c.c failed"; exit 1; }
 done
 rm -f "$SYS/lib/libfzamiga.a"; "$TC/bin/m68k-amigaos-ar" rcs "$SYS/lib/libfzamiga.a" "$A"/*.o
-cp "$HERE/deps/amiga/include/fzamiga.h" "$HERE/deps/amiga/include/fzdecl.h" "$SYS/include/"
+cp "$HERE/deps/amiga/include/fzamiga.h" "$HERE/deps/amiga/include/fzdecl.h" "$HERE/deps/amiga/include/iconv.h" "$SYS/include/"
 
 # ---- GMP (generic C for now: its m68k assembly is a later speed step)
 if [ ! -f "$SYS/lib/libgmp.a" ] || [ "$(cat "$WORK/.gmp" 2>/dev/null)" != "$GMP_SHA256$(stamp gmp)" ]; then
