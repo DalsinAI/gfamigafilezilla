@@ -46,7 +46,7 @@ if [ ! -f config.status ]; then
     CC="m68k-amigaos-gcc $SPECS" CXX="m68k-amigaos-g++ $SPECS" \
     CFLAGS="$OPT -include fzamiga.h -I$SYS/include" CXXFLAGS="$OPT -include fzamiga.h -I$SYS/include -I$BR/include" \
     LDFLAGS="-L$SYS/lib -specs=$FPUSPECS -L$FPULIB" LIBS="-lfzamiga -lsocket -lpthread -latomic" \
-    PKG_CONFIG="pkg-config --static" ac_cv_func_timegm=yes ./configure --host=m68k-amigaos --build="$HOSTB" --prefix=/FileZilla \
+    PKG_CONFIG="pkg-config --static" ac_cv_func_timegm=yes ac_cv_func_localtime_r=yes ac_cv_func_gmtime_r=yes ./configure --host=m68k-amigaos --build="$HOSTB" --prefix=/FileZilla \
         --with-wx-config="$WXCONFIG" --disable-shared --enable-static --disable-locales --disable-manualupdatecheck \
         --disable-autoupdatecheck --without-dbus --disable-storj --disable-precomp --with-pugixml=builtin --with-idn-lib=-lfzamiga \
         --disable-dependency-tracking > configure.log 2>&1 || {
