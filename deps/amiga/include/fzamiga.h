@@ -72,6 +72,7 @@ __stdargs int utimensat(int fd, const char *name, const struct timespec *t, int 
 __stdargs int futimens(int fd, const struct timespec *t);
 /* dosrun.c */
 int fz_amiga_run_detached(const char *cmdline);
+int fz_amiga_progdir(char *buf, int len);
 #ifndef AT_FDCWD
 #define AT_FDCWD -2
 #endif

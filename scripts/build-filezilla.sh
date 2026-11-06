@@ -90,4 +90,10 @@ fi
 cp src/interface/filezilla "$OUT/FileZilla"
 # 247 MB with its symbols; the program itself is far smaller
 m68k-amigaos-strip "$OUT/FileZilla"
+# its resources (themes, icons, default filters), which it looks for in
+# resources/ beside the program
+rm -rf "$WORK/stage" "$OUT/resources"
+make -C src/interface/resources install DESTDIR="$WORK/stage" > install.log 2>&1 || { tail -20 install.log; exit 1; }
+cp -R "$WORK/stage/FileZilla/share/filezilla/resources" "$OUT/resources"
+echo "resources: $(find "$OUT/resources" -type f | wc -l) files"
 ls -l "$OUT/FileZilla"
