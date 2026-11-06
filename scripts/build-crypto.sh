@@ -49,6 +49,13 @@ done
 rm -f "$SYS/lib/libfzamiga.a"; "$TC/bin/m68k-amigaos-ar" rcs "$SYS/lib/libfzamiga.a" "$A"/*.o
 cp "$HERE/deps/amiga/include/fzamiga.h" "$HERE/deps/amiga/include/fzdecl.h" "$HERE/deps/amiga/include/iconv.h" "$HERE/deps/amiga/include/idna.h" "$HERE/deps/amiga/include/idn-free.h" "$SYS/include/"
 
+# ---- what an older sysroot still holds from GnuTLS, Nettle, GMP and Argon2:
+# gone, so nothing can link them by mistake
+rm -rf "$SYS/include/gnutls" "$SYS/include/nettle" "$SYS/include/gmp.h" "$SYS/include/argon2.h" \
+    "$SYS/lib/libgnutls.a" "$SYS/lib/libgnutls.la" "$SYS/lib/libnettle.a" "$SYS/lib/libhogweed.a" \
+    "$SYS/lib/libgmp.a" "$SYS/lib/libgmp.la" "$SYS/lib/libargon2.a" \
+    "$SYS/lib/pkgconfig/gnutls.pc" "$SYS/lib/pkgconfig/nettle.pc" "$SYS/lib/pkgconfig/hogweed.pc" "$SYS/lib/pkgconfig/gmp.pc"
+
 # ---- GFOpenTLS and GFOpenCrypto: headers and link stubs (no floating point)
 if [ ! -f "$SYS/lib/libgfopentls.a" ] || [ "$(cat "$WORK/.gfopentls" 2>/dev/null)" != "$GFOPENTLS_COMMIT" ]; then
     G="$WORK/gfopentls"
