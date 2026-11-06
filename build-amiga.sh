@@ -63,7 +63,14 @@ fetch gfopenwxtoolkit "$WXT_REPO" "$WXT_COMMIT"
 WXT="$WORK/deps/gfopenwxtoolkit"; WXB="$WORK/gfopenwx"
 if [ ! -x "$WXB/out/sdk/bin/wx-config" ] || [ "$(cat "$WXB/.rev" 2>/dev/null)" != "$WXT_COMMIT" ]; then
     echo "toolkit $WXT_COMMIT: building its SDK"
-    st=0; STOVE="$STOVE" WORK="$WXB" OUT="$WXB/out" JOBS=$JOBS sh "$WXT/build-amiga.sh" > "$WORK/wx.log" 2>&1 || st=$?
+    # its make goes on where it stopped, so a run that runs out of time
+    # ends cleanly here and the next one carries on
+    wleft=$(( ${BUDGET_TOTAL:-840} - 20 - ($(date +%s) - t0) ))
+    st=0; STOVE="$STOVE" WORK="$WXB" OUT="$WXB/out" JOBS=$JOBS timeout "$wleft" sh "$WXT/build-amiga.sh" > "$WORK/wx.log" 2>&1 || st=$?
+    if [ "$st" = 124 ]; then
+        echo "toolkit SDK not finished this run ($(find "$WXB" -name '*.o' -newer "$WXT/build-amiga.sh" | wc -l) objects so far)"
+        exit 0
+    fi
     [ "$st" = 0 ] || { tail -40 "$WORK/wx.log"; exit 1; }
     [ -x "$WXB/out/sdk/bin/wx-config" ] || { tail -20 "$WORK/wx.log"; echo "toolkit SDK not finished this run"; exit 0; }
     echo "$WXT_COMMIT" > "$WXB/.rev"
