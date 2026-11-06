@@ -2,7 +2,8 @@
  * AmigaOS 3. libnix's DIR has no descriptor, so each directory
  * libfilezilla opens is registered here with its path; dirfd() hands out a
  * token for it, and fstatat()/fdopendir() turn that token back into the
- * path. Also utimensat()/futimens() over libnix's utimes().
+ * path. Also utimensat()/futimens() over libnix's utimes(), and
+ * fchmod()/fchown().
  * Copyright (c) 2026 AmiCradle Team */
 #include <errno.h>
 #include <stdlib.h>
@@ -12,6 +13,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <fcntl.h>
+#include <unistd.h>
 #include <proto/dos.h>
 #include "fzamiga.h"
 
@@ -117,4 +119,22 @@ __stdargs int futimens(int fd, const struct timespec *t)
     if (!sfd || !sfd->lx_fh) { errno = EBADF; return -1; }
     if (!NameFromFH((BPTR)sfd->lx_fh, (STRPTR)path, sizeof path)) { errno = EIO; return -1; }
     return utimensat(AT_FDCWD, path, t, 0);
+}
+
+/* SQLite's unix VFS: AmigaDOS has no owners, and the mode goes through the
+ * file's name. */
+int fchmod(int fd, mode_t mode)
+{
+    char path[1024];
+    StdFileDes *sfd = _lx_fhfromfd(fd);
+    if (!sfd || !sfd->lx_fh) { errno = EBADF; return -1; }
+    if (!NameFromFH((BPTR)sfd->lx_fh, (STRPTR)path, sizeof path)) { errno = EIO; return -1; }
+    return chmod(path, mode);
+}
+
+int fchown(int fd, uid_t owner, gid_t group)
+{
+    (void)owner; (void)group;
+    if (!_lx_fhfromfd(fd)) { errno = EBADF; return -1; }
+    return 0;
 }

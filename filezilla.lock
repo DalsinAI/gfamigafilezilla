@@ -30,12 +30,10 @@ GMP_SHA256=bd2966e6d277f79328e894a5a9f3ba3fbf2ed2be81def5f48623e30c23fb1572
 ARGON2_VERSION=20190702
 ARGON2_URL=$U/main/a/argon2/argon2_0~20190702+dfsg.orig.tar.xz
 ARGON2_SHA256=815f1017b5b0033204778c2e32443257274bc5d9dd16d355c4f7db8189e23dcc
-# GFOpenWX Toolkit (wxWidgets on GFOpenLayout). FileZilla needs the frame
-# toolbar and wizards: toolkit PR #4's branch (team3/wx-toolbar-books-20261106)
-# at c2382bf, until PR #4 is merged and main has them (main a0b8736 has AUI
-# and XRC, PR #3, but no toolbar or wizard).
+# GFOpenWX Toolkit (wxWidgets on GFOpenLayout), main with the frame toolbar
+# and wizards (PR #4).
 WXT_REPO=https://github.com/DalsinAI/gfopenwxtoolkit
-WXT_COMMIT=c2382bfd72efb0c08c71cc6588a313acdec4e0ee
+WXT_COMMIT=7fb2de8eb56eac123103f5cbff0cd787ab937268
 # fpuauto (amicradle-guest common/fpuauto): the FPU when there is one
 FPUAUTO_REPO=https://github.com/DalsinAI/amicradle-guest
 FPUAUTO_COMMIT=462f3a3ccb4cea314e1bb7f7cfaebda266073233
