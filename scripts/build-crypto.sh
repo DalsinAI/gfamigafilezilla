@@ -58,7 +58,7 @@ if [ ! -f "$SYS/lib/libgfopentls.a" ] || [ "$(cat "$WORK/.gfopentls" 2>/dev/null
         echo "$GFOPENTLS_COMMIT" > "$G/.commit"
     fi
     rm -rf "$G/out"
-    (cd "$G" && STOVE="$(dirname "$TC")" OUT="$G/out" ./build-amiga.sh) > "$WORK/gfopentls.log" 2>&1 || fail gfopentls "$WORK/gfopentls.log"
+    (cd "$G" && STOVE="$(dirname "$TC")" OUT="$G/out" sh ./build-amiga.sh) > "$WORK/gfopentls.log" 2>&1 || fail gfopentls "$WORK/gfopentls.log"
     grep "FPU check" "$WORK/gfopentls.log" || :
     rm -f "$SYS/lib/libgfopentls.a" "$SYS/lib/libgfopencrypto.a"
     cp "$G/out/lib/soft-float/libgfopentls.a" "$G/out/lib/soft-float/libgfopencrypto.a" "$SYS/lib/"
