@@ -1,0 +1,100 @@
+AmigaOS: the tray icon only where the toolkit has wxTaskBarIcon (wxUSE_TASKBARICON).
+
+diff -ruN fa/src/interface/Mainfrm.cpp fb/src/interface/Mainfrm.cpp
+--- a/src/interface/Mainfrm.cpp	2026-11-06 02:58:05.630039527 +0000
++++ b/src/interface/Mainfrm.cpp	2026-11-06 02:58:05.710064141 +0000
+@@ -554,7 +554,7 @@
+ 	// edit handler should clean them on next startup
+ 	edit_handler_.reset();
+ 
+-#ifndef __WXMAC__
++#if FZ_TRAYICON
+ 	delete m_taskBarIcon;
+ #endif
+ }
+@@ -1215,7 +1215,7 @@
+ 
+ bool CMainFrame::CloseDialogsAndQuit(wxCloseEvent &event)
+ {
+-#ifndef __WXMAC__
++#if FZ_TRAYICON
+ 	if (m_taskBarIcon) {
+ 		delete m_taskBarIcon;
+ 		m_taskBarIcon = 0;
+@@ -2743,9 +2743,11 @@
+ 	}
+ #endif
+ 	if (!event.IsIconized()) {
++#if FZ_TRAYICON
+ 		if (m_taskBarIcon) {
+ 			m_taskBarIcon->RemoveIcon();
+ 		}
++#endif
+ 		Show(true);
+ 
+ 		if (async_request_queue_) {
+@@ -2755,6 +2757,7 @@
+ 		return;
+ 	}
+ 
++#if FZ_TRAYICON
+ 	if (!options_.get_int(OPTION_MINIMIZE_TRAY)) {
+ 		return;
+ 	}
+@@ -2777,8 +2780,10 @@
+ 	if (installed) {
+ 		Show(false);
+ 	}
++#endif
+ }
+ 
++#if FZ_TRAYICON
+ void CMainFrame::OnTaskBarClick(wxTaskBarIconEvent&)
+ {
+ #ifdef __WXGTK__
+@@ -2800,6 +2805,7 @@
+ 	QueueEvent(new wxCommandEvent(fzEVT_TASKBAR_CLICK_DELAYED));
+ #endif
+ }
++#endif
+ 
+ #ifdef __WXGTK__
+ void CMainFrame::OnTaskBarClick_Delayed(wxCommandEvent&)
+diff -ruN fa/src/interface/Mainfrm.h fb/src/interface/Mainfrm.h
+--- a/src/interface/Mainfrm.h	2026-11-06 02:58:05.629964219 +0000
++++ b/src/interface/Mainfrm.h	2026-11-06 02:58:05.707644746 +0000
+@@ -11,6 +11,14 @@
+ #include <wx/taskbar.h>
+ #endif
+ 
++// A tray icon where the toolkit has one (not on macOS, nor on the Amiga's
++// GFOpenWX Toolkit until it offers a Workbench AppIcon for it)
++#if !defined(__WXMAC__) && wxUSE_TASKBARICON
++#define FZ_TRAYICON 1
++#else
++#define FZ_TRAYICON 0
++#endif
++
+ #include "../commonui/updater.h"
+ 
+ #include <list>
+@@ -165,8 +173,10 @@
+ 	void OnChildFocused(wxChildFocusEvent& event);
+ #else
+ 	void OnIconize(wxIconizeEvent& event);
++#if FZ_TRAYICON
+ 	void OnTaskBarClick(wxTaskBarIconEvent&);
+ #endif
++#endif
+ #ifdef __WXGTK__
+ 	void OnTaskBarClick_Delayed(wxCommandEvent& event);
+ #endif
+@@ -192,7 +202,7 @@
+ 
+ 	CQueue* m_pQueuePane{};
+ 
+-#ifndef __WXMAC__
++#if FZ_TRAYICON
+ 	wxTaskBarIcon* m_taskBarIcon{};
+ #endif
+ #ifdef __WXGTK__
