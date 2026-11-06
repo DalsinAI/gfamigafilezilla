@@ -82,30 +82,22 @@ CFG
     echo "fzssh $FZSSH_VERSION: $(ls -l "$SYS/lib/libfzssh.a" | awk '{print $5}') bytes"
 fi
 
-# ---- SQLite (FileZilla's queue and settings), with our file system layer
-if [ ! -f "$SYS/lib/libsqlite3.a" ] || [ "$(cat "$WORK/.sqlite" 2>/dev/null)" != "$SQLITE_COMMIT$(stamp sqlite)$(sha256sum < "$HERE/deps/amiga/sqlite_amiga.c" | cut -c1-16)" ]; then
-    Q="$WORK/sqlite-src"
-    if [ "$(cat "$Q/.commit" 2>/dev/null)" != "$SQLITE_COMMIT" ]; then
-        rm -rf "$Q"; mkdir -p "$Q"; git -C "$Q" init -q
-        git -C "$Q" fetch -q --depth 1 --filter=blob:none "$SQLITE_GIT" "$SQLITE_COMMIT"
-        git -C "$Q" checkout -q FETCH_HEAD -- lib-src/sqlite
-        echo "$SQLITE_COMMIT" > "$Q/.commit"
+# ---- SQLite (FileZilla's queue and settings) from our shared SQLite
+if [ ! -f "$SYS/lib/libsqlite3.a" ] || [ "$(cat "$WORK/.sqlite" 2>/dev/null)" != "$GFSQLITE_COMMIT$SQLITE_SHA256" ]; then
+    Q="$WORK/gfopensqlite"
+    if [ "$(cat "$Q/.commit" 2>/dev/null)" != "$GFSQLITE_COMMIT" ]; then
+        rm -rf "$Q"; git clone -q "$GFSQLITE_REPO" "$Q" && git -C "$Q" checkout -q "$GFSQLITE_COMMIT"
+        echo "$GFSQLITE_COMMIT" > "$Q/.commit"
     fi
-    rm -rf "$WORK/sqlite"; cp -R "$Q/lib-src/sqlite" "$WORK/sqlite"
-    for p in "$HERE"/patches/sqlite-*.patch; do
-        patch -s -d "$WORK/sqlite" -p1 < "$p" || { echo "patch failed: $p"; exit 1; }
-    done
-    O="$WORK/obj/sqlite"; rm -rf "$O"; mkdir -p "$O"
-    # no mmap (no shared-memory WAL index: a rollback journal), temporary
-    # tables in memory (no /tmp), our layer made the default at start
-    QF="$OPT -DSQLITE_OMIT_WAL -DSQLITE_MAX_MMAP_SIZE=0 -DSQLITE_TEMP_STORE=3 -DSQLITE_THREADSAFE=1 \
-        -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_DEFAULT_FOREIGN_KEYS=1 -DSQLITE_EXTRA_INIT=fz_amiga_sqlite_init"
-    m68k-amigaos-gcc $QF -include "$HERE/deps/amiga/include/sqlite_pre.h" -c "$WORK/sqlite/sqlite3.c" -o "$O/sqlite3.o" > "$WORK/sqlite.log" 2>&1 || fail sqlite "$WORK/sqlite.log"
-    m68k-amigaos-gcc $OPT -I"$WORK/sqlite" -c "$HERE/deps/amiga/sqlite_amiga.c" -o "$O/sqlite_amiga.o" >> "$WORK/sqlite.log" 2>&1 || fail sqlite "$WORK/sqlite.log"
-    rm -f "$SYS/lib/libsqlite3.a"; m68k-amigaos-ar rcs "$SYS/lib/libsqlite3.a" "$O"/*.o
-    cp "$WORK/sqlite/sqlite3.h" "$WORK/sqlite/sqlite3ext.h" "$SYS/include/" 2>/dev/null || cp "$WORK/sqlite/sqlite3.h" "$SYS/include/"
-    SV=$(sed -n 's/^#define SQLITE_VERSION *"\(.*\)"/\1/p' "$WORK/sqlite/sqlite3.h")
+    mkdir -p "$Q/tarballs"; fetch "$SQLITE_URL" "$SQLITE_SHA256" sqlite-amalgamation-3530400.zip
+    cp "$D/sqlite-amalgamation-3530400.zip" "$Q/tarballs/"
+    rm -rf "$Q/out-soft"
+    (cd "$Q" && OS32_GCC16="$(dirname "$TC")" FLOAT=soft ./build.sh) > "$WORK/sqlite.log" 2>&1 || fail sqlite "$WORK/sqlite.log"
+    grep "FPU check" "$WORK/sqlite.log" || :
+    rm -f "$SYS/lib/libsqlite3.a"; cp "$Q/out-soft/lib/libsqlite3.a" "$SYS/lib/"
+    cp "$Q/out-soft/include/sqlite3.h" "$Q/out-soft/include/sqlite3ext.h" "$SYS/include/"
+    SV=$(sed -n 's/^#define SQLITE_VERSION *"\(.*\)"/\1/p' "$SYS/include/sqlite3.h")
     printf 'prefix=%s\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n\nName: SQLite\nDescription: SQL database engine\nVersion: %s\nLibs: -L${libdir} -lsqlite3\nCflags: -I${includedir}\n' "$SYS" "$SV" > "$SYS/lib/pkgconfig/sqlite3.pc"
-    echo "$SQLITE_COMMIT$(stamp sqlite)$(sha256sum < "$HERE/deps/amiga/sqlite_amiga.c" | cut -c1-16)" > "$WORK/.sqlite"
-    echo "sqlite $SV: $(ls -l "$SYS/lib/libsqlite3.a" | awk '{print $5}') bytes"
+    echo "$GFSQLITE_COMMIT$SQLITE_SHA256" > "$WORK/.sqlite"
+    echo "sqlite $SV (gfopensqlite $GFSQLITE_COMMIT): $(ls -l "$SYS/lib/libsqlite3.a" | awk '{print $5}') bytes"
 fi
