@@ -98,7 +98,7 @@ if [ ! -f "$SYS/lib/libsqlite3.a" ] || [ "$(cat "$WORK/.sqlite" 2>/dev/null)" !=
     # tables in memory (no /tmp), our layer made the default at start
     QF="$OPT -DSQLITE_OMIT_WAL -DSQLITE_MAX_MMAP_SIZE=0 -DSQLITE_TEMP_STORE=3 -DSQLITE_THREADSAFE=1 \
         -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_DEFAULT_FOREIGN_KEYS=1 -DSQLITE_EXTRA_INIT=fz_amiga_sqlite_init"
-    m68k-amigaos-gcc $QF -c "$WORK/sqlite/sqlite3.c" -o "$O/sqlite3.o" > "$WORK/sqlite.log" 2>&1 || fail sqlite "$WORK/sqlite.log"
+    m68k-amigaos-gcc $QF -include "$HERE/deps/amiga/include/sqlite_pre.h" -c "$WORK/sqlite/sqlite3.c" -o "$O/sqlite3.o" > "$WORK/sqlite.log" 2>&1 || fail sqlite "$WORK/sqlite.log"
     m68k-amigaos-gcc $OPT -I"$WORK/sqlite" -c "$HERE/deps/amiga/sqlite_amiga.c" -o "$O/sqlite_amiga.o" >> "$WORK/sqlite.log" 2>&1 || fail sqlite "$WORK/sqlite.log"
     rm -f "$SYS/lib/libsqlite3.a"; m68k-amigaos-ar rcs "$SYS/lib/libsqlite3.a" "$O"/*.o
     cp "$WORK/sqlite/sqlite3.h" "$WORK/sqlite/sqlite3ext.h" "$SYS/include/" 2>/dev/null || cp "$WORK/sqlite/sqlite3.h" "$SYS/include/"
