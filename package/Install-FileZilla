@@ -21,7 +21,7 @@
     (help @copyfiles-help)
     (source "")
     (dest #drawer)
-    (pattern "~(Install-FileZilla#?)")
+    (pattern "~(Install-FileZilla#?|FileZilla-drawer.info)")
     (infos))
 (copyfiles (source "resources") (dest (tackon #drawer "resources")) (all))
 
