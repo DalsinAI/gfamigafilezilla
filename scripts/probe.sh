@@ -58,3 +58,19 @@ for w in 'struct addrinfo' 'EAI_NONAME' 'AI_PASSIVE' 'NI_MAXHOST' 'socklen_t' 's
     echo "def '$w': $(grep -RlF "$w" "$P/include" "$P/sys-include" 2>/dev/null | sed "s|$P/||" | head -3 | tr '\n' ' ')"
 done
 for f in netdb.h sys/socket.h netinet/in.h; do for d in "$P/sys-include" "$P/include"; do [ -f "$d/$f" ] && { echo "--- $d/$f: $(wc -l < "$d/$f") lines"; grep -nE '^(struct|extern|int|#define (AF_|PF_|SOCK_|EAI|AI_|IPPROTO))' "$d/$f" | head -30; }; done; done
+# libfilezilla's file, directory and string calls: declared where, and in which library
+LIBS=$(find "$P/lib" "$P/libnix/lib" "$TC/lib" -maxdepth 2 -name 'lib*.a' 2>/dev/null | grep -v '/m68020\|/m68881\|/m68060\|/fpu\|/baserel\|/libb\|/libm0' | head -40)
+for s in ftruncate futimens utimensat utimes utime realpath readlink symlink lstat dirfd fdopendir fstatat \
+    wcsncasecmp wcscasecmp mbsnrtowcs wcsnrtombs strcasecmp dlsym shm_open munmap mmap fsync getuid \
+    __stdfiledes _stdfiledes __fdtofh fdtofh __getfh __fhtofd chmod mkdir access; do
+    d=$(grep -RlE "\b$s\b *\(" "$P/include" "$P/sys-include" "$P/libnix/include" 2>/dev/null | sed "s|$P/||" | head -2 | tr '\n' ' ')
+    l=$(for a in $LIBS; do "$TC/bin/m68k-amigaos-nm" -g "$a" 2>/dev/null | grep -qE " [TDBC] _?$s\$" && printf '%s ' "${a##*/}"; done)
+    echo "sym $s: decl[$d] lib[$l]"
+done
+for d in "$P/sys-include" "$P/include" "$P/libnix/include"; do
+    [ -f "$d/sys/stat.h" ] && { echo "--- $d/sys/stat.h"; grep -nE 'st_size|st_mtime|st_mtim|off_t|UTIME|AT_' "$d/sys/stat.h" | head -12; }
+    [ -f "$d/fcntl.h" ] && { echo "--- $d/fcntl.h"; grep -nE 'define (O_|AT_|F_)' "$d/fcntl.h" | head -30; }
+    [ -f "$d/stdio.h" ] && grep -nE 'stdfiledes|_fh|BPTR' "$d/stdio.h" | head -6
+done
+grep -RhE 'typedef .*off_t;' "$P/include" "$P/sys-include" 2>/dev/null | sort -u | head -4
+echo "dlfcn: $(ls "$P"/*/dlfcn.h "$P"/include/dlfcn.h 2>/dev/null | tr '\n' ' ')"
