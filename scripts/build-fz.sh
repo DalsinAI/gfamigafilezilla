@@ -40,6 +40,7 @@ if [ ! -f "$SYS/lib/libfilezilla.a" ] || [ "$(cat "$WORK/.lfz" 2>/dev/null)" != 
     (cd "$WORK/libfilezilla" && CC="m68k-amigaos-gcc $SPECS" CXX="m68k-amigaos-g++ $SPECS" \
         CFLAGS="$OPT -include fzamiga.h -I$SYS/include" CXXFLAGS="$OPT -include fzamiga.h -I$SYS/include" \
         LDFLAGS="-L$SYS/lib" LIBS="-lfzamiga -lsocket -lpthread -latomic" PKG_CONFIG="pkg-config --static" \
+        ac_cv_func_timegm=yes \
         ./configure --host=m68k-amigaos --build="$HOSTB" --prefix="$SYS" --disable-shared --enable-static \
         --disable-locales --disable-doxygen-doc --disable-dependency-tracking > configure.log 2>&1 \
         || fail libfilezilla-configure configure.log
