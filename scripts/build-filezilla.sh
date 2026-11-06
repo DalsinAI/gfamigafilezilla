@@ -72,7 +72,10 @@ st=0
 timeout "${BUDGET:-600}" nice -n 19 make -k -j"$JOBS" > make.log 2>&1 || st=$?
 if [ "$st" = 124 ]; then echo "filezilla: time's up, the next run goes on"; exit 0; fi
 if [ "$st" != 0 ]; then
-    grep -E "error:|undefined reference|Error [0-9]" make.log | sort -u | cut -c1-300 | head -80; exit 1
+    grep -E "error:|undefined reference|Error [0-9]" make.log | grep -v "/bin/ld:" | sort -u | cut -c1-300 | head -40
+    # the linker's own words: which symbols, which libraries
+    grep -E "/bin/ld: " make.log | sed 's|.*/bin/ld: ||' | sed 's|^[^ ]*/\([^/ ]*\.o\)|\1|' | sort | uniq -c | sort -rn | cut -c1-260 | head -100
+    exit 1
 fi
 cp src/interface/filezilla "$OUT/FileZilla"
 ls -l "$OUT/FileZilla"
