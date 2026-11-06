@@ -61,7 +61,22 @@ echo "libfilezilla and fzssh: $(( $(date +%s) - t0 )) s"
 # ---- 3: the toolkit's SDK (when its commit changed), then FileZilla
 fetch gfopenwxtoolkit "$WXT_REPO" "$WXT_COMMIT"
 WXT="$WORK/deps/gfopenwxtoolkit"; WXB="$WORK/gfopenwx"
-if [ ! -x "$WXB/out/sdk/bin/wx-config" ] || [ "$(cat "$WXB/.rev" 2>/dev/null)" != "$WXT_COMMIT" ]; then
+# a toolkit SDK another Cradle job built (WXT_SDK_JOB, its tarball's
+# SHA-256 in WXT_SDK_SHA256), when filezilla.lock names one: Cradle keeps
+# job outputs in jobs/<id>/out/ beside this checkout
+if [ -n "${WXT_SDK_JOB:-}" ] && [ "$(cat "$WXB/.rev" 2>/dev/null)" != "$WXT_COMMIT $WXT_SDK_JOB" ]; then
+    tb="${WXT_SDK_DIR:-$HERE/../jobs/$WXT_SDK_JOB/out}/gfopenwx-sdk.tar.gz"
+    [ -f "$tb" ] || { echo "toolkit SDK $tb is not there"; exit 1; }
+    echo "$WXT_SDK_SHA256  $tb" | sha256sum -c - >/dev/null || { echo "toolkit SDK $tb: sha256 mismatch"; exit 1; }
+    rm -rf "$WXB/unpack" "$WXB/out/sdk"; mkdir -p "$WXB/unpack" "$WXB/out"
+    tar xzf "$tb" -C "$WXB/unpack"
+    wc=$(find "$WXB/unpack" -path '*/bin/wx-config' | head -1)
+    [ -n "$wc" ] || { echo "toolkit SDK $tb has no bin/wx-config"; exit 1; }
+    mv "$(dirname "$(dirname "$wc")")" "$WXB/out/sdk"; rm -rf "$WXB/unpack"
+    echo "$WXT_COMMIT $WXT_SDK_JOB" > "$WXB/.rev"
+    echo "toolkit: SDK from job $WXT_SDK_JOB"
+fi
+if [ -z "${WXT_SDK_JOB:-}" ] && { [ ! -x "$WXB/out/sdk/bin/wx-config" ] || [ "$(cat "$WXB/.rev" 2>/dev/null)" != "$WXT_COMMIT" ]; }; then
     echo "toolkit $WXT_COMMIT: building its SDK"
     # its make goes on where it stopped, so a run that runs out of time
     # ends cleanly here and the next one carries on

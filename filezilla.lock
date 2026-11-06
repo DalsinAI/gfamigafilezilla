@@ -36,6 +36,9 @@ ARGON2_SHA256=815f1017b5b0033204778c2e32443257274bc5d9dd16d355c4f7db8189e23dcc
 # start. Back to main once that branch is merged.
 WXT_REPO=https://github.com/DalsinAI/gfopenwxtoolkit
 WXT_COMMIT=89b8a622422dc246102b09d628c60efd3457b833
+# that toolkit's SDK as a Cradle job built it (empty: build it here)
+WXT_SDK_JOB=
+WXT_SDK_SHA256=
 # fpuauto (amicradle-guest common/fpuauto): the FPU when there is one
 FPUAUTO_REPO=https://github.com/DalsinAI/amicradle-guest
 FPUAUTO_COMMIT=462f3a3ccb4cea314e1bb7f7cfaebda266073233
