@@ -69,6 +69,8 @@ echo "crypto: $(( $(date +%s) - t0 )) s"
 # ---- 2: libfilezilla, fzssh, SQLite
 TC="$TC" WORK="$WORK" SYS="$SYS" JOBS=$JOBS sh "$HERE/scripts/build-fz.sh"
 echo "libfilezilla and fzssh: $(( $(date +%s) - t0 )) s"
+# the Shell probe for SFTP, FTP and FTPS (tests/amiga/fzprobe.cpp)
+TC="$TC" WORK="$WORK" SYS="$SYS" FPUSPECS="$FA/fpuauto.specs" FPULIB="$FAL" OUT="$OUT" sh "$HERE/scripts/build-probe.sh"
 
 # ---- 3: the toolkit's SDK (when its commit changed), then FileZilla
 fetch gfopenwxtoolkit "$WXT_REPO" "$WXT_COMMIT"
