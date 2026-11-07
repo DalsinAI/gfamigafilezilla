@@ -55,8 +55,8 @@ diff -ruN a2/src/interface/Mainfrm.cpp b/src/interface/Mainfrm.cpp
 +#endif
 diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
 --- a/src/interface/amiga_arexx.cpp	1970-01-01 00:00:00.000000000 +0000
-+++ b/src/interface/amiga_arexx.cpp	2026-11-07 11:18:27.552530783 +0000
-@@ -0,0 +1,472 @@
++++ b/src/interface/amiga_arexx.cpp	2026-11-07 11:30:33.576891681 +0000
+@@ -0,0 +1,444 @@
 +// amiga_arexx.cpp - FileZilla's ARexx port FILEZILLA.1 (AmigaOS), on the
 +// toolkit's wxARexxPort (arexx.class; QUIT, ACTIVATE, DEACTIVATE, VERSION
 +// and HELP come with it). FileZilla's own commands:
@@ -70,20 +70,18 @@ diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
 +//   STATUS                                      RESULT: state, server, directory
 +//   FAULT CODE/N/A                              FileZilla's error numbers too
 +//
-+// Commands run on the main thread. The ones that wait for the server run
-+// the event loop meanwhile (the port holds other commands back until they
-+// answer); the window closing or TIMEOUT seconds (60 for the server, none
-+// for a transfer) end the wait. RC 10 with the error number in RC2 when a
++// Commands run on the main thread. The ones that wait for the server do so
++// in the port's WaitFor (the event loop runs; the port holds other
++// commands back until they answer); the window closing or TIMEOUT seconds
++// (60 for the server, none for a transfer) end the wait. RC 10 with the error number in RC2 when a
 +// command fails, RC 20 when FileZilla is closing.
 +//
 +// Taken into Mainfrm.cpp (#include at its end) so the build needs no new
 +// Makefile entries.
 +// Copyright (c) 2026 AmiCradle Team
 +
-+#include <wx/evtloop.h>
 +#include <wx/openlayout/arexx.h>
 +#include <libfilezilla/local_filesys.hpp>
-+#include <libfilezilla/time.hpp>
 +#include <memory>
 +#include "fzarexx.h"
 +
@@ -145,55 +143,29 @@ diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
 +	return !q || q->GetFileCount() == 0;
 +}
 +
-+// Runs the event loop until ready() says yes. False when FileZilla is
-+// closing (*closing set) or after timeout_s seconds (0: no limit).
-+bool rexx_wait(bool (*ready)(), long timeout_s, bool* closing)
++// The wait's end as the script sees it, through the port's WaitFor (the
++// event loop runs, queued events too; other commands wait their turn):
++// true when ready() said yes; else RC 20 when FileZilla is closing, RC 10
++// with timeout_error in RC2 after timeout_s seconds (0: no limit).
++bool rexx_waited(wxARexxCommand& c, bool (*ready)(), long timeout_s, long timeout_error = E_TIMEOUT)
 +{
-+	*closing = false;
 +	struct counted {
 +		counted() { ++rexx_waiting; }
 +		~counted() { --rexx_waiting; }
 +	} count;
-+	fz::monotonic_clock const start = fz::monotonic_clock::now();
-+	for (;;) {
-+		if (!rexx_frame) {
-+			*closing = true;
-+			return false;
-+		}
-+		if (ready()) {
-+			return true;
-+		}
-+		if (timeout_s > 0 && fz::monotonic_clock::now() - start > fz::duration::from_seconds(timeout_s)) {
-+			return false;
-+		}
-+		wxEventLoopBase* loop = wxEventLoopBase::GetActive();
-+		if (!loop || loop->DispatchTimeout(50) < 0) {
-+			*closing = true;
-+			return false;
-+		}
-+		// the engine's notifications are queued events, which the main
-+		// loop only handles between dispatches: the connection, listing or
-+		// transfer moves on only through these
-+		if (wxTheApp) {
-+			wxTheApp->ProcessPendingEvents();
-+		}
-+	}
-+}
-+
-+// the wait's end as the script sees it; true when it can go on
-+bool rexx_waited(wxARexxCommand& c, bool (*ready)(), long timeout_s, long timeout_error = E_TIMEOUT)
-+{
-+	bool closing;
-+	if (rexx_wait(ready, timeout_s, &closing)) {
-+		return true;
-+	}
-+	if (closing) {
++	long const ms = timeout_s > 0 ? timeout_s * 1000 : 24L * 3600 * 1000;
++	bool const ok = rexx_port && rexx_port->WaitFor(c, [ready] { return !rexx_frame || ready(); }, ms);
++	if (!rexx_frame) {
 +		c.SetError(20);
++		return false;
 +	}
-+	else {
-+		c.SetError(10, timeout_error);
++	if (!ok) {
++		if (c.m_rc == 10) {
++			c.SetError(10, timeout_error);
++		}
++		return false;
 +	}
-+	return false;
++	return true;
 +}
 +
 +std::wstring rexx_url(CState* s)
