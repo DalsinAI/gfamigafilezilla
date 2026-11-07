@@ -4,18 +4,17 @@ common QUIT, ACTIVATE, DEACTIVATE, VERSION, HELP and FAULT.
 
 diff -ruN a2/src/interface/Mainfrm.cpp b/src/interface/Mainfrm.cpp
 --- a/src/interface/Mainfrm.cpp	2026-11-07 10:18:59.538422894 +0000
-+++ b/src/interface/Mainfrm.cpp	2026-11-07 10:18:59.549996879 +0000
-@@ -57,6 +57,10 @@
- 
- #if FZ_MANUALUPDATECHECK
- #include "overlay.h"
++++ b/src/interface/Mainfrm.cpp	2026-11-07 10:21:11.394801090 +0000
+@@ -1,5 +1,9 @@
+ #include "filezilla.h"
+ #include "Mainfrm.h"
 +#ifdef __AMIGA__
 +void fz_arexx_open(CMainFrame* frame);
 +void fz_arexx_close();
 +#endif
- #include <wx/hyperlink.h>
- #include <wx/mstream.h>
- #endif
+ 
+ #include "aboutdialog.h"
+ #include "asyncrequestqueue.h"
 @@ -527,10 +531,17 @@
  	// Delay call to PostInitialize, otherwise macOS gets really confused about the right mouse button...
  	startupTimer_.SetOwner(this);
@@ -55,7 +54,7 @@ diff -ruN a2/src/interface/Mainfrm.cpp b/src/interface/Mainfrm.cpp
 +#endif
 diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
 --- a/src/interface/amiga_arexx.cpp	1970-01-01 00:00:00.000000000 +0000
-+++ b/src/interface/amiga_arexx.cpp	2026-11-07 10:18:59.554096336 +0000
++++ b/src/interface/amiga_arexx.cpp	2026-11-07 10:21:11.395239659 +0000
 @@ -0,0 +1,639 @@
 +// amiga_arexx.cpp - FileZilla's ARexx port FILEZILLA.1 (AmigaOS).
 +//
@@ -83,12 +82,12 @@ diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
 +#include <libfilezilla/local_filesys.hpp>
 +#include <libfilezilla/mutex.hpp>
 +#include <libfilezilla/time.hpp>
++#include <libfilezilla/util.hpp>
 +#include <functional>
 +#include <memory>
 +#include <string>
 +#include <vector>
 +#include <strings.h>
-+#include <unistd.h>
 +#include "fzarexx.h"
 +
 +namespace {
@@ -290,7 +289,7 @@ diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
 +			if (timeout && fz::monotonic_clock::now() - start > timeout) {
 +				return false;
 +			}
-+			usleep(50000);
++			fz::sleep(fz::duration::from_milliseconds(50));
 +		}
 +	}
 +
