@@ -54,8 +54,8 @@ diff -ruN a2/src/interface/Mainfrm.cpp b/src/interface/Mainfrm.cpp
 +#endif
 diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
 --- a/src/interface/amiga_arexx.cpp	1970-01-01 00:00:00.000000000 +0000
-+++ b/src/interface/amiga_arexx.cpp	2026-11-07 10:32:49.788375089 +0000
-@@ -0,0 +1,639 @@
++++ b/src/interface/amiga_arexx.cpp	2026-11-07 10:43:30.171978996 +0000
+@@ -0,0 +1,643 @@
 +// amiga_arexx.cpp - FileZilla's ARexx port FILEZILLA.1 (AmigaOS).
 +//
 +// wxARexxPort is the shared part, kept in this one file so it can move
@@ -87,6 +87,7 @@ diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
 +#include <memory>
 +#include <string>
 +#include <vector>
++#include <stdio.h>
 +#include <strings.h>
 +#include "fzarexx.h"
 +
@@ -217,7 +218,10 @@ diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
 +			table.push_back({c.name, c.tmpl});
 +		}
 +		char name[40]{};
-+		if (fz_rexx_start(host_.c_str(), table.data(), static_cast<int>(table.size()), &Dispatch, this, name, sizeof name) != 0) {
++		long const err = fz_rexx_start(host_.c_str(), table.data(), static_cast<int>(table.size()), &Dispatch, this, name, sizeof name);
++		if (err != 0) {
++			// -1: no arexx.class; -2: no task; else arexx.class's AREXX_ErrorCode
++			fprintf(stderr, "%s: no ARexx port (%ld)\n", host_.c_str(), err);
 +			return false;
 +		}
 +		name_ = name;
