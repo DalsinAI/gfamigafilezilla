@@ -132,6 +132,8 @@ python3 -I "$HERE/scripts/make-icon.py" install "$OUT/Install-FileZilla.info"
 # the drawer's own icon: the archive puts it beside the drawer as FileZilla.info
 python3 -I "$HERE/scripts/make-icon.py" drawer "$OUT/FileZilla-drawer.info"
 cp "$HERE/package/Install-FileZilla" "$HERE/package/README.txt" "$OUT/"
+rm -rf "$OUT/Rexx"; cp -R "$HERE/package/Rexx" "$OUT/Rexx"
+mkdir -p "$OUT/tests"; cp "$HERE/tests/amiga/arexx-test.rexx" "$OUT/tests/"
 cp "$SRC/COPYING" "$OUT/COPYING-FileZilla.txt"
 cp "$WORK/fzssh/agpl3.txt" "$OUT/COPYING-fzssh.txt"
 cp "$HERE/LICENSE" "$OUT/LICENSE-port.txt"
