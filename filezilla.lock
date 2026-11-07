@@ -17,9 +17,9 @@ FZSSH_SHA256=0c53178298364404e1fe4ce3d50267cf1238e52b414a6a53356bc43b37811338
 # GFOpenTLS and GFOpenCrypto (DalsinAI/gfopentls) in place of GnuTLS,
 # Nettle, GMP and Argon2: the link stubs libgfopentls.a and libgfopencrypto.a
 # (calls into gfopentls.library 1.5 and gfopencrypto.library 2.4, opened
-# before main()), from the stubs branch (gfopentls PR #28) until it merges
+# before main()), from gfopentls main a8c6c0e (stubs PR #28 merged)
 GFOPENTLS_REPO=https://github.com/DalsinAI/gfopentls
-GFOPENTLS_COMMIT=279460a8f26cbe993b6445daf64ffc9670615bbc
+GFOPENTLS_COMMIT=a8c6c0e0b4cda1b5de66d64727e0b74d9779f9ab
 # GFOpenWX Toolkit (wxWidgets on GFOpenLayout): main 1c4e5dd, with the
 # shared ARexx port wxARexxPort (#15 merged); its SDK built here.
 WXT_REPO=https://github.com/DalsinAI/gfopenwxtoolkit
