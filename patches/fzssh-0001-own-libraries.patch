@@ -1,0 +1,3484 @@
+fzssh on GFOpenCrypto in place of Nettle, GMP and Argon2.
+
+- mpz: big numbers as big-endian bytes; modular exponentiation (constant
+  time), primality and RSA's private operation are GFOpenCrypto's.
+- Key exchange: X25519, ECDH on P-256/384/521 and the DH groups 14-18 and
+  group exchange through oc_x25519, oc_ec_mul/oc_ec_keygen and oc_modexp.
+  Group exchange checks q with Miller-Rabin and p = 2q + 1 with
+  Pocklington's test. group1 (1024 bits) is gone.
+- Ciphers: AES-GCM, AES-CTR and AES-CBC on oc_aes and oc_ghash.
+- MACs: HMAC over libfilezilla's hashes; UMAC is gone.
+- Host keys and login keys: Ed25519, ECDSA and RSA (PKCS #1 v1.5 done
+  here) on GFOpenCrypto; Ed448 is gone, RSA keys are loaded but not made.
+- Key files: PuTTY v3 Argon2 through oc_argon2, AES-CBC through oc_aes;
+  DES and 3DES encrypted keys are refused with a message.
+- SHAKE128/256 for ML-KEM: a sponge over oc_keccak_f1600.
+- The key file test expects the removed algorithms to be refused.
+
+diff -ruN fzssh/lib/cipher.cpp fzssh-ot/lib/cipher.cpp
+--- fzssh/lib/cipher.cpp	2026-08-18 15:04:46.000000000 +0000
++++ fzssh-ot/lib/cipher.cpp	2026-11-06 23:02:12.127913496 +0000
+@@ -1,28 +1,42 @@
+ #include "cipher.hpp"
+ 
+-#include <nettle/cbc.h>
+-#include <nettle/ctr.h>
+-#include <nettle/gcm.h>
+-#include <nettle/memops.h>
+-#include <nettle/version.h>
++/* fzssh's ciphers on GFOpenCrypto: AES in GCM, CTR and CBC modes. oc_aes
++ * runs the block cipher; GCM's counter and GHASH and the CBC chaining
++ * across packets are kept here. Copyright (c) 2026 AmiCradle Team. */
++
++#include <gfopencrypto/gfopencrypto.h>
+ 
+ #include <libfilezilla/util.hpp>
+ 
++#include <string.h>
++
+ using namespace std::literals;
++
++namespace fz::ssh {
++
+ namespace {
+-template<typename Char>
+-void write_uint32(Char * data, uint32_t v)
++constexpr size_t aes_block{16};
++constexpr size_t gcm_tag{16};
++uint8_t const zero_iv[16]{};
++
++void put_be64(uint8_t * p, uint64_t v)
+ {
+-	data[3] = static_cast<Char>(v & 0xffu);
+-	v >>= 8;
+-	data[2] = static_cast<Char>(v & 0xffu);
+-	v >>= 8;
+-	data[1] = static_cast<Char>(v & 0xffu);
+-	v >>= 8;
+-	data[0] = static_cast<Char>(v);
++	for (int i = 7; i >= 0; --i) {
++		p[i] = static_cast<uint8_t>(v & 0xffu);
++		v >>= 8;
++	}
++}
++
++// 128-bit big-endian counter plus n
++void add_counter(uint8_t * ctr, size_t n)
++{
++	for (int i = 15; i >= 0 && n; --i) {
++		n += ctr[i];
++		ctr[i] = static_cast<uint8_t>(n & 0xffu);
++		n >>= 8;
++	}
+ }
+ }
+-namespace fz::ssh {
+ 
+ cipher_base::~cipher_base() noexcept
+ {
+@@ -54,630 +68,298 @@
+ 	virtual bool set_iv(uint8_t const*, size_t) override { return true; }
+ };
+ 
+-class cipher_aes256_gcm final : public cipher_base
++// aes128-gcm@openssh.com and aes256-gcm@openssh.com (RFC 5647): the packet
++// length is the authenticated data, the IV's last 8 bytes count packets
++class cipher_aes_gcm final : public cipher_base
+ {
+ public:
+-	cipher_aes256_gcm();
+-	~cipher_aes256_gcm();
++	cipher_aes_gcm(size_t key_size, std::string_view name)
++		: cipher_base(16, key_size, 12, true, false, gcm_tag)
++		, name_(name)
++	{}
+ 
+-	std::string_view name() const override { return "aes256-gcm@openssh.com"sv; }
++	~cipher_aes_gcm()
++	{
++		fz::wipe(key_);
++		fz::wipe(h_, sizeof(h_));
++		fz::wipe(ad_);
++	}
+ 
+-	virtual bool decrypt_length(uint8_t*, size_t) override;
++	std::string_view name() const override { return name_; }
++
++	virtual bool decrypt_length(uint8_t*, size_t) override { return true; }
+ 	virtual bool encrypt(uint8_t* plain, size_t size) override;
+ 	virtual bool decrypt(uint8_t* cipher, size_t size) override;
+ 
+ 	virtual bool set_key(uint8_t const* key, size_t len) override;
+-	virtual bool set_iv(uint8_t const* key, size_t len) override;
++	virtual bool set_iv(uint8_t const* iv, size_t len) override { ad_.clear(); return cipher_base::set_iv(iv, len); }
++
++	virtual void add_authenticated_data(uint8_t const* data, size_t size) override
++	{
++		ad_.insert(ad_.end(), data, data + size);
++	}
+ 
+-	virtual void add_authenticated_data(uint8_t const* data, size_t size) override;
+ private:
+-	gcm_aes256_ctx ctx_;
++	// The tag of ciphertext (with the authenticated data) under the current IV
++	bool tag(uint8_t * out, uint8_t const* cipher, size_t size);
++	bool crypt(uint8_t * data, size_t size);
++	void next_iv();
++
++	std::string const name_;
++	std::vector<uint8_t> key_;
++	uint8_t h_[16]{};
++	std::vector<uint8_t> ad_;
+ };
+ 
+-cipher_aes256_gcm::cipher_aes256_gcm()
+-    : cipher_base(16, 32, 12, true, false, GCM_DIGEST_SIZE)
+-{
+-}
+-
+-cipher_aes256_gcm::~cipher_aes256_gcm()
++bool cipher_aes_gcm::set_key(uint8_t const* key, size_t len)
+ {
+-	wipe(&ctx_, sizeof(gcm_aes256_ctx));
+-}
+-
+-bool cipher_aes256_gcm::decrypt_length(uint8_t*, size_t)
+-{
+-	return true;
+-}
+-
+-void cipher_aes256_gcm::add_authenticated_data(uint8_t const* data, size_t size)
+-{
+-	gcm_aes256_update(&ctx_, size, reinterpret_cast<unsigned char const*>(data));
+-}
+-
+-bool cipher_aes256_gcm::encrypt(uint8_t* plain, size_t size)
+-{
+-	if (size < GCM_DIGEST_SIZE) {
++	if (len != key_size_) {
+ 		return false;
+ 	}
+-
+-	gcm_aes256_encrypt(&ctx_, size - GCM_DIGEST_SIZE, plain, plain);
+-
+-#if NETTLE_VERSION_MAJOR >= 4
+-	gcm_aes256_digest(&ctx_, plain + size - GCM_DIGEST_SIZE);
+-#else
+-	gcm_aes256_digest(&ctx_, GCM_DIGEST_SIZE, plain + size - GCM_DIGEST_SIZE);
+-#endif
+-
+-	// Update IV
+-	for (size_t i = 11; i > 3; --i) {
+-		if (++iv_[i]) {
+-			break;
+-		}
+-	}
+-	gcm_aes256_set_iv(&ctx_, iv_.size(), iv_.data());
+-
+-	return true;
++	key_.assign(key, key + len);
++	memset(h_, 0, sizeof(h_));
++	return oc_aes(h_, sizeof(h_), key_.data(), key_.size(), zero_iv, OC_AES_ECB_ENCRYPT) == 0;
+ }
+ 
+-bool cipher_aes256_gcm::decrypt(uint8_t* cipher, size_t size)
++bool cipher_aes_gcm::tag(uint8_t * out, uint8_t const* cipher, size_t size)
+ {
+-	if (size < GCM_DIGEST_SIZE) {
++	if (iv_.size() != 12 || key_.empty()) {
+ 		return false;
+ 	}
+-
+-	gcm_aes256_decrypt(&ctx_, size - GCM_BLOCK_SIZE, cipher, cipher);
+-
+-	uint8_t digest[GCM_DIGEST_SIZE];
+-#if NETTLE_VERSION_MAJOR >= 4
+-	gcm_aes256_digest(&ctx_, digest);
+-#else
+-	gcm_aes256_digest(&ctx_, GCM_DIGEST_SIZE, digest);
+-#endif
+-	if (!memeql_sec(digest, cipher + size - GCM_DIGEST_SIZE, GCM_DIGEST_SIZE)) {
+-		return false;
++	uint8_t y[16]{};
++	if (!ad_.empty()) {
++		oc_ghash(y, h_, ad_.data(), ad_.size());
+ 	}
+-
+-	// Update IV
+-	for (size_t i = 11; i > 3; --i) {
+-		if (++iv_[i]) {
+-			break;
+-		}
++	if (size) {
++		oc_ghash(y, h_, cipher, size);
+ 	}
+-	gcm_aes256_set_iv(&ctx_, iv_.size(), iv_.data());
+-	return true;
+-}
++	uint8_t lengths[16];
++	put_be64(lengths, static_cast<uint64_t>(ad_.size()) * 8);
++	put_be64(lengths + 8, static_cast<uint64_t>(size) * 8);
++	oc_ghash(y, h_, lengths, sizeof(lengths));
+ 
+-bool cipher_aes256_gcm::set_key(uint8_t const* key, size_t len)
+-{
+-	if (len != key_size_) {
++	// E(J0), J0 = IV || 00000001
++	uint8_t j0[16];
++	memcpy(j0, iv_.data(), 12);
++	j0[12] = 0;
++	j0[13] = 0;
++	j0[14] = 0;
++	j0[15] = 1;
++	if (oc_aes(j0, sizeof(j0), key_.data(), key_.size(), zero_iv, OC_AES_ECB_ENCRYPT)) {
+ 		return false;
+ 	}
+-	gcm_aes256_set_key(&ctx_, key);
+-	return true;
+-}
+-
+-bool cipher_aes256_gcm::set_iv(uint8_t const* iv, size_t len)
+-{
+-	if (!cipher_base::set_iv(iv, len)) {
+-		return false;
++	for (size_t i = 0; i < 16; ++i) {
++		out[i] = y[i] ^ j0[i];
+ 	}
+-	gcm_aes256_set_iv(&ctx_, iv_.size(), iv_.data());
+-	return true;
+-}
+-
+-class cipher_aes128_gcm final : public cipher_base
+-{
+-public:
+-	cipher_aes128_gcm();
+-	~cipher_aes128_gcm();
+-
+-	std::string_view name() const override { return "aes128-gcm@openssh.com"sv; }
+-
+-	virtual bool decrypt_length(uint8_t*, size_t) override;
+-	virtual bool encrypt(uint8_t* plain, size_t size) override;
+-	virtual bool decrypt(uint8_t* cipher, size_t size) override;
+-
+-	virtual bool set_key(uint8_t const* key, size_t len) override;
+-	virtual bool set_iv(uint8_t const* key, size_t len) override;
+-
+-	virtual void add_authenticated_data(uint8_t const* data, size_t size) override;
+-private:
+-	gcm_aes128_ctx ctx_;
+-};
+-
+-cipher_aes128_gcm::cipher_aes128_gcm()
+-	: cipher_base(16, 16, 12, true, false, GCM_DIGEST_SIZE)
+-{
+-}
+-
+-cipher_aes128_gcm::~cipher_aes128_gcm()
+-{
+-	wipe(&ctx_, sizeof(gcm_aes128_ctx));
+-}
+-
+-bool cipher_aes128_gcm::decrypt_length(uint8_t*, size_t)
+-{
++	fz::wipe(j0, sizeof(j0));
++	fz::wipe(y, sizeof(y));
+ 	return true;
+ }
+ 
+-void cipher_aes128_gcm::add_authenticated_data(uint8_t const* data, size_t size)
++bool cipher_aes_gcm::crypt(uint8_t * data, size_t size)
+ {
+-	gcm_aes128_update(&ctx_, size, reinterpret_cast<unsigned char const*>(data));
+-}
+-
+-bool cipher_aes128_gcm::encrypt(uint8_t* plain, size_t size)
+-{
+-	if (size < GCM_DIGEST_SIZE) {
+-		return false;
+-	}
+-
+-	gcm_aes128_encrypt(&ctx_, size - GCM_DIGEST_SIZE, plain, plain);
+-
+-#if NETTLE_VERSION_MAJOR >= 4
+-	gcm_aes128_digest(&ctx_, plain + size - GCM_DIGEST_SIZE);
+-#else
+-	gcm_aes128_digest(&ctx_, GCM_DIGEST_SIZE, plain + size - GCM_DIGEST_SIZE);
+-#endif
+-
+-	// Update IV
+-	for (size_t i = 11; i > 3; --i) {
+-		if (++iv_[i]) {
+-			break;
+-		}
++	if (!size) {
++		return true;
+ 	}
+-	gcm_aes128_set_iv(&ctx_, iv_.size(), iv_.data());
+-
+-	return true;
++	// The data's counter starts at J0 + 1. A packet is far shorter than the
++	// 2^32 blocks after which GCM's 32-bit increment and CTR's 128-bit one
++	// part ways, and the counter's low word starts at 2.
++	uint8_t ctr[16];
++	memcpy(ctr, iv_.data(), 12);
++	ctr[12] = 0;
++	ctr[13] = 0;
++	ctr[14] = 0;
++	ctr[15] = 2;
++	return oc_aes(data, size, key_.data(), key_.size(), ctr, OC_AES_CTR) == 0;
+ }
+ 
+-bool cipher_aes128_gcm::decrypt(uint8_t* cipher, size_t size)
++void cipher_aes_gcm::next_iv()
+ {
+-	if (size < GCM_DIGEST_SIZE) {
+-		return false;
+-	}
+-
+-	gcm_aes128_decrypt(&ctx_, size - GCM_BLOCK_SIZE, cipher, cipher);
+-
+-	uint8_t digest[GCM_DIGEST_SIZE];
+-#if NETTLE_VERSION_MAJOR >= 4
+-	gcm_aes128_digest(&ctx_, digest);
+-#else
+-	gcm_aes128_digest(&ctx_, GCM_DIGEST_SIZE, digest);
+-#endif
+-	if (!memeql_sec(digest, cipher + size - GCM_DIGEST_SIZE, GCM_DIGEST_SIZE)) {
+-		return false;
+-	}
+-
+-	// Update IV
+ 	for (size_t i = 11; i > 3; --i) {
+ 		if (++iv_[i]) {
+ 			break;
+ 		}
+ 	}
+-	gcm_aes128_set_iv(&ctx_, iv_.size(), iv_.data());
+-	return true;
+-}
+-
+-bool cipher_aes128_gcm::set_key(uint8_t const* key, size_t len)
+-{
+-	if (len != key_size_) {
+-		return false;
+-	}
+-	gcm_aes128_set_key(&ctx_, key);
+-	return true;
++	ad_.clear();
+ }
+ 
+-bool cipher_aes128_gcm::set_iv(uint8_t const* iv, size_t len)
++bool cipher_aes_gcm::encrypt(uint8_t* plain, size_t size)
+ {
+-	if (!cipher_base::set_iv(iv, len)) {
++	if (size < gcm_tag) {
+ 		return false;
+ 	}
+-	gcm_aes128_set_iv(&ctx_, iv_.size(), iv_.data());
+-	return true;
+-}
+-
+-class cipher_aes256_cbc final : public cipher_base
+-{
+-public:
+-	cipher_aes256_cbc();
+-	~cipher_aes256_cbc();
+-
+-	std::string_view name() const override { return "aes256-cbc"sv; }
+-
+-	virtual bool decrypt_length(uint8_t*, size_t) override;
+-	virtual bool encrypt(uint8_t* plain, size_t size) override;
+-	virtual bool decrypt(uint8_t* cipher, size_t size) override;
+-
+-	virtual bool set_key(uint8_t const* key, size_t len) override;
+-
+-private:
+-	aes256_ctx ctx_;
+-	aes256_ctx dec_ctx_;
+-};
+-
+-cipher_aes256_cbc::cipher_aes256_cbc()
+-    : cipher_base(16, 32, 16, false, true)
+-{
+-}
+-
+-cipher_aes256_cbc::~cipher_aes256_cbc()
+-{
+-	wipe(&ctx_, sizeof(aes256_ctx));
+-	wipe(&dec_ctx_, sizeof(aes256_ctx));
+-}
+-
+-bool cipher_aes256_cbc::decrypt_length(uint8_t* cipher, size_t s)
+-{
+-	if (s != block_size_) {
++	size_t const len = size - gcm_tag;
++	if (!crypt(plain, len) || !tag(plain + len, plain, len)) {
+ 		return false;
+ 	}
+-	cbc_decrypt(&dec_ctx_, reinterpret_cast<nettle_cipher_func*>(&aes256_decrypt), block_size_, iv_.data(), s, cipher, cipher);
++	next_iv();
+ 	return true;
+ }
+ 
+-bool cipher_aes256_cbc::encrypt(uint8_t* plain, size_t size)
++bool cipher_aes_gcm::decrypt(uint8_t* cipher, size_t size)
+ {
+-	if (size % block_size_) {
++	if (size < gcm_tag) {
+ 		return false;
+ 	}
+-	cbc_encrypt(&ctx_, reinterpret_cast<nettle_cipher_func*>(&aes256_encrypt), block_size_, iv_.data(), size, plain, plain);
+-	return true;
+-}
+-
+-bool cipher_aes256_cbc::decrypt(uint8_t* cipher, size_t size)
+-{
+-	if (size % block_size_) {
++	size_t const len = size - gcm_tag;
++	uint8_t digest[gcm_tag];
++	if (!tag(digest, cipher, len) || !oc_ct_equal(digest, cipher + len, gcm_tag)) {
+ 		return false;
+ 	}
+-	cbc_decrypt(&dec_ctx_, reinterpret_cast<nettle_cipher_func*>(&aes256_decrypt), block_size_, iv_.data(), size, cipher, cipher);
+-	return true;
+-}
+-
+-bool cipher_aes256_cbc::set_key(uint8_t const* key, size_t len)
+-{
+-	if (len != key_size_) {
++	if (!crypt(cipher, len)) {
+ 		return false;
+ 	}
+-	aes256_set_encrypt_key(&ctx_, key);
+-	aes256_set_decrypt_key(&dec_ctx_, key);
++	next_iv();
+ 	return true;
+ }
+ 
+-class cipher_aes192_cbc final : public cipher_base
++// aes128-cbc, aes192-cbc, aes256-cbc: the IV carries on from packet to packet
++class cipher_aes_cbc final : public cipher_base
+ {
+ public:
+-	cipher_aes192_cbc();
+-	~cipher_aes192_cbc();
+-
+-	std::string_view name() const override { return "aes192-cbc"sv; }
+-
+-	virtual bool decrypt_length(uint8_t*, size_t) override;
+-	virtual bool encrypt(uint8_t* plain, size_t size) override;
+-	virtual bool decrypt(uint8_t* cipher, size_t size) override;
+-
+-	virtual bool set_key(uint8_t const* key, size_t len) override;
+-
+-private:
+-	aes192_ctx ctx_;
+-	aes192_ctx dec_ctx_;
+-};
+-
+-cipher_aes192_cbc::cipher_aes192_cbc()
+-	: cipher_base(16, 24, 16, false, true)
+-{
+-}
+-
+-cipher_aes192_cbc::~cipher_aes192_cbc()
+-{
+-	wipe(&ctx_, sizeof(aes192_ctx));
+-	wipe(&dec_ctx_, sizeof(aes192_ctx));
+-}
+-
+-bool cipher_aes192_cbc::decrypt_length(uint8_t* cipher, size_t s)
+-{
+-	if (s != block_size_) {
+-		return false;
+-	}
+-	cbc_decrypt(&dec_ctx_, reinterpret_cast<nettle_cipher_func*>(&aes192_decrypt), block_size_, iv_.data(), s, cipher, cipher);
+-	return true;
+-}
+-
+-bool cipher_aes192_cbc::encrypt(uint8_t* plain, size_t size)
+-{
+-	if (size % block_size_) {
+-		return false;
+-	}
+-	cbc_encrypt(&ctx_, reinterpret_cast<nettle_cipher_func*>(&aes192_encrypt), block_size_, iv_.data(), size, plain, plain);
+-	return true;
+-}
+-
+-bool cipher_aes192_cbc::decrypt(uint8_t* cipher, size_t size)
+-{
+-	if (size % block_size_) {
+-		return false;
+-	}
+-	cbc_decrypt(&dec_ctx_, reinterpret_cast<nettle_cipher_func*>(&aes192_decrypt), block_size_, iv_.data(), size, cipher, cipher);
+-	return true;
+-}
++	cipher_aes_cbc(size_t key_size, std::string_view name)
++		: cipher_base(16, key_size, 16, false, true)
++		, name_(name)
++	{}
+ 
+-bool cipher_aes192_cbc::set_key(uint8_t const* key, size_t len)
+-{
+-	if (len != key_size_) {
+-		return false;
++	~cipher_aes_cbc()
++	{
++		fz::wipe(key_);
+ 	}
+-	aes192_set_encrypt_key(&ctx_, key);
+-	aes192_set_decrypt_key(&dec_ctx_, key);
+-	return true;
+-}
+-
+-class cipher_aes128_cbc final : public cipher_base
+-{
+-public:
+-	cipher_aes128_cbc();
+-	~cipher_aes128_cbc();
+-
+-	std::string_view name() const override { return "aes128-cbc"sv; }
+-
+-	virtual bool decrypt_length(uint8_t*, size_t) override;
+-	virtual bool encrypt(uint8_t* plain, size_t size) override;
+-	virtual bool decrypt(uint8_t* cipher, size_t size) override;
+-
+-	virtual bool set_key(uint8_t const* key, size_t len) override;
+-
+-private:
+-	aes128_ctx ctx_;
+-	aes128_ctx dec_ctx_;
+-};
+ 
+-cipher_aes128_cbc::cipher_aes128_cbc()
+-	: cipher_base(16, 16, 16, false, true)
+-{
+-}
+-
+-cipher_aes128_cbc::~cipher_aes128_cbc()
+-{
+-	wipe(&ctx_, sizeof(aes128_ctx));
+-	wipe(&dec_ctx_, sizeof(aes128_ctx));
+-}
++	std::string_view name() const override { return name_; }
+ 
+-bool cipher_aes128_cbc::decrypt_length(uint8_t* cipher, size_t s)
+-{
+-	if (s != block_size_) {
+-		return false;
++	virtual bool decrypt_length(uint8_t* cipher, size_t s) override
++	{
++		return s == block_size_ && decrypt(cipher, s);
+ 	}
+-	cbc_decrypt(&dec_ctx_, reinterpret_cast<nettle_cipher_func*>(&aes128_decrypt), block_size_, iv_.data(), s, cipher, cipher);
+-	return true;
+-}
+ 
+-bool cipher_aes128_cbc::encrypt(uint8_t* plain, size_t size)
+-{
+-	if (size % block_size_) {
+-		return false;
++	virtual bool encrypt(uint8_t* plain, size_t size) override
++	{
++		if (size % block_size_ || iv_.size() != aes_block || key_.empty()) {
++			return false;
++		}
++		if (!size) {
++			return true;
++		}
++		if (oc_aes(plain, size, key_.data(), key_.size(), iv_.data(), OC_AES_CBC_ENCRYPT)) {
++			return false;
++		}
++		memcpy(iv_.data(), plain + size - aes_block, aes_block);
++		return true;
+ 	}
+-	cbc_encrypt(&ctx_, reinterpret_cast<nettle_cipher_func*>(&aes128_encrypt), block_size_, iv_.data(), size, plain, plain);
+-	return true;
+-}
+ 
+-bool cipher_aes128_cbc::decrypt(uint8_t* cipher, size_t size)
+-{
+-	if (size % block_size_) {
+-		return false;
++	virtual bool decrypt(uint8_t* cipher, size_t size) override
++	{
++		if (size % block_size_ || iv_.size() != aes_block || key_.empty()) {
++			return false;
++		}
++		if (!size) {
++			return true;
++		}
++		uint8_t next[aes_block];
++		memcpy(next, cipher + size - aes_block, aes_block);
++		if (oc_aes(cipher, size, key_.data(), key_.size(), iv_.data(), OC_AES_CBC_DECRYPT)) {
++			return false;
++		}
++		memcpy(iv_.data(), next, aes_block);
++		return true;
+ 	}
+-	cbc_decrypt(&dec_ctx_, reinterpret_cast<nettle_cipher_func*>(&aes128_decrypt), block_size_, iv_.data(), size, cipher, cipher);
+-	return true;
+-}
+ 
+-bool cipher_aes128_cbc::set_key(uint8_t const* key, size_t len)
+-{
+-	if (len != key_size_) {
+-		return false;
++	virtual bool set_key(uint8_t const* key, size_t len) override
++	{
++		if (len != key_size_) {
++			return false;
++		}
++		key_.assign(key, key + len);
++		return true;
+ 	}
+-	aes128_set_encrypt_key(&ctx_, key);
+-	aes128_set_decrypt_key(&dec_ctx_, key);
+-	return true;
+-}
+-
+-class cipher_aes256_ctr final : public cipher_base
+-{
+-public:
+-	cipher_aes256_ctr();
+-	~cipher_aes256_ctr();
+-
+-	std::string_view name() const override { return "aes256-ctr"sv; }
+-
+-	virtual bool decrypt_length(uint8_t* cipher, size_t s) override;
+-	virtual bool encrypt(uint8_t* plain, size_t size) override;
+-	virtual bool decrypt(uint8_t* cipher, size_t size) override;
+-	virtual bool set_key(uint8_t const* key, size_t len) override;
+ 
+ private:
+-	aes256_ctx ctx_;
++	std::string const name_;
++	std::vector<uint8_t> key_;
+ };
+ 
+-cipher_aes256_ctr::cipher_aes256_ctr()
+-	: cipher_base(16, 32, 16, false, false)
+-{}
+-
+-cipher_aes256_ctr::~cipher_aes256_ctr()
+-{
+-	wipe(&ctx_, sizeof(aes256_ctx));
+-}
+-
+-bool cipher_aes256_ctr::decrypt_length(uint8_t* cipher, size_t s)
++// aes128-ctr, aes192-ctr, aes256-ctr (RFC 4344's SDCTR)
++class cipher_aes_ctr final : public cipher_base
+ {
+-	if (s != block_size_) {
+-		return false;
+-	}
+-	ctr_crypt(&ctx_, reinterpret_cast<nettle_cipher_func*>(&aes256_encrypt), block_size_, iv_.data(), s, cipher, cipher);
+-	return true;
+-}
++public:
++	cipher_aes_ctr(size_t key_size, std::string_view name)
++		: cipher_base(16, key_size, 16, false, false)
++		, name_(name)
++	{}
+ 
+-bool cipher_aes256_ctr::encrypt(uint8_t* plain, size_t size)
+-{
+-	if (size % block_size_) {
+-		return false;
++	~cipher_aes_ctr()
++	{
++		fz::wipe(key_);
+ 	}
+-	ctr_crypt(&ctx_, reinterpret_cast<nettle_cipher_func*>(&aes256_encrypt), block_size_, iv_.data(), size, plain, plain);
+-	return true;
+-}
+ 
+-bool cipher_aes256_ctr::decrypt(uint8_t* cipher, size_t size)
+-{
+-	return encrypt(cipher, size);
+-}
++	std::string_view name() const override { return name_; }
+ 
+-bool cipher_aes256_ctr::set_key(uint8_t const* key, size_t len)
+-{
+-	if (len != key_size_) {
+-		return false;
++	virtual bool decrypt_length(uint8_t* cipher, size_t s) override
++	{
++		return s == block_size_ && encrypt(cipher, s);
+ 	}
+-	aes256_set_encrypt_key(&ctx_, key);
+-	return true;
+-}
+-
+-class cipher_aes192_ctr final : public cipher_base
+-{
+-public:
+-	cipher_aes192_ctr();
+-	~cipher_aes192_ctr();
+-
+-	std::string_view name() const override { return "aes192-ctr"sv; }
+-
+-	virtual bool decrypt_length(uint8_t* cipher, size_t s) override;
+-	virtual bool encrypt(uint8_t* plain, size_t size) override;
+-	virtual bool decrypt(uint8_t* cipher, size_t size) override;
+-	virtual bool set_key(uint8_t const* key, size_t len) override;
+-
+-private:
+-	aes192_ctx ctx_;
+-};
+ 
+-cipher_aes192_ctr::cipher_aes192_ctr()
+-    : cipher_base(16, 24, 16, false, false)
+-{}
+-
+-cipher_aes192_ctr::~cipher_aes192_ctr()
+-{
+-	wipe(&ctx_, sizeof(aes192_ctx));
+-}
+-
+-bool cipher_aes192_ctr::decrypt_length(uint8_t* cipher, size_t s)
+-{
+-	if (s != block_size_) {
+-		return false;
++	virtual bool encrypt(uint8_t* plain, size_t size) override
++	{
++		if (size % block_size_ || iv_.size() != aes_block || key_.empty()) {
++			return false;
++		}
++		if (!size) {
++			return true;
++		}
++		if (oc_aes(plain, size, key_.data(), key_.size(), iv_.data(), OC_AES_CTR)) {
++			return false;
++		}
++		add_counter(iv_.data(), size / aes_block);
++		return true;
+ 	}
+-	ctr_crypt(&ctx_, reinterpret_cast<nettle_cipher_func*>(&aes192_encrypt), block_size_, iv_.data(), s, cipher, cipher);
+-	return true;
+-}
+ 
+-bool cipher_aes192_ctr::encrypt(uint8_t* plain, size_t size)
+-{
+-	if (size % block_size_) {
+-		return false;
++	virtual bool decrypt(uint8_t* cipher, size_t size) override
++	{
++		return encrypt(cipher, size);
+ 	}
+-	ctr_crypt(&ctx_, reinterpret_cast<nettle_cipher_func*>(&aes192_encrypt), block_size_, iv_.data(), size, plain, plain);
+-	return true;
+-}
+ 
+-bool cipher_aes192_ctr::decrypt(uint8_t* cipher, size_t size)
+-{
+-	return encrypt(cipher, size);
+-}
+-
+-bool cipher_aes192_ctr::set_key(uint8_t const* key, size_t len)
+-{
+-	if (len != key_size_) {
+-		return false;
++	virtual bool set_key(uint8_t const* key, size_t len) override
++	{
++		if (len != key_size_) {
++			return false;
++		}
++		key_.assign(key, key + len);
++		return true;
+ 	}
+-	aes192_set_encrypt_key(&ctx_, key);
+-	return true;
+-}
+-
+-
+-class cipher_aes128_ctr final : public cipher_base
+-{
+-public:
+-	cipher_aes128_ctr();
+-	~cipher_aes128_ctr();
+-
+-	std::string_view name() const override { return "aes128-ctr"sv; }
+-
+-	virtual bool decrypt_length(uint8_t* cipher, size_t s) override;
+-	virtual bool encrypt(uint8_t* plain, size_t size) override;
+-	virtual bool decrypt(uint8_t* cipher, size_t size) override;
+-	virtual bool set_key(uint8_t const* key, size_t len) override;
+ 
+ private:
+-	aes128_ctx ctx_;
++	std::string const name_;
++	std::vector<uint8_t> key_;
+ };
+ 
+-cipher_aes128_ctr::cipher_aes128_ctr()
+-    : cipher_base(16, 16, 16, false, false)
+-{}
+-
+-cipher_aes128_ctr::~cipher_aes128_ctr()
+-{
+-	wipe(&ctx_, sizeof(aes128_ctx));
+-}
+-
+-bool cipher_aes128_ctr::decrypt_length(uint8_t* cipher, size_t s)
+-{
+-	if (s != block_size_) {
+-		return false;
+-	}
+-	ctr_crypt(&ctx_, reinterpret_cast<nettle_cipher_func*>(&aes128_encrypt), block_size_, iv_.data(), s, cipher, cipher);
+-	return true;
+-}
+-
+-bool cipher_aes128_ctr::encrypt(uint8_t* plain, size_t size)
+-{
+-	if (size % block_size_) {
+-		return false;
+-	}
+-	ctr_crypt(&ctx_, reinterpret_cast<nettle_cipher_func*>(&aes128_encrypt), block_size_, iv_.data(), size, plain, plain);
+-	return true;
+-}
+-
+-bool cipher_aes128_ctr::decrypt(uint8_t* cipher, size_t size)
+-{
+-	return encrypt(cipher, size);
+-}
+-
+-bool cipher_aes128_ctr::set_key(uint8_t const* key, size_t len)
+-{
+-	if (len != key_size_) {
+-		return false;
+-	}
+-	aes128_set_encrypt_key(&ctx_, key);
+-	return true;
+-}
+-
+-
+ std::unique_ptr<cipher_base> create_cipher(std::string_view const& alg)
+ {
+ 	if (alg == "aes256-gcm@openssh.com"sv) {
+-		return std::make_unique<cipher_aes256_gcm>();
++		return std::make_unique<cipher_aes_gcm>(32, alg);
+ 	}
+ 	else if (alg == "aes128-gcm@openssh.com"sv) {
+-		return std::make_unique<cipher_aes128_gcm>();
++		return std::make_unique<cipher_aes_gcm>(16, alg);
+ 	}
+ 	else if (alg == "aes256-cbc"sv) {
+-		return std::make_unique<cipher_aes256_cbc>();
++		return std::make_unique<cipher_aes_cbc>(32, alg);
+ 	}
+ 	else if (alg == "aes192-cbc"sv) {
+-		return std::make_unique<cipher_aes192_cbc>();
++		return std::make_unique<cipher_aes_cbc>(24, alg);
+ 	}
+ 	else if (alg == "aes128-cbc"sv) {
+-		return std::make_unique<cipher_aes128_cbc>();
++		return std::make_unique<cipher_aes_cbc>(16, alg);
+ 	}
+ 	else if (alg == "aes256-ctr"sv) {
+-		return std::make_unique<cipher_aes256_ctr>();
++		return std::make_unique<cipher_aes_ctr>(32, alg);
+ 	}
+ 	else if (alg == "aes192-ctr"sv) {
+-		return std::make_unique<cipher_aes192_ctr>();
++		return std::make_unique<cipher_aes_ctr>(24, alg);
+ 	}
+ 	else if (alg == "aes128-ctr"sv) {
+-		return std::make_unique<cipher_aes128_ctr>();
++		return std::make_unique<cipher_aes_ctr>(16, alg);
+ 	}
+ 	else if (alg == "none"sv) {
+ 		return std::make_unique<cipher_none>();
+diff -ruN fzssh/lib/crypt/util.cpp fzssh-ot/lib/crypt/util.cpp
+--- fzssh/lib/crypt/util.cpp	2026-08-18 15:04:46.000000000 +0000
++++ fzssh-ot/lib/crypt/util.cpp	2026-11-06 23:02:39.706926497 +0000
+@@ -4,8 +4,7 @@
+ #include <libfilezilla/buffer.hpp>
+ #include <libfilezilla/nonowning_buffer.hpp>
+ 
+-#include <nettle/memops.h>
+-#include <nettle/sha3.h>
++#include <gfopencrypto/gfopencrypto.h>
+ 
+ #include <string.h>
+ 
+@@ -62,7 +61,7 @@
+ 
+ bool smemeq(void const* p, void const *q, size_t n)
+ {
+-	return nettle_memeql_sec(p, q, n) != 0;
++	return oc_ct_equal(p, q, n) != 0;
+ }
+ 
+ int ssh_sha3_256 = 256;
+@@ -111,41 +110,65 @@
+ 	delete acc;
+ }
+ 
++// SHAKE128 and SHAKE256 (FIPS 202) for ML-KEM: a sponge over GFOpenCrypto's
++// Keccak-f[1600]. Lanes are little-endian, whatever the host's order.
+ struct ShakeXOF
+ {
+-	union {
+-		sha3_128_ctx ctx128;
+-		sha3_256_ctx ctx256;
+-	} ctx_;
+-
+-	size_t bits_;
++	uint64_t a[25];
++	size_t rate;
++	size_t pos;
++	bool squeezing;
+ };
+ 
++namespace {
++void xof_absorb(ShakeXOF * h, uint8_t const* p, size_t len)
++{
++	for (size_t i = 0; i < len; ++i) {
++		h->a[h->pos / 8] ^= static_cast<uint64_t>(p[i]) << (8 * (h->pos % 8));
++		if (++h->pos == h->rate) {
++			oc_keccak_f1600(h->a);
++			h->pos = 0;
++		}
++	}
++}
++
++ShakeXOF * xof_new(size_t rate, ptrlen seed)
++{
++	auto h = new ShakeXOF{};
++	h->rate = rate;
++	xof_absorb(h, reinterpret_cast<uint8_t const*>(seed.ptr), seed.len);
++	return h;
++}
++}
++
+ ShakeXOF* shake128_xof_from_input(ptrlen seed)
+ {
+-	auto ctx = new ShakeXOF;
+-	ctx->bits_ = 128;
+-	sha3_128_init(&ctx->ctx_.ctx128);
+-	sha3_128_update(&ctx->ctx_.ctx128, seed.len, reinterpret_cast<uint8_t const*>(seed.ptr));
+-	return ctx;
++	return xof_new(168, seed);
+ }
+ 
+ ShakeXOF* shake256_xof_from_input(ptrlen seed)
+ {
+-	auto ctx = new ShakeXOF;
+-	ctx->bits_ = 256;
+-	sha3_256_init(&ctx->ctx_.ctx256);
+-	sha3_256_update(&ctx->ctx_.ctx256, seed.len, reinterpret_cast<uint8_t const*>(seed.ptr));
+-	return ctx;
++	return xof_new(136, seed);
+ }
+ 
+ void shake_xof_read(ShakeXOF* h, void* out, size_t len)
+ {
+-	if (h->bits_ == 128) {
+-		sha3_128_shake_output(&h->ctx_.ctx128, len, reinterpret_cast<uint8_t*>(out));
+-	}
+-	else {
+-		sha3_256_shake_output(&h->ctx_.ctx256, len, reinterpret_cast<uint8_t*>(out));
++	if (!h->squeezing) {
++		// SHAKE's domain bits and the pad10*1
++		h->a[h->pos / 8] ^= uint64_t(0x1f) << (8 * (h->pos % 8));
++		h->a[(h->rate - 1) / 8] ^= uint64_t(0x80) << (8 * ((h->rate - 1) % 8));
++		oc_keccak_f1600(h->a);
++		h->pos = 0;
++		h->squeezing = true;
++	}
++	auto o = reinterpret_cast<uint8_t*>(out);
++	for (size_t i = 0; i < len; ++i) {
++		if (h->pos == h->rate) {
++			oc_keccak_f1600(h->a);
++			h->pos = 0;
++		}
++		o[i] = static_cast<uint8_t>(h->a[h->pos / 8] >> (8 * (h->pos % 8)));
++		++h->pos;
+ 	}
+ }
+ 
+diff -ruN fzssh/lib/dh.cpp fzssh-ot/lib/dh.cpp
+--- fzssh/lib/dh.cpp	2026-08-18 15:04:46.000000000 +0000
++++ fzssh-ot/lib/dh.cpp	2026-11-06 23:17:43.355338418 +0000
+@@ -4,10 +4,7 @@
+ #include <libfilezilla/logger.hpp>
+ #include <libfilezilla/util.hpp>
+ 
+-#include <nettle/curve25519.h>
+-#include <nettle/ecc.h>
+-#include <nettle/ecdsa.h>
+-#include <nettle/memops.h>
++#include <gfopencrypto/gfopencrypto.h>
+ 
+ #include "crypt/mlkem.hpp"
+ 
+@@ -75,7 +72,7 @@
+ 			0, 0, 0, 0, 0, 0, 0, 0 };
+ 
+ 		pub_.resize(pub_octet_size_);
+-		nettle_curve25519_mul(pub_.data(), priv_.data(), nine);
++		oc_x25519(pub_.data(), priv_.data(), nine);
+ 
+ 		return true;
+ 	}
+@@ -94,10 +91,9 @@
+ 
+ 	buffer ret;
+ 	ret.resize(pub_octet_size_);
+-	nettle_curve25519_mul(ret.data(), priv_.data(), reinterpret_cast<uint8_t const*>(pub2->key().data()));
+-
+-	char zero[pub_octet_size_] = {};
+-	if (memeql_sec(ret.data(), zero, pub_octet_size_)) {
++	// -1 for an all-zero result: a small-order point
++	if (oc_x25519(ret.data(), priv_.data(), reinterpret_cast<uint8_t const*>(pub2->key().data())) != 0) {
++		fz::wipe(ret);
+ 		return {};
+ 	}
+ 	return ret;
+@@ -127,8 +123,6 @@
+ 	nistp_curve const curve_;
+ };
+ 
+-extern "C" void rnd(void *, size_t length, uint8_t *dst);
+-
+ class dh_privkey_sha2_nistp final : public dh_privkey_base
+ {
+ public:
+@@ -148,15 +142,14 @@
+ 
+ 		curve_point pub(curve_);
+ 
+-		ecdsa_generate_keypair(pub, priv_, nullptr, &rnd);
+-
+-		pub_.append('\x04');
+-
+-		mpz x, y;
+-		ecc_point_get(pub, x, y);
++		auto seed = random_bytes(curve_bytes(curve_) + 8); // the extra 64 bits GFOpenCrypto asks for
++		int const len = oc_ec_keygen(oc_curve(curve_), priv_.d.data(), pub.p.data(), seed.data(), seed.size());
++		fz::wipe(seed);
++		if (len != static_cast<int>(pub.p.size())) {
++			return false;
++		}
+ 
+-		to_string_append(pub_, x, curve_bytes(curve_));
+-		to_string_append(pub_, y, curve_bytes(curve_));
++		pub_.append(pub.p);
+ 
+ 		return true;
+ 	}
+@@ -181,30 +174,18 @@
+ 		return {};
+ 	}
+ 
+-	std::string_view x = raw.substr(1, curve_bytes(curve_));
+-	std::string_view y = raw.substr(1 + curve_bytes(curve_), curve_bytes(curve_));
+-
+-	mpz xz;
+-	mpz yz;
+-
+-	nettle_mpz_set_str_256_u(xz, x.size(), reinterpret_cast<uint8_t const*>(x.data()));
+-	nettle_mpz_set_str_256_u(yz, y.size(), reinterpret_cast<uint8_t const*>(y.data()));
+-
+-	curve_point pubpoint(curve_);
+-	if (!nettle_ecc_point_set(pubpoint, xz, yz)) {
++	// GFOpenCrypto checks the point is on the curve, then multiplies
++	curve_point shared(curve_);
++	memcpy(shared.p.data(), raw.data(), shared.p.size());
++	if (oc_ec_mul(oc_curve(curve_), shared.p.data(), shared.p.size(), priv_.d.data(), priv_.d.size()) != 1) {
++		wipe(shared);
+ 		return {};
+ 	}
+ 
+-	curve_point shared(curve_);
+-	nettle_ecc_point_mul(shared, priv_, pubpoint);
+-
+-	nettle_ecc_point_get(shared, xz, yz);
+-
+-	auto ret = to_string(xz, curve_bytes(curve_));
++	buffer ret;
++	ret.append(shared.x().data(), shared.x().size());
+ 
+ 	wipe(shared);
+-	wipe(xz);
+-	wipe(yz);
+ 
+ 	return ret;
+ }
+@@ -214,20 +195,26 @@
+ {
+ 	group(char const* prime, char const* generator)
+ 	{
+-		mpz_set_str(p, prime, 16);
+-		mpz_sub_ui(p_sub1, p, 1);
+-		mpz_set_str(g, generator, 16);
+-		mpz_tdiv_q_ui(q, p, 2);
+-		bits = mpz_sizeinbase(p, 2);
++		p.set_hex(prime);
++		g.set_hex(generator);
++		init();
+ 	}
+ 
+ 	group(mpz && prime, mpz && generator)
+ 		: p(std::move(prime))
+ 		, g(std::move(generator))
+ 	{
+-		mpz_sub_ui(p_sub1, p, 1);
+-		mpz_tdiv_q_ui(q, p, 2);
+-		bits = mpz_sizeinbase(p, 2);
++		init();
++	}
++
++	void init()
++	{
++		if (p.is_zero()) {
++			return;
++		}
++		p_sub1 = sub_ui(p, 1);
++		q = half(p);
++		bits = p.bits();
+ 	}
+ 
+ 	bool validate(logger_interface & log);
+@@ -254,14 +241,8 @@
+ 
+ 	static std::array<group, 6> groups({
+ 		group{
+-			// group1 Note: _Second_ Oakley group
+-			"FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
+-			"29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
+-			"EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"
+-			"E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED"
+-			"EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381"
+-			"FFFFFFFFFFFFFFFF",
+-			"2"
++			// group1 (the second Oakley group, 1024 bits) is not offered: too short
++			"0", "0"
+ 		},
+ 		{
+ 			"FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
+@@ -411,7 +392,7 @@
+ {
+ 	auto const& groups = get_groups();
+ 	for (size_t i = 0; i < groups.size(); ++i) {
+-		if (groups[i].bits >= bits) {
++		if (groups[i].bits && groups[i].bits >= bits) {
+ 			return static_cast<dh_group>(i);
+ 		}
+ 	}
+@@ -471,7 +452,7 @@
+ 	f_ = std::move(*f);
+ 
+ 	// Check for abnormal keys. The probability of this happening at random is infinitesimal
+-	auto const b = mpz_popcount(f_);
++	auto const b = f_.popcount();
+ 	if (b < 8 || b > g_.bits - 8) {
+ 		return false;
+ 	}
+@@ -508,7 +489,7 @@
+ 	}
+ 
+ 	// Short exponent optimization
+-	size_t bits = mpz_sizeinbase(g_.q, 2);
++	size_t bits = g_.q.bits();
+ 	bits_hint *= 2;
+ 	if (bits_hint < bits) {
+ 		bits = std::max(bits_hint, size_t(256));
+@@ -522,19 +503,21 @@
+ 				uint8_t remainder_mask = ~((2u << (bits % 8 - 1)) - 1);
+ 				raw[0] &= remainder_mask;
+ 			}
+-			mpz_import(x_, raw.size(), 1, 1, 0, 0, reinterpret_cast<uint8_t const*>(raw.data()));
++			x_.set(raw.data(), raw.size());
+ 			wipe(raw);
+ 		}
+ 		while (x_ <= 1 || x_ >= g_.q);
+ 
+-		mpz_powm_sec(e, g_.g, x_, g_.p);
++		auto r = powm(g_.g, x_, g_.p);
++		if (!r) {
++			return false;
++		}
++		e = std::move(*r);
+ 	}
+ 	while (e <= 1 || e >= g_.p_sub1);
+ 
+ 	pub_.append(0);
+-	auto bytes = (mpz_sizeinbase(e, 2) + 7) / 8;
+-	mpz_export(pub_.get(bytes), nullptr, 1, 1, 0, 0, e);
+-	pub_.add(bytes);
++	pub_.append(e.data(), e.bytes());
+ 	if (!(pub_[1] & 0x80)) {
+ 		pub_.consume(1);
+ 	}
+@@ -549,18 +532,13 @@
+ 		return {};
+ 	}
+ 
+-	mpz k;
+-	scoped_wiper w(k);
+-	mpz_powm_sec(k, pub2->f_, x_, g_.p);
+-
+-	if (k <= 1 || k >= g_.p_sub1) {
++	auto k = powm(pub2->f_, x_, g_.p);
++	if (!k || *k <= 1 || *k >= g_.p_sub1) {
+ 		return {};
+ 	}
+ 
+ 	buffer ret;
+-	auto bytes = (mpz_sizeinbase(k, 2) + 7) / 8;
+-	mpz_export(ret.get(bytes), nullptr, 1, 1, 0, 0, k);
+-	ret.add(bytes);
++	ret.append(k->data(), k->bytes());
+ 	return ret;
+ }
+ 
+@@ -693,9 +671,6 @@
+ 	else if (alg == "diffie-hellman-group14-sha1"sv || alg == "diffie-hellman-group14-sha256"sv) {
+ 		return std::make_unique<dh_pubkey_group>(dh_group::group14);
+ 	}
+-	else if (alg == "diffie-hellman-group1-sha1"sv) {
+-		return std::make_unique<dh_pubkey_group>(dh_group::group1);
+-	}
+ 	else if (alg == "diffie-hellman-group15-sha512"sv) {
+ 		return std::make_unique<dh_pubkey_group>(dh_group::group15);
+ 	}
+@@ -732,9 +707,6 @@
+ 	else if (alg == "diffie-hellman-group14-sha1"sv || alg == "diffie-hellman-group14-sha256"sv) {
+ 		return std::make_unique<dh_privkey_group>(dh_group::group14);
+ 	}
+-	else if (alg == "diffie-hellman-group1-sha1"sv) {
+-		return std::make_unique<dh_privkey_group>(dh_group::group1);
+-	}
+ 	else if (alg == "diffie-hellman-group15-sha512"sv) {
+ 		return std::make_unique<dh_privkey_group>(dh_group::group15);
+ 	}
+@@ -782,14 +754,24 @@
+ {
+ 	// P must be a safe prime as per RFC 4419:
+ 	// "A prime p is safe if p = 2q + 1 and q is prime."
+-	if (mpz_probab_prime_p(p, 64) == 0) {
++	//
++	// q gets the Miller-Rabin test; p = 2q + 1 then needs only Pocklington's
++	// test with base 2 (q prime, q > sqrt(p), 2^(p-1) = 1 mod p and
++	// gcd(2^2 - 1, p) = 1 prove p prime), one exponentiation in place of a
++	// second full test: group exchange is slow enough on a 68040.
++	if (!p.is_odd() || p.bits() < 3) {
+ 		log.log(logmsg::error, "Received group prime failed primality check"sv);
+ 		return false;
+ 	}
+-	if (mpz_probab_prime_p(q, 64) == 0) {
++	if (!probab_prime(q)) {
+ 		log.log(logmsg::error, "Received group prime is not a safe prime"sv);
+ 		return false;
+ 	}
++	auto f = powm(mpz(2), p_sub1, p);
++	if (!f || !(*f == 1) || mod(p, mpz(3)).is_zero()) {
++		log.log(logmsg::error, "Received group prime failed primality check"sv);
++		return false;
++	}
+ 
+ 	// Reject trivial g
+ 	if (g <= 1 || g >= p_sub1) {
+@@ -798,14 +780,17 @@
+ 	}
+ 
+ 	// Check that the order is either q or p-1
+-	mpz r;
+-	mpz_powm(r, g, q, p);
++	auto r = powm(g, q, p);
++	if (!r) {
++		log.log(logmsg::error, "Received group prime is too large"sv);
++		return false;
++	}
+ 
+-	if (r == 1) {
++	if (*r == 1) {
+ 		return true; // order q
+ 	}
+ 
+-	if (r == p_sub1) {
++	if (*r == p_sub1) {
+ 		return true; // order p-1
+ 	}
+ 
+diff -ruN fzssh/lib/ecc.cpp fzssh-ot/lib/ecc.cpp
+--- fzssh/lib/ecc.cpp	2026-08-18 15:04:46.000000000 +0000
++++ fzssh-ot/lib/ecc.cpp	2026-11-06 23:00:10.311498143 +0000
+@@ -1,7 +1,9 @@
+ #include "ecc.hpp"
+ #include "mpz.hpp"
+ 
+-#include <nettle/ecc-curve.h>
++#include <gfopencrypto/gfopencrypto.h>
++
++#include <string.h>
+ 
+ using namespace std::literals;
+ 
+@@ -20,17 +22,17 @@
+ 	return {};
+ }
+ 
+-const struct ecc_curve * get_nettle_curve(nistp_curve c) {
++int oc_curve(nistp_curve c) {
+ 	switch (c) {
+ 	case nistp_curve::nistp256:
+-		return nettle_get_secp_256r1();
++		return 256;
+ 	case nistp_curve::nistp384:
+-		return nettle_get_secp_384r1();
++		return 384;
+ 	case nistp_curve::nistp521:
+-		return nettle_get_secp_521r1();
++		return 521;
+ 	}
+ 
+-	return nullptr;
++	return 0;
+ }
+ 
+ std::string_view key_name(nistp_curve c) {
+@@ -87,35 +89,75 @@
+ }
+ 
+ curve_point::curve_point(nistp_curve c)
++	: p(1 + 2 * curve_bytes(c))
+ {
+-	nettle_ecc_point_init(&p, get_nettle_curve(c));
++	p[0] = 4;
+ }
+ 
+ curve_point::~curve_point()
+ {
+-	nettle_ecc_point_clear(&p);
++	fz::wipe(p);
+ }
+ 
+-curve_scalar::curve_scalar(nistp_curve c)
++namespace {
++bool fit(uint8_t * out, size_t size, std::basic_string_view<uint8_t> v)
+ {
+-	nettle_ecc_scalar_init(&p, get_nettle_curve(c));
++	while (!v.empty() && !v.front()) {
++		v.remove_prefix(1);
++	}
++	if (v.size() > size) {
++		return false;
++	}
++	memset(out, 0, size - v.size());
++	if (!v.empty()) {
++		memcpy(out + size - v.size(), v.data(), v.size());
++	}
++	return true;
++}
+ }
+ 
+-curve_scalar::~curve_scalar()
++bool curve_point::set(nistp_curve c, std::basic_string_view<uint8_t> x, std::basic_string_view<uint8_t> y)
+ {
+-	if (p.p) {
+-		fz::wipe(p.p, static_cast<size_t>(nettle_ecc_size(p.ecc)) * sizeof(*p.p));
++	size_t const n = curve_bytes(c);
++	if (p.size() != 1 + 2 * n || !fit(p.data() + 1, n, x) || !fit(p.data() + 1 + n, n, y)) {
++		return false;
+ 	}
+-	nettle_ecc_scalar_clear(&p);
++	// GFOpenCrypto checks the point is on the curve: one times the point
++	std::vector<uint8_t> check = p;
++	uint8_t const one = 1;
++	bool const ok = oc_ec_mul(oc_curve(c), check.data(), check.size(), &one, 1) == 1 && check == p;
++	fz::wipe(check);
++	return ok;
++}
++
++curve_scalar::curve_scalar(nistp_curve c)
++	: d(curve_bytes(c))
++{
+ }
+ 
++curve_scalar::~curve_scalar()
++{
++	fz::wipe(d);
++}
+ 
+-void wipe(curve_point & p)
++bool curve_scalar::set(nistp_curve c, std::basic_string_view<uint8_t> v)
+ {
+-	if (p.p.p) {
+-		fz::wipe(p.p.p, static_cast<size_t>(nettle_ecc_size_a(p.p.ecc)) * sizeof(*p.p.p));
++	if (!fit(d.data(), d.size(), v)) {
++		return false;
+ 	}
++	// In range when it signs: a zero hash under d gives an answer, or -1
++	std::vector<uint8_t> r(d.size()), s(d.size());
++	uint8_t const h[32]{};
++	bool const ok = oc_ecdsa_sign(oc_curve(c), r.data(), s.data(), d.data(), h, sizeof(h)) == 0;
++	fz::wipe(r);
++	fz::wipe(s);
++	return ok;
+ }
+ 
++void wipe(curve_point & p)
++{
++	fz::wipe(p.p);
++	p.p.assign(p.p.size(), 0);
++}
+ 
+ }
+diff -ruN fzssh/lib/ecc.hpp fzssh-ot/lib/ecc.hpp
+--- fzssh/lib/ecc.hpp	2026-08-18 15:04:46.000000000 +0000
++++ fzssh-ot/lib/ecc.hpp	2026-11-06 23:00:10.311133364 +0000
+@@ -4,9 +4,7 @@
+ #include <libfilezilla/hash.hpp>
+ #include <libfilezilla/util.hpp>
+ 
+-#include <nettle/ecc.h>
+-
+-struct ecc_curve;
++#include <vector>
+ 
+ namespace fz::ssh {
+ enum class nistp_curve : unsigned {
+@@ -16,12 +14,14 @@
+ };
+ 
+ hash_algorithm get_digest(nistp_curve c);
+-const struct ecc_curve * get_nettle_curve(nistp_curve c);
++// GFOpenCrypto's curve number: 256, 384 or 521
++int oc_curve(nistp_curve c);
+ std::string_view key_name(nistp_curve c);
+ std::string_view curve_name(nistp_curve c);
+ size_t curve_bytes(nistp_curve c);
+ std::string_view curve_oid(nistp_curve c);
+ 
++// A point as X9.62 uncompressed bytes, 04 || x || y
+ struct curve_point final
+ {
+ 	curve_point() = delete;
+@@ -31,12 +31,15 @@
+ 	explicit curve_point(nistp_curve c);
+ 	~curve_point();
+ 
+-	operator ecc_point *() { return &p; }
+-	operator ecc_point const*() const { return &p; }
++	// x and y big-endian, any leading zeros; false when not on the curve
++	bool set(nistp_curve c, std::basic_string_view<uint8_t> x, std::basic_string_view<uint8_t> y);
++	std::basic_string_view<uint8_t> x() const { return {p.data() + 1, (p.size() - 1) / 2}; }
++	std::basic_string_view<uint8_t> y() const { return {p.data() + 1 + (p.size() - 1) / 2, (p.size() - 1) / 2}; }
+ 
+-	ecc_point p;
++	std::vector<uint8_t> p;
+ };
+ 
++// A private scalar, big-endian, the curve's size
+ struct curve_scalar final
+ {
+ 	curve_scalar() = delete;
+@@ -46,10 +49,10 @@
+ 	explicit curve_scalar(nistp_curve c);
+ 	~curve_scalar();
+ 
+-	operator ecc_scalar *() { return &p; }
+-	operator ecc_scalar const*() const { return &p; }
++	// false unless 1 <= v < n
++	bool set(nistp_curve c, std::basic_string_view<uint8_t> v);
+ 
+-	ecc_scalar p;
++	std::vector<uint8_t> d;
+ };
+ 
+ void wipe(curve_point & p);
+diff -ruN fzssh/lib/mac.cpp fzssh-ot/lib/mac.cpp
+--- fzssh/lib/mac.cpp	2026-08-18 15:04:46.000000000 +0000
++++ fzssh-ot/lib/mac.cpp	2026-11-06 23:02:22.724018329 +0000
+@@ -6,9 +6,7 @@
+ #include <libfilezilla/hash.hpp>
+ #include <libfilezilla/util.hpp>
+ 
+-#include <nettle/memops.h>
+-#include <nettle/umac.h>
+-#include <nettle/version.h>
++#include <gfopencrypto/gfopencrypto.h>
+ 
+ using namespace std::literals;
+ 
+@@ -79,7 +77,7 @@
+ 	{
+ 		calc(seq, data, size);
+ 		auto d = h_.digest();
+-		return memeql_sec(mac, d.data(), 12) != 0;
++		return oc_ct_equal(mac, d.data(), 12) != 0;
+ 	}
+ 
+ private:
+@@ -92,104 +90,6 @@
+ 	hash_accumulator h_;
+ };
+ 
+-class mac_umac64 final : public mac_base
+-{
+-public:
+-	mac_umac64(std::string_view const& key) noexcept
+-		: mac_base(8, true)
+-	{
+-		nettle_umac64_set_key(&ctx_, reinterpret_cast<uint8_t const*>(key.data()));
+-	}
+-
+-	~mac_umac64()
+-	{
+-		wipe(&ctx_, sizeof(umac64_ctx));
+-	}
+-
+-	virtual bool generate(uint32_t seq, uint8_t const* data, size_t size, uint8_t* mac) override
+-	{
+-		char buf[8];
+-		write_uint64(buf, seq);
+-		nettle_umac64_set_nonce(&ctx_, 8, reinterpret_cast<uint8_t*>(buf));
+-		nettle_umac64_update(&ctx_, size, data);
+-#if NETTLE_VERSION_MAJOR >= 4
+-		nettle_umac64_digest(&ctx_, mac);
+-#else
+-		nettle_umac64_digest(&ctx_, 8, mac);
+-#endif
+-		return true;
+-	}
+-	virtual bool verify(uint32_t seq, uint8_t const* data, size_t size, uint8_t const* mac) override
+-	{
+-		char buf[8];
+-		write_uint64(buf, seq);
+-
+-		nettle_umac64_set_nonce(&ctx_, 8, reinterpret_cast<uint8_t*>(buf));
+-		nettle_umac64_update(&ctx_, size, data);
+-
+-		uint8_t digest[8];
+-#if NETTLE_VERSION_MAJOR >= 4
+-		nettle_umac64_digest(&ctx_, digest);
+-#else
+-		nettle_umac64_digest(&ctx_, 8, digest);
+-#endif
+-		return memeql_sec(mac, digest, 8) != 0;
+-	}
+-
+-private:
+-	umac64_ctx ctx_;
+-};
+-
+-class mac_umac128 final : public mac_base
+-{
+-public:
+-	mac_umac128(std::string_view const& key) noexcept
+-		: mac_base(16, true)
+-	{
+-		nettle_umac128_set_key(&ctx_, reinterpret_cast<uint8_t const*>(key.data()));
+-	}
+-
+-	~mac_umac128()
+-	{
+-		wipe(&ctx_, sizeof(umac128_ctx));
+-	}
+-
+-	virtual bool generate(uint32_t seq, uint8_t const* data, size_t size, uint8_t* mac) override
+-	{
+-		char buf[8];
+-		write_uint64(buf, seq);
+-
+-		nettle_umac128_set_nonce(&ctx_, 8, reinterpret_cast<uint8_t*>(buf));
+-		nettle_umac128_update(&ctx_, size, data);
+-#if NETTLE_VERSION_MAJOR >= 4
+-		nettle_umac128_digest(&ctx_, mac);
+-#else
+-		nettle_umac128_digest(&ctx_, 16, mac);
+-#endif
+-		return true;
+-	}
+-
+-	virtual bool verify(uint32_t seq, uint8_t const* data, size_t size, uint8_t const* mac) override
+-	{
+-		char buf[8];
+-		write_uint64(buf, seq);
+-
+-		nettle_umac128_set_nonce(&ctx_, 8, reinterpret_cast<uint8_t*>(buf));
+-		nettle_umac128_update(&ctx_, size, data);
+-
+-		uint8_t digest[16];
+-#if NETTLE_VERSION_MAJOR >= 4
+-		nettle_umac128_digest(&ctx_, digest);
+-#else
+-		nettle_umac128_digest(&ctx_, 16, digest);
+-#endif
+-		return memeql_sec(mac, digest, 16) != 0;
+-	}
+-
+-private:
+-	umac128_ctx ctx_;
+-};
+-
+ std::unique_ptr<mac_base> create_mac(std::string_view const& alg, std::string_view const& key)
+ {
+ 	if (alg == "aes256-gcm@openssh.com"sv) {
+@@ -228,18 +128,6 @@
+ 		}
+ 		return std::make_unique<mac_hmac>(32, hmac_algorithm::sha256, key, true);
+ 	}
+-	else if (alg == "umac-64-etm@openssh.com"sv) {
+-		if (key.size() != 16) {
+-			return {};
+-		}
+-		return std::make_unique<mac_umac64>(key);
+-	}
+-	else if (alg == "umac-128-etm@openssh.com"sv) {
+-		if (key.size() != 16) {
+-			return {};
+-		}
+-		return std::make_unique<mac_umac128>(key);
+-	}
+ 	else if (alg == "none"sv) {
+ 		return std::make_unique<mac_none>();
+ 	}
+@@ -269,12 +157,6 @@
+ 	else if (alg == "hmac-sha2-256-etm@openssh.com"sv) {
+ 		return 32;
+ 	}
+-	else if (alg == "umac-64-etm@openssh.com"sv) {
+-		return 16;
+-	}
+-	else if (alg == "umac-128-etm@openssh.com"sv) {
+-		return 16;
+-	}
+ 	return {};
+ }
+ 
+diff -ruN fzssh/lib/mpz.cpp fzssh-ot/lib/mpz.cpp
+--- fzssh/lib/mpz.cpp	2026-08-18 15:04:46.000000000 +0000
++++ fzssh-ot/lib/mpz.cpp	2026-11-06 23:17:43.355710262 +0000
+@@ -3,76 +3,216 @@
+ #include "asn1.hpp"
+ #include "buffer_util.hpp"
+ 
+-#include <nettle/bignum.h>
++#include <gfopencrypto/gfopencrypto.h>
++
++#include <libfilezilla/encode.hpp>
+ 
+ #include <string.h>
+ 
+ namespace fz::ssh {
+ 
+-bool operator==(mpz const& l, mpz const& r)
++mpz::mpz(unsigned long int n)
++{
++	while (n) {
++		b.insert(b.begin(), static_cast<uint8_t>(n & 0xffu));
++		n >>= 8;
++	}
++}
++
++void mpz::set(uint8_t const* data, size_t size)
++{
++	while (size && !*data) {
++		++data;
++		--size;
++	}
++	// data may point into b itself (sub_ui trims its own result)
++	std::vector<uint8_t> v(data, data + size);
++	fz::wipe(b);
++	b.swap(v);
++	fz::wipe(v);
++}
++
++bool mpz::set_hex(char const* hex)
+ {
+-	return mpz_cmp(l, r) == 0;
++	auto raw = fz::hex_decode(std::string_view(hex).size() % 2 ? std::string("0") + hex : std::string(hex));
++	if (raw.empty() && *hex) {
++		return false;
++	}
++	set(raw.data(), raw.size());
++	return true;
+ }
+ 
+-bool operator==(mpz const& l, unsigned long int r)
++size_t mpz::bits() const
+ {
+-	return mpz_cmp_ui(l.v, r) == 0;
++	if (b.empty()) {
++		return 0;
++	}
++	size_t n = (b.size() - 1) * 8;
++	for (uint8_t c = b[0]; c; c >>= 1) {
++		++n;
++	}
++	return n;
+ }
+ 
+-bool operator<=(mpz const& l, mpz const& r)
++bool mpz::tstbit(size_t bit) const
+ {
+-	return mpz_cmp(l, r) <= 0;
++	size_t const byte = bit / 8;
++	if (byte >= b.size()) {
++		return false;
++	}
++	return (b[b.size() - 1 - byte] >> (bit % 8)) & 1;
+ }
+ 
+-bool operator<(mpz const& l, mpz const& r)
++size_t mpz::popcount() const
+ {
+-	return mpz_cmp(l, r) < 0;
++	size_t n{};
++	for (uint8_t c : b) {
++		for (; c; c &= c - 1) {
++			++n;
++		}
++	}
++	return n;
+ }
+ 
+-bool operator<=(mpz const& l, unsigned long int r)
++int cmp(mpz const& l, mpz const& r)
+ {
+-	return mpz_cmp_ui(l.v, r) <= 0;
++	if (l.b.size() != r.b.size()) {
++		return l.b.size() < r.b.size() ? -1 : 1;
++	}
++	int c = l.b.empty() ? 0 : memcmp(l.b.data(), r.b.data(), l.b.size());
++	return c < 0 ? -1 : (c > 0 ? 1 : 0);
+ }
+ 
+-void wipe(mpz_t & v)
++bool operator==(mpz const& l, mpz const& r) { return cmp(l, r) == 0; }
++bool operator==(mpz const& l, unsigned long int r) { return cmp(l, mpz(r)) == 0; }
++bool operator<=(mpz const& l, mpz const& r) { return cmp(l, r) <= 0; }
++bool operator<(mpz const& l, mpz const& r) { return cmp(l, r) < 0; }
++bool operator<=(mpz const& l, unsigned long int r) { return cmp(l, mpz(r)) <= 0; }
++
++mpz sub_ui(mpz const& v, unsigned long int n)
++{
++	mpz ret = v;
++	unsigned long borrow = n;
++	for (size_t i = ret.b.size(); i-- > 0 && borrow;) {
++		unsigned long const sub = borrow & 0xffu;
++		borrow >>= 8;
++		if (ret.b[i] >= sub) {
++			ret.b[i] = static_cast<uint8_t>(ret.b[i] - sub);
++		}
++		else {
++			ret.b[i] = static_cast<uint8_t>(ret.b[i] + 256 - sub);
++			++borrow;
++		}
++	}
++	ret.set(ret.b.data(), ret.b.size());
++	return ret;
++}
++
++mpz half(mpz const& v)
+ {
+-	// It's a bit ugly to access the limbs directly
+-	// Should the GMP api change and no longer expose this, best we can do is mpz_size and mpz_limbs_modify
+-	auto const alloc = v[0]._mp_alloc;
+-	if (alloc > 0 && v[0]._mp_d) {
+-		fz::wipe(v[0]._mp_d, static_cast<size_t>(alloc) * sizeof(*v[0]._mp_d));
++	std::vector<uint8_t> out(v.b.size());
++	uint8_t carry{};
++	for (size_t i = 0; i < v.b.size(); ++i) {
++		out[i] = static_cast<uint8_t>((v.b[i] >> 1) | (carry << 7));
++		carry = v.b[i] & 1;
+ 	}
+-	v[0]._mp_size = 0;
++	mpz ret(out.data(), out.size());
++	fz::wipe(out);
++	return ret;
+ }
+ 
+-size_t to_string_size(mpz_t const& n, size_t pad)
++mpz mod(mpz const& v, mpz const& m)
+ {
+-	size_t s = nettle_mpz_sizeinbase_256_u(n);
+-	return std::max(s, pad);
++	if (m.is_zero()) {
++		return {};
++	}
++	// r stays below m; r = 2r + bit, then r - m when that doesn't borrow
++	size_t const n = m.bytes() + 1;
++	std::vector<uint8_t> mm(n), r(n), t(n);
++	memcpy(mm.data() + 1, m.data(), m.bytes());
++	for (size_t bit = v.bits(); bit-- > 0;) {
++		unsigned carry = v.tstbit(bit) ? 1 : 0;
++		for (size_t i = n; i-- > 0;) {
++			unsigned const x = (unsigned(r[i]) << 1) | carry;
++			r[i] = static_cast<uint8_t>(x);
++			carry = x >> 8;
++		}
++		unsigned borrow{};
++		for (size_t i = n; i-- > 0;) {
++			unsigned const x = unsigned(r[i]) - mm[i] - borrow;
++			t[i] = static_cast<uint8_t>(x);
++			borrow = (x >> 8) & 1;
++		}
++		uint8_t const keep = static_cast<uint8_t>(0u - borrow); // ff: r < m
++		for (size_t i = 0; i < n; ++i) {
++			r[i] = static_cast<uint8_t>((r[i] & keep) | (t[i] & ~keep));
++		}
++	}
++	mpz ret(r.data(), r.size());
++	fz::wipe(r);
++	fz::wipe(t);
++	return ret;
+ }
+ 
+-fz::buffer to_string(mpz_t const& n, size_t pad)
++std::optional<mpz> powm(mpz const& base, mpz const& exponent, mpz const& modulus)
++{
++	if (!modulus.is_odd() || modulus.bytes() > OC_RSA_MAX_BYTES) {
++		return {};
++	}
++	std::vector<uint8_t> out(modulus.bytes());
++	uint8_t const zero = 0;
++	if (oc_modexp(out.data(), base.is_zero() ? &zero : base.data(), base.is_zero() ? 1 : base.bytes(),
++		exponent.is_zero() ? &zero : exponent.data(), exponent.is_zero() ? 1 : exponent.bytes(),
++		modulus.data(), modulus.bytes()))
++	{
++		return {};
++	}
++	mpz ret(out.data(), out.size());
++	fz::wipe(out);
++	return ret;
++}
++
++bool probab_prime(mpz const& v)
++{
++	if (v.is_zero()) {
++		return false;
++	}
++	// 0: the library's 40 rounds, an error below 2^-80 for any input
++	return oc_is_probable_prime(v.data(), v.bytes(), 0) == 1;
++}
++
++void wipe(mpz & v)
++{
++	fz::wipe(v.b);
++	v.b.clear();
++}
++
++size_t to_string_size(mpz const& n, size_t pad)
++{
++	return std::max(n.bytes(), pad);
++}
++
++fz::buffer to_string(mpz const& n, size_t pad)
+ {
+ 	fz::buffer ret;
+ 	to_string_append(ret, n, pad);
+ 	return ret;
+ }
+ 
+-void to_string_append(fz::buffer & buf, mpz_t const& n, size_t pad)
++void to_string_append(fz::buffer & buf, mpz const& n, size_t pad)
+ {
+-	size_t s = to_string_size(n, 0);
++	size_t s = n.bytes();
+ 	if (s < pad) {
+ 		buf.append(pad - s, 0);
+ 	}
+ 	if (s) {
+-		nettle_mpz_get_str_256(s, reinterpret_cast<unsigned char*>(buf.get(s)), n);
+-		buf.add(s);
++		buf.append(n.data(), s);
+ 	}
+ }
+ 
+-bool to_string_append(uint8_t* out, size_t size, mpz_t const& n, size_t pad)
++bool to_string_append(uint8_t* out, size_t size, mpz const& n, size_t pad)
+ {
+-	size_t needed = to_string_size(n, 0);
++	size_t needed = n.bytes();
+ 	if (std::max(needed, pad) != size) {
+ 		return false;
+ 	}
+@@ -82,7 +222,7 @@
+ 		memset(out, 0, offset);
+ 	}
+ 	if (needed) {
+-		nettle_mpz_get_str_256(needed, reinterpret_cast<unsigned char*>(out + offset), n);
++		memcpy(out + offset, n.data(), needed);
+ 	}
+ 	return true;
+ }
+@@ -97,21 +237,14 @@
+ 	return mpint_from_blob(*blob, allow_negative);
+ }
+ 
+-std::optional<mpz> mpint_from_blob(std::string_view blob, bool allow_negative)
++std::optional<mpz> mpint_from_blob(std::string_view blob, bool)
+ {
+ 	mpz ret;
+ 	if (!blob.empty()) {
+ 		auto c = static_cast<uint8_t>(blob.front());
+ 		if (c & 0x80u) {
+-			if (!allow_negative) {
+-				return {};
+-			}
+-			if (blob.size() >= 2 && c == 0xffu && static_cast<uint8_t>(blob[1]) & 0x80u) {
+-				// Unnecessary leading FF byte
+-				return {};
+-			}
+-			nettle_mpz_set_str_256_s(ret, blob.size(), reinterpret_cast<uint8_t const*>(blob.data()));
+-			return ret;
++			// Negative numbers have no use in SSH's keys and key exchanges
++			return {};
+ 		}
+ 
+ 		if (!c) {
+@@ -121,56 +254,76 @@
+ 				return {};
+ 			}
+ 		}
+-		nettle_mpz_set_str_256_u(ret, blob.size(), reinterpret_cast<uint8_t const*>(blob.data()));
++		ret.set(blob);
+ 	}
+ 
+ 	return ret;
+ }
+ 
++std::vector<uint8_t> emsa_pkcs1_v15(hash_algorithm alg, std::vector<uint8_t> const& digest, size_t k)
++{
++	static uint8_t const sha1[] = {0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14};
++	static uint8_t const sha256[] = {0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20};
++	static uint8_t const sha512[] = {0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40};
++
++	uint8_t const* prefix{};
++	size_t prefix_len{};
++	size_t hash_len{};
++	switch (alg) {
++	case hash_algorithm::sha1:
++		prefix = sha1; prefix_len = sizeof(sha1); hash_len = 20;
++		break;
++	case hash_algorithm::sha256:
++		prefix = sha256; prefix_len = sizeof(sha256); hash_len = 32;
++		break;
++	case hash_algorithm::sha512:
++		prefix = sha512; prefix_len = sizeof(sha512); hash_len = 64;
++		break;
++	default:
++		return {};
++	}
++	if (digest.size() != hash_len || k < prefix_len + hash_len + 11) {
++		return {};
++	}
++
++	std::vector<uint8_t> em(k, 0xff);
++	em[0] = 0;
++	em[1] = 1;
++	size_t const t = k - prefix_len - hash_len;
++	em[t - 1] = 0;
++	memcpy(em.data() + t, prefix, prefix_len);
++	memcpy(em.data() + t + prefix_len, digest.data(), hash_len);
++	return em;
++}
++
+ namespace {
+ template<typename T>
+-void der_encode_impl(T& out, mpz_t const& v)
++void der_encode_impl(T& out, mpz const& v)
+ {
+-	auto const sign = mpz_sgn(v);
+-	auto const negative = sign < 0;
+-
+-	size_t bytes = 1;
+-	if (sign) {
+-		bytes = (mpz_sizeinbase(v, 2) + 7) / 8;
+-
+-		// Add a sign-extension byte if the selected width would encode
+-		// the value with the wrong DER INTEGER sign bit.
+-		bool const sign_bit = mpz_tstbit(v, bytes * 8 - 1) != 0;
+-		if (sign_bit != negative) {
+-			++bytes;
+-		}
+-	}
++	// A leading zero byte keeps a set top bit from reading as a sign
++	size_t const bytes = v.is_zero() ? 1 : v.bytes() + ((v.b[0] & 0x80u) ? 1 : 0);
+ 
+ 	out += static_cast<char>(ASN1Type::Integer);
+ 	der_encode_length(out, bytes);
+ 
+ 	auto const pos = out.size();
+ 	out.resize(pos + bytes);
+-
+-	for (size_t i = 0; i < bytes; ++i) {
+-		uint8_t b{};
+-		auto const base = (bytes - 1 - i) * 8;
+-		for (unsigned bit = 0; bit < 8; ++bit) {
+-			if (mpz_tstbit(v, base + bit)) {
+-				b |= static_cast<uint8_t>(1u << bit);
+-			}
+-		}
+-		out[pos + i] = static_cast<char>(b);
++	size_t const lead = bytes - v.bytes();
++	for (size_t i = 0; i < lead; ++i) {
++		out[pos + i] = 0;
++	}
++	for (size_t i = 0; i < v.bytes(); ++i) {
++		out[pos + lead + i] = static_cast<char>(v.b[i]);
+ 	}
+ }
+ }
+ 
+-void der_encode(std::string& out, mpz_t const& v)
++void der_encode(std::string& out, mpz const& v)
+ {
+ 	der_encode_impl(out, v);
+ }
+ 
+-void der_encode(secure_buffer& out, mpz_t const& v)
++void der_encode(secure_buffer& out, mpz const& v)
+ {
+ 	der_encode_impl(out, v);
+ }
+diff -ruN fzssh/lib/mpz.hpp fzssh-ot/lib/mpz.hpp
+--- fzssh/lib/mpz.hpp	2026-08-18 15:04:46.000000000 +0000
++++ fzssh-ot/lib/mpz.hpp	2026-11-06 23:04:42.819352283 +0000
+@@ -1,65 +1,52 @@
+ #ifndef FZSSH_MPZ_HEADER
+ #define FZSSH_MPZ_HEADER
+ 
++/* fzssh's big numbers on GFOpenCrypto in place of GMP: a non-negative
++ * integer kept as big-endian bytes. The arithmetic that has to be constant
++ * time or fast (modular exponentiation, RSA, primality) is the library's;
++ * what is left here (compare, minus one, halve, bits) works on public values.
++ * Copyright (c) 2026 AmiCradle Team. fzssh is GPL v2 or later. */
++
+ #include <libfilezilla/buffer.hpp>
++#include <libfilezilla/hash.hpp>
+ #include <libfilezilla/util.hpp>
+-#include <gmp.h>
+ 
+ #include <optional>
+ #include <string_view>
++#include <vector>
+ 
+ namespace fz::ssh {
+ 
+ struct mpz final
+ {
+-	mpz()
+-	{
+-		mpz_init(v);
+-	}
+-
+-	~mpz()
+-	{
+-		mpz_clear(v);
+-	}
+-
+-	mpz(mpz &&p) noexcept
+-	{
+-		mpz_init(v);
+-		mpz_swap(v, p.v);
+-	}
+-
+-	mpz& operator=(mpz &&p) noexcept
+-	{
+-		mpz_swap(v, p.v);
+-		return *this;
+-	}
+-
+-	explicit mpz(unsigned long int n)
+-	{
+-		mpz_init(v);
+-		mpz_set_ui(v, n);
+-	}
+-
+-	mpz(mpz const& p)
+-	{
+-		mpz_init(v);
+-		mpz_set(v, p.v);
+-	}
+-
+-	mpz& operator=(mpz const& p)
+-	{
+-		if (this != &p) {
+-			mpz_set(v, p.v);
+-		}
+-		return *this;
+-	}
++	mpz() = default;
++	explicit mpz(unsigned long int n);
++	mpz(uint8_t const* data, size_t size) { set(data, size); }
++
++	mpz(mpz const&) = default;
++	mpz& operator=(mpz const&) = default;
++	mpz(mpz&& o) noexcept : b(std::move(o.b)) {}
++	mpz& operator=(mpz&& o) noexcept { if (this != &o) { fz::wipe(b); b = std::move(o.b); } return *this; }
++	~mpz() { fz::wipe(b); }
++
++	void set(uint8_t const* data, size_t size);
++	void set(std::string_view s) { set(reinterpret_cast<uint8_t const*>(s.data()), s.size()); }
++	bool set_hex(char const* hex);
++
++	size_t bits() const;
++	size_t bytes() const { return b.size(); }
++	bool tstbit(size_t bit) const;
++	size_t popcount() const;
++	bool is_zero() const { return b.empty(); }
++	bool is_odd() const { return !b.empty() && (b.back() & 1); }
+ 
+-	operator mpz_t &() { return v; }
+-	operator mpz_t const&() const { return v; }
++	uint8_t const* data() const { return b.data(); }
+ 
+-	mpz_t v;
++	// big-endian, no leading zero bytes; empty is zero
++	std::vector<uint8_t> b;
+ };
+ 
++int cmp(mpz const& l, mpz const& r);
+ bool operator==(mpz const& l, mpz const& r);
+ bool operator==(mpz const& l, unsigned long int r);
+ bool operator<(mpz const& l, mpz const& r);
+@@ -69,21 +56,35 @@
+ inline bool operator>(mpz const& l, mpz const& r) { return r < l; }
+ inline bool operator>=(mpz const& l, mpz const& r) { return r <= l; }
+ 
+-void wipe(mpz_t & v);
++// v - n for v >= n
++mpz sub_ui(mpz const& v, unsigned long int n);
++// v / 2
++mpz half(mpz const& v);
++// v mod m (m not zero), bit by bit with no branch on the values: for a key's
++// CRT exponents, made when a key is exported
++mpz mod(mpz const& v, mpz const& m);
++// base^exponent mod modulus (odd modulus), constant time in base and exponent
++std::optional<mpz> powm(mpz const& base, mpz const& exponent, mpz const& modulus);
++bool probab_prime(mpz const& v);
++
++void wipe(mpz & v);
+ using fz::wipe;
+ 
+-size_t to_string_size(mpz_t const& n, size_t pad);
+-fz::buffer to_string(mpz_t const& n, size_t pad = 0);
+-void to_string_append(fz::buffer & buf, mpz_t const& n, size_t pad);
+-bool to_string_append(uint8_t* out, size_t size, mpz_t const& n, size_t pad);
++size_t to_string_size(mpz const& n, size_t pad);
++fz::buffer to_string(mpz const& n, size_t pad = 0);
++void to_string_append(fz::buffer & buf, mpz const& n, size_t pad);
++bool to_string_append(uint8_t* out, size_t size, mpz const& n, size_t pad);
+ 
+ std::optional<mpz> extract_mpint(std::string_view & buf, bool allow_negative);
+ std::optional<mpz> mpint_from_blob(std::string_view buf, bool allow_negative);
+ 
+-void der_encode(std::string& out, mpz_t const& v);
+-void der_encode(secure_buffer& out, mpz_t const& v);
++// EMSA-PKCS1-v1_5 (RFC 8017 9.2) of a SHA-1, SHA-256 or SHA-512 digest, k
++// bytes long: 00 01 FF..FF 00 DigestInfo; empty when it doesn't fit
++std::vector<uint8_t> emsa_pkcs1_v15(hash_algorithm alg, std::vector<uint8_t> const& digest, size_t k);
++
++void der_encode(std::string& out, mpz const& v);
++void der_encode(secure_buffer& out, mpz const& v);
+ 
+ }
+ 
+ #endif
+-
+diff -ruN fzssh/lib/privkey.cpp fzssh-ot/lib/privkey.cpp
+--- fzssh/lib/privkey.cpp	2026-08-18 15:04:46.000000000 +0000
++++ fzssh-ot/lib/privkey.cpp	2026-11-06 23:07:25.167698284 +0000
+@@ -8,10 +8,7 @@
+ #include <libfilezilla/hash.hpp>
+ #include <libfilezilla/logger.hpp>
+ 
+-#include <nettle/ecc-curve.h>
+-#include <nettle/ecdsa.h>
+-#include <nettle/eddsa.h>
+-#include <nettle/rsa.h>
++#include <gfopencrypto/gfopencrypto.h>
+ 
+ #include "string.h"
+ 
+@@ -133,7 +130,7 @@
+ 	pub_.clear();
+ 	write_string(pub_, name());
+ 	write_uint32(pub_, 32);
+-	nettle_ed25519_sha512_public_key(pub_.get(32), priv_.data());
++	oc_ed25519_public_key(pub_.get(32), priv_.data());
+ 	pub_.add(32);
+ 
+ 	return selftest();
+@@ -148,7 +145,7 @@
+ 	buffer sig;
+ 	write_string(sig, "ssh-ed25519"sv);
+ 	write_uint32(sig, 64);
+-	nettle_ed25519_sha512_sign(pub_.data() + pub_.size() - 32, priv_.data(), data.size(), data.data(), sig.get(64));
++	oc_ed25519_sign(sig.get(64), priv_.data(), data.data(), data.size());
+ 	sig.add(64);
+ 	return sig;
+ }
+@@ -239,7 +236,7 @@
+ 	pub_.clear();
+ 	write_string(pub_, name());
+ 	write_uint32(pub_, 32);
+-	nettle_ed25519_sha512_public_key(pub_.get(32), priv_.data());
++	oc_ed25519_public_key(pub_.get(32), priv_.data());
+ 	pub_.add(32);
+ 
+ 	return selftest();
+@@ -275,194 +272,6 @@
+ 	return true;
+ }
+ 
+-class private_key_ed448 final : public concrete_private_key_impl
+-{
+-public:
+-	~private_key_ed448();
+-
+-	virtual std::string_view name() const override {
+-		return "ssh-ed448"sv;
+-	}
+-
+-	virtual bool generate() override;
+-
+-	virtual buffer do_sign(std::basic_string_view<uint8_t> const& data, std::string_view signature_algorithm) override;
+-
+-	virtual bool parse_openssh_blob(std::string_view & data) override;
+-	virtual bool parse_putty_blobs(std::string_view pub, std::string_view priv) override;
+-	virtual bool parse_der(std::string_view data) override;
+-	virtual bool parse_inner_pkcs8(std::string_view data, std::string_view opt_pubblob, bool pubblob_constructed) override;
+-
+-	virtual bool export_pkcs8(secure_buffer & out) const override;
+-
+-	virtual std::unique_ptr<private_key> clone() const override;
+-private:
+-	std::vector<uint8_t> priv_;
+-};
+-
+-std::unique_ptr<private_key> private_key_ed448::clone() const
+-{
+-	if (pub_.empty()) {
+-		return {};
+-	}
+-
+-	auto ret = std::make_unique<private_key_ed448>();
+-	ret->priv_ = priv_;
+-	ret->comment_ = comment_;
+-	ret->pub_ = pub_;
+-	return ret;
+-}
+-
+-private_key_ed448::~private_key_ed448()
+-{
+-	wipe(priv_);
+-}
+-
+-bool private_key_ed448::generate()
+-{
+-	priv_ = random_bytes(ED448_KEY_SIZE);
+-
+-	pub_.clear();
+-	write_string(pub_, name());
+-	write_uint32(pub_, ED448_KEY_SIZE);
+-	nettle_ed448_shake256_public_key(pub_.get(ED448_KEY_SIZE), priv_.data());
+-	pub_.add(ED448_KEY_SIZE);
+-
+-	return selftest();
+-}
+-
+-buffer private_key_ed448::do_sign(std::basic_string_view<uint8_t> const& data, std::string_view signature_algorithm)
+-{
+-	if (pub_.empty() || priv_.empty() || data.empty() || signature_algorithm != name()) {
+-		return {};
+-	}
+-
+-	buffer sig;
+-	write_string(sig, "ssh-ed448"sv);
+-	write_uint32(sig, ED448_SIGNATURE_SIZE);
+-	nettle_ed448_shake256_sign(pub_.data() + pub_.size() - ED448_KEY_SIZE, priv_.data(), data.size(), data.data(), sig.get(ED448_SIGNATURE_SIZE));
+-	sig.add(ED448_SIGNATURE_SIZE);
+-	return sig;
+-}
+-
+-bool private_key_ed448::parse_openssh_blob(std::string_view & data)
+-{
+-	pub_.clear();
+-	wipe(priv_);
+-	priv_.clear();
+-
+-	auto pub = extract_blob(data);
+-	auto priv = extract_blob(data);
+-	if (!pub || !priv) {
+-		return false;
+-	}
+-	if (pub->size() != ED448_KEY_SIZE || priv->size() != 2*ED448_KEY_SIZE) {
+-		return false;
+-	}
+-	if (priv->substr(ED448_KEY_SIZE) != *pub) {
+-		return false;
+-	}
+-	priv_.assign(priv->begin(), priv->begin() + ED448_KEY_SIZE);
+-	write_string(pub_, name());
+-	write_string(pub_, *pub);
+-
+-	return selftest();
+-}
+-
+-bool private_key_ed448::parse_putty_blobs(std::string_view pubblob, std::string_view privblob)
+-{
+-	pub_.clear();
+-	wipe(priv_);
+-	priv_.clear();
+-
+-	auto pub = extract_blob(pubblob);
+-	auto priv = extract_blob(privblob);
+-	if (!pub || !priv) {
+-		return false;
+-	}
+-	if (pub->size() != ED448_KEY_SIZE || priv->size() != ED448_KEY_SIZE) {
+-		return false;
+-	}
+-
+-	priv_.assign(priv->begin(), priv->end());
+-	write_string(pub_, name());
+-	write_string(pub_, *pub);
+-
+-	return selftest();
+-}
+-
+-bool private_key_ed448::parse_inner_pkcs8(std::string_view data, std::string_view opt_pubblob, bool /*pubblob_constructed*/)
+-{
+-	if (!parse_der(data)) {
+-		return false;
+-	}
+-
+-	if (!opt_pubblob.empty()) {
+-		if (!opt_pubblob[0]) {
+-			opt_pubblob.remove_prefix(1);
+-		}
+-		if (opt_pubblob != pub_.to_view().substr(17)) {
+-			pub_.clear();
+-			wipe(priv_);
+-			priv_.clear();
+-			return false;
+-		}
+-	}
+-	return true;
+-}
+-
+-bool private_key_ed448::parse_der(std::string_view data)
+-{
+-	pub_.clear();
+-	wipe(priv_);
+-	priv_.clear();
+-
+-	ASN1Value raw = parseDer(data, ASN1Type::OctetString);
+-	if (raw.data_.size() != ED448_KEY_SIZE) {
+-		return false;
+-	}
+-
+-	priv_.assign(raw.data_.begin(), raw.data_.end());
+-
+-	pub_.clear();
+-	write_string(pub_, name());
+-	write_uint32(pub_, ED448_KEY_SIZE);
+-	nettle_ed448_shake256_public_key(pub_.get(ED448_KEY_SIZE), priv_.data());
+-	pub_.add(ED448_KEY_SIZE);
+-
+-	return selftest();
+-}
+-
+-bool private_key_ed448::export_pkcs8(secure_buffer & out) const
+-{
+-	if (pub_.empty()) {
+-		return {};
+-	}
+-
+-	std::string oid;
+-	if (!der_encode_oid(oid, "1.3.101.113"sv) ) {
+-		return {};
+-	}
+-
+-	der_encode(out, oid, ASN1Type::Sequence, true);
+-
+-	secure_buffer inner;
+-	der_encode(inner, std::string_view(reinterpret_cast<char const*>(priv_.data()), priv_.size()), ASN1Type::OctetString, false);
+-	der_encode(out, inner.to_view(), ASN1Type::OctetString, false);
+-
+-	if (pub_[0]) {
+-		der_encode(out, pub_.to_view().substr(pub_.size() - ED448_KEY_SIZE), ASN1Class::context_specific, 1, false);
+-	}
+-	else {
+-		std::string padded;
+-		padded += '\0';
+-		padded += pub_.to_view().substr(pub_.size() - ED448_KEY_SIZE);
+-		der_encode(out, padded, ASN1Class::context_specific, 1, false);
+-	}
+-
+-	return true;
+-}
+-
+ class private_key_ecdsa_sha2_nistp final : public concrete_private_key_impl
+ {
+ public:
+@@ -492,11 +301,6 @@
+ 	curve_scalar priv_;
+ };
+ 
+-extern "C" void rnd(void *, size_t length, uint8_t *dst)
+-{
+-	random_bytes(length, dst);
+-}
+-
+ private_key_ecdsa_sha2_nistp::private_key_ecdsa_sha2_nistp(nistp_curve curve)
+ 	: curve_(curve)
+ 	, priv_(curve_)
+@@ -513,10 +317,7 @@
+ 		return {};
+ 	}
+ 	auto ret = std::make_unique<private_key_ecdsa_sha2_nistp>(curve_);
+-	mpz v;
+-	fz::scoped_wiper w(v);
+-	ecc_scalar_get(priv_, v);
+-	ecc_scalar_set(ret->priv_, v);
++	ret->priv_.d = priv_.d;
+ 	ret->comment_ = comment_;
+ 	ret->pub_ = pub_;
+ 	return ret;
+@@ -526,19 +327,18 @@
+ {
+ 	curve_point pub(curve_);
+ 
+-	ecdsa_generate_keypair(pub, priv_, nullptr, &rnd);
+-
+ 	pub_.clear();
++	auto seed = random_bytes(curve_bytes(curve_) + 8); // the extra 64 bits GFOpenCrypto asks for
++	int const len = oc_ec_keygen(oc_curve(curve_), priv_.d.data(), pub.p.data(), seed.data(), seed.size());
++	fz::wipe(seed);
++	if (len != static_cast<int>(pub.p.size())) {
++		return false;
++	}
++
+ 	write_string(pub_, name());
+ 	write_string(pub_, curve_name(curve_));
+-	write_uint32(pub_, curve_bytes(curve_) * 2 + 1);
+-	pub_.append('\x04');
+-
+-	mpz x, y;
+-	ecc_point_get(pub, x, y);
+-
+-	to_string_append(pub_, x, curve_bytes(curve_));
+-	to_string_append(pub_, y, curve_bytes(curve_));
++	write_uint32(pub_, pub.p.size());
++	pub_.append(pub.p);
+ 
+ 	return selftest();
+ }
+@@ -553,22 +353,22 @@
+ 	acc.update(data);
+ 	auto digest = acc.digest();
+ 
+-	dsa_signature sig;
+-	nettle_dsa_signature_init(&sig);
+-
+-	ecdsa_sign(priv_, nullptr, &rnd, digest.size(), digest.data(), &sig);
++	// RFC 6979's deterministic nonce
++	size_t const bytes = curve_bytes(curve_);
++	std::vector<uint8_t> r(bytes), s(bytes);
++	if (oc_ecdsa_sign(oc_curve(curve_), r.data(), s.data(), priv_.d.data(), digest.data(), digest.size())) {
++		return {};
++	}
+ 
+ 	buffer ret;
+ 	write_string(ret, name());
+-	auto const& p = ret.get(0);
++	size_t const len_pos = ret.size();
+ 	ret.append(4, 0);
+-	size_t s = ret.size();
+-
+-	write_mpint(ret, to_string(sig.r, curve_bytes(curve_)));
+-	write_mpint(ret, to_string(sig.s, curve_bytes(curve_)));
+-	write_uint32(p, ret.size() - s);
++	size_t const start = ret.size();
+ 
+-	nettle_dsa_signature_clear(&sig);
++	write_mpint(ret, to_string(mpz(r.data(), r.size()), bytes));
++	write_mpint(ret, to_string(mpz(s.data(), s.size()), bytes));
++	write_uint32(ret.data() + len_pos, static_cast<uint32_t>(ret.size() - start));
+ 
+ 	return ret;
+ }
+@@ -584,28 +384,15 @@
+ 		return false;
+ 	}
+ 
+-	mpz key;
+-	fz::scoped_wiper w(key);
+-
+-	mpz_import(key, priv.size(), 1, 1, 0, 0, reinterpret_cast<uint8_t const*>(priv.data()));
+-	if (!ecc_scalar_set(priv_, key)) {
++	if (!priv_.set(curve_, {reinterpret_cast<uint8_t const*>(priv.data()), priv.size()})) {
+ 		return false;
+ 	}
+ 
+ 	std::string_view x = pub.substr(1, curve_bytes(curve_));
+ 	std::string_view y = pub.substr(1 + curve_bytes(curve_), curve_bytes(curve_));
+ 
+-	mpz xz;
+-	mpz yz;
+-
+ 	curve_point pubpoint(curve_);
+-
+-	nettle_mpz_set_str_256_u(xz, x.size(), reinterpret_cast<uint8_t const*>(x.data()));
+-	nettle_mpz_set_str_256_u(yz, y.size(), reinterpret_cast<uint8_t const*>(y.data()));
+-
+-	bool ret = nettle_ecc_point_set(pubpoint, xz, yz);
+-
+-	if (!ret) {
++	if (!pubpoint.set(curve_, {reinterpret_cast<uint8_t const*>(x.data()), x.size()}, {reinterpret_cast<uint8_t const*>(y.data()), y.size()})) {
+ 		return false;
+ 	}
+ 
+@@ -705,8 +492,7 @@
+ 	secure_buffer seq;
+ 	der_encode(seq, 1);
+ 
+-	mpz key;
+-	ecc_scalar_get(priv_, key);
++	mpz key(priv_.d.data(), priv_.d.size());
+ 
+ 	der_encode_generated(seq, to_string_size(key, 0), [&](uint8_t* out, size_t size) { to_string_append(out, size, key, 0); }, ASN1Type::OctetString, false);
+ 
+@@ -781,33 +567,25 @@
+ private:
+ 	bool set_values(std::string_view const& n, std::string_view const& e, std::string_view const& d, std::string_view const& p, std::string_view const& q, std::string_view const& iqmp);
+ 
+-	rsa_private_key priv_;
+-	rsa_public_key rsa_pub_;
++	void wipe_priv();
++
++	mpz n_, e_;
++	mpz d_, p_, q_, iqmp_;
+ };
+ 
+-private_key_rsa::private_key_rsa()
+-{
+-	nettle_rsa_private_key_init(&priv_);
+-	nettle_rsa_public_key_init(&rsa_pub_);
+-}
++private_key_rsa::private_key_rsa() = default;
+ 
+-namespace {
+-void wipe_priv(rsa_private_key & priv)
++void private_key_rsa::wipe_priv()
+ {
+-	wipe(priv.a);
+-	wipe(priv.b);
+-	wipe(priv.c);
+-	wipe(priv.d);
+-	wipe(priv.p);
+-	wipe(priv.q);
+-}
++	wipe(d_);
++	wipe(p_);
++	wipe(q_);
++	wipe(iqmp_);
+ }
+ 
+ private_key_rsa::~private_key_rsa()
+ {
+-	wipe_priv(priv_);
+-	nettle_rsa_private_key_clear(&priv_);
+-	nettle_rsa_public_key_clear(&rsa_pub_);
++	wipe_priv();
+ }
+ 
+ std::unique_ptr<private_key> private_key_rsa::clone() const
+@@ -817,17 +595,12 @@
+ 	}
+ 
+ 	auto ret = std::make_unique<private_key_rsa>();
+-	mpz_set(ret->priv_.a, priv_.a);
+-	mpz_set(ret->priv_.b, priv_.b);
+-	mpz_set(ret->priv_.c, priv_.c);
+-	mpz_set(ret->priv_.d, priv_.d);
+-	mpz_set(ret->priv_.p, priv_.p);
+-	mpz_set(ret->priv_.q, priv_.q);
+-	ret->priv_.size = priv_.size;
+-
+-	mpz_set(ret->rsa_pub_.n, rsa_pub_.n);
+-	mpz_set(ret->rsa_pub_.e, rsa_pub_.e);
+-	ret->rsa_pub_.size = rsa_pub_.size;
++	ret->n_ = n_;
++	ret->e_ = e_;
++	ret->d_ = d_;
++	ret->p_ = p_;
++	ret->q_ = q_;
++	ret->iqmp_ = iqmp_;
+ 	ret->pub_ = pub_;
+ 	ret->comment_ = comment_;
+ 	return ret;
+@@ -838,20 +611,12 @@
+ 	return "ssh-rsa"sv;
+ }
+ 
+-bool private_key_rsa::generate(size_t bits)
++bool private_key_rsa::generate(size_t)
+ {
++	// FileZilla only loads keys; making RSA keys is left to Ed25519 and
++	// ECDSA, which GFOpenCrypto generates
+ 	pub_.clear();
+-
+-	mpz_set_ui(rsa_pub_.e, 65537);
+-	if (nettle_rsa_generate_keypair(&rsa_pub_, &priv_, nullptr, &rnd, nullptr, nullptr, bits, 0) != 1) {
+-		return false;
+-	}
+-
+-	write_string(pub_, "ssh-rsa"sv);
+-	write_mpint(pub_, to_string(rsa_pub_.e));
+-	write_mpint(pub_, to_string(rsa_pub_.n));
+-
+-	return selftest();
++	return false;
+ }
+ 
+ buffer private_key_rsa::do_sign(std::basic_string_view<uint8_t> const& data, std::string_view signature_algorithm)
+@@ -879,24 +644,21 @@
+ 
+ 	buffer ret{};
+ 
+-	mpz sig;
+-
+-	auto do_sign_rsa = [&]() {
+-		switch (a) {
+-		case hash_algorithm::sha1:
+-			return nettle_rsa_sha1_sign_digest_tr(&rsa_pub_, &priv_, nullptr, &rnd, hash.digest().data(), sig);
+-		case hash_algorithm::sha256:
+-			return nettle_rsa_sha256_sign_digest_tr(&rsa_pub_, &priv_, nullptr, &rnd, hash.digest().data(), sig);
+-		case hash_algorithm::sha512:
+-			return nettle_rsa_sha512_sign_digest_tr(&rsa_pub_, &priv_, nullptr, &rnd, hash.digest().data(), sig);
+-		default:
+-			return 0;
+-		}
+-	};
+-
+-	if (do_sign_rsa()) {
++	// PKCS #1 v1.5; GFOpenCrypto's private operation is constant time and
++	// checks its answer with e
++	size_t const k = n_.bytes();
++	auto em = emsa_pkcs1_v15(a, hash.digest(), k);
++	if (em.empty()) {
++		return {};
++	}
++	std::vector<uint8_t> sig(k);
++	int const r = oc_rsa_private(sig.data(), em.data(), n_.data(), k, e_.data(), e_.bytes(),
++		d_.data(), d_.bytes(), p_.data(), p_.bytes(), q_.data(), q_.bytes(),
++		nullptr, 0, nullptr, 0, iqmp_.data(), iqmp_.bytes());
++	if (!r) {
+ 		write_string(ret, signature_algorithm);
+-		write_string(ret, to_string(sig));
++		write_uint32(ret, k);
++		ret.append(sig);
+ 	}
+ 
+ 	return ret;
+@@ -905,44 +667,29 @@
+ bool private_key_rsa::set_values(std::string_view const& n, std::string_view const& e, std::string_view const& d, std::string_view const& p, std::string_view const& q, std::string_view const& iqmp)
+ {
+ 	pub_.clear();
+-	wipe_priv(priv_);
++	wipe_priv();
+ 
+ 	if (n.empty() || e.empty() || d.empty() || p.empty() || q.empty() || iqmp.empty()) {
+ 		return false;
+ 	}
+ 
+-	mpz_import(rsa_pub_.e, e.size(), 1, 1, 0, 0, reinterpret_cast<uint8_t const*>(e.data()));
+-	mpz_import(rsa_pub_.n, n.size(), 1, 1, 0, 0, reinterpret_cast<uint8_t const*>(n.data()));
+-	if (mpz_sizeinbase(rsa_pub_.n, 2) < 1024) {
+-		return false;
+-	}
+-
+-	if (nettle_rsa_public_key_prepare(&rsa_pub_) != 1) {
++	e_.set(e);
++	n_.set(n);
++	if (n_.bits() < 1024 || n_.bytes() > OC_RSA_MAX_BYTES || !n_.is_odd() || !e_.is_odd() || e_ <= 1 || e_ >= n_) {
+ 		return false;
+ 	}
+ 
+-	mpz_import(priv_.d, d.size(), 1, 1, 0, 0, reinterpret_cast<uint8_t const*>(d.data()));
+-	mpz_import(priv_.p, p.size(), 1, 1, 0, 0, reinterpret_cast<uint8_t const*>(p.data()));
+-	mpz_import(priv_.q, q.size(), 1, 1, 0, 0, reinterpret_cast<uint8_t const*>(q.data()));
+-	mpz_import(priv_.c, iqmp.size(), 1, 1, 0, 0, reinterpret_cast<uint8_t const*>(iqmp.data()));
+-
+-	mpz p1;
+-	mpz_sub_ui(p1, priv_.p, 1);
+-	mpz_fdiv_r(priv_.a, priv_.d, p1);
+-	wipe(p1);
+-
+-	mpz q1;
+-	mpz_sub_ui(q1, priv_.q, 1);
+-	mpz_fdiv_r(priv_.b, priv_.d, q1);
+-	wipe(q1);
+-
+-	if (nettle_rsa_private_key_prepare(&priv_) != 1) {
++	d_.set(d);
++	p_.set(p);
++	q_.set(q);
++	iqmp_.set(iqmp);
++	if (d_.is_zero() || !p_.is_odd() || !q_.is_odd() || iqmp_.is_zero() || p_.bytes() + q_.bytes() > n_.bytes() + 1) {
+ 		return false;
+ 	}
+ 
+ 	write_string(pub_, "ssh-rsa"sv);
+-	write_mpint(pub_, to_string(rsa_pub_.e));
+-	write_mpint(pub_, to_string(rsa_pub_.n));
++	write_mpint(pub_, to_string(e_));
++	write_mpint(pub_, to_string(n_));
+ 
+ 	return selftest();
+ }
+@@ -1029,14 +776,20 @@
+ 	secure_buffer seq;
+ 	der_encode(seq, 0);
+ 
+-	der_encode(seq, rsa_pub_.n);
+-	der_encode(seq, rsa_pub_.e);
+-	der_encode(seq, priv_.d);
+-	der_encode(seq, priv_.p);
+-	der_encode(seq, priv_.q);
+-	der_encode(seq, priv_.a);
+-	der_encode(seq, priv_.b);
+-	der_encode(seq, priv_.c);
++	mpz dp = mod(d_, sub_ui(p_, 1));
++	mpz dq = mod(d_, sub_ui(q_, 1));
++
++	der_encode(seq, n_);
++	der_encode(seq, e_);
++	der_encode(seq, d_);
++	der_encode(seq, p_);
++	der_encode(seq, q_);
++	der_encode(seq, dp);
++	der_encode(seq, dq);
++	der_encode(seq, iqmp_);
++
++	wipe(dp);
++	wipe(dq);
+ 
+ 	secure_buffer inner;
+ 	der_encode(inner, seq.to_view(), ASN1Type::Sequence, true);
+@@ -1051,9 +804,6 @@
+ 	if (alg == "ssh-ed25519"sv) {
+ 		ret = std::make_unique<private_key_ed25519>();
+ 	}
+-	else if (alg == "ssh-ed448"sv) {
+-		ret = std::make_unique<private_key_ed448>();
+-	}
+ 	else if (alg == "ecdsa-sha2-nistp256"sv) {
+ 		ret = std::make_unique<private_key_ecdsa_sha2_nistp>(nistp_curve::nistp256);
+ 	}
+diff -ruN fzssh/lib/privkey_import.cpp fzssh-ot/lib/privkey_import.cpp
+--- fzssh/lib/privkey_import.cpp	2026-08-18 15:04:46.000000000 +0000
++++ fzssh-ot/lib/privkey_import.cpp	2026-11-06 23:05:29.769924305 +0000
+@@ -5,7 +5,6 @@
+ 
+ #include "crypt/bcrypt.hpp"
+ 
+-#include <argon2.h>
+ 
+ #include <libfilezilla/file.hpp>
+ #include <libfilezilla/hash.hpp>
+@@ -13,15 +12,27 @@
+ #include <libfilezilla/translate.hpp>
+ #include <libfilezilla/util.hpp>
+ 
+-#include <nettle/aes.h>
+-#include <nettle/cbc.h>
+-#include <nettle/des.h>
++#include <gfopencrypto/gfopencrypto.h>
+ 
+ #include <string.h>
+ 
+ namespace fz::ssh {
+ 
+ namespace {
++// AES-CBC decryption in place on GFOpenCrypto, whole blocks
++bool aes_cbc_decrypt(void * buf, size_t len, void const* key, size_t keylen, void const* iv)
++{
++	if (len % 16) {
++		return false;
++	}
++	if (!len) {
++		return true;
++	}
++	return oc_aes(reinterpret_cast<uint8_t*>(buf), len, reinterpret_cast<uint8_t const*>(key), keylen, reinterpret_cast<uint8_t const*>(iv), OC_AES_CBC_DECRYPT) == 0;
++}
++}
++
++namespace {
+ void load_openssh_private_key(std::vector<private_key_info> & keys, std::string_view data, logger_interface & logger, std::optional<std::string_view> const& password)
+ {
+ 	auto constexpr magic = "openssh-key-v1\0"sv;
+@@ -666,82 +677,10 @@
+ 			return {};
+ 		}
+ 	}
+-	else if (oid == "1.2.840.113549.1.5.3"sv) { // DES+MD5, ses RFC8018
+-		auto kdfparams = get_common_kdf_params(params.data_, logger);
+-		if (!kdfparams) {
+-			return {};
+-		}
+-
+-		if (!password) {
+-			private_key_info ret;
+-			ret.ciphertext_ = data;
+-			ret.type_ = "ENCRYPTED PRIVATE KEY"sv;
+-			return ret;
+-		}
+-
+-		auto key = pbkdf1(hash_algorithm::md5, *password, *kdfparams);
+-		nettle_des_fix_parity(DES_KEY_SIZE, key.data(), key.data());
+-
+-		if (ciphertext.size() % DES_BLOCK_SIZE) {
+-			logger.log(logmsg::debug_warning, "Malformed encrypted PKCS#8 structure, ciphertext length does not align with block size"sv);
+-			return {};
+-		}
+-
+-		decrypted.resize(ciphertext.size());
+-
+-		struct CBC_CTX(des_ctx, DES_BLOCK_SIZE) ctx;
+-		nettle_des_set_key(&ctx.ctx, key.data());
+-		CBC_SET_IV(&ctx, key.data() + DES_BLOCK_SIZE);
+-		CBC_DECRYPT(&ctx, nettle_des_decrypt, ciphertext.size(), decrypted.data(), reinterpret_cast<uint8_t const*>(ciphertext.data()));
+-		wipe(&ctx, sizeof(ctx));
+-
+-		if (!remove_padding(decrypted, DES_BLOCK_SIZE)) {
+-			logger.log(logmsg::debug_warning, "Wrong password or corrupted private key"sv);
+-			return {};
+-		}
+-	}
+-	else if (oid == "1.2.840.113549.1.12.1.3"sv) {
+-		// 3DES CBC, rfc7292
+-
+-		auto kdfparams = get_common_kdf_params(params.data_, logger);
+-		if (!kdfparams) {
+-			return {};
+-		}
+-
+-		if (!password) {
+-			private_key_info ret;
+-			ret.ciphertext_ = data;
+-			ret.type_ = "ENCRYPTED PRIVATE KEY"sv;
+-			return ret;
+-		}
+-
+-		auto pw = to_bmpstring(*password);
+-		if (!password->empty() && pw.empty()) {
+-			logger.log(logmsg::debug_warning, "Password not representable as BMPString"sv);
+-			return {};
+-		}
+-		pw.append(2, '\0');
+-
+-		auto key = pkcs12_kdf(fz::hash_algorithm::sha1, pw.to_view(), DES3_KEY_SIZE, *kdfparams, 1);
+-		auto iv = pkcs12_kdf(fz::hash_algorithm::sha1, pw.to_view(), DES3_BLOCK_SIZE, *kdfparams, 2);
+-
+-		if (ciphertext.size() % DES3_BLOCK_SIZE) {
+-			logger.log(logmsg::debug_warning, "Malformed encrypted PKCS#8 structure, ciphertext length does not align with block size"sv);
+-			return {};
+-		}
+-
+-		decrypted.resize(ciphertext.size());
+-
+-		struct CBC_CTX(des3_ctx, DES3_BLOCK_SIZE) ctx;
+-		nettle_des3_set_key(&ctx.ctx, key.data());
+-		CBC_SET_IV(&ctx, iv.data());
+-		CBC_DECRYPT(&ctx, nettle_des3_decrypt, ciphertext.size(), decrypted.data(), reinterpret_cast<uint8_t const*>(ciphertext.data()));
+-		wipe(&ctx, sizeof(ctx));
+-
+-		if (!remove_padding(decrypted, DES_BLOCK_SIZE)) {
+-			logger.log(logmsg::debug_warning, "Wrong password or corrupted private key"sv);
+-			return {};
+-		}
++	else if (oid == "1.2.840.113549.1.5.3"sv || oid == "1.2.840.113549.1.12.1.3"sv) {
++		// DES and 3DES (PKCS #5 v1.5, PKCS #12) are not supported
++		logger.log(logmsg::debug_warning, "Private key encrypted with DES or 3DES, which is not supported. Convert it to an AES-encrypted key."sv);
++		return {};
+ 	}
+ 
+ 
+@@ -996,23 +935,18 @@
+ 		else if (name == "DEK-Info"sv) {
+ 			if (starts_with(value, "AES-128-CBC,"sv)) {
+ 				value.remove_prefix(12);
+-				blocksize = AES_BLOCK_SIZE;
+-				keysize = AES128_KEY_SIZE;
++				blocksize = 16;
++				keysize = 16;
+ 			}
+ 			else if (starts_with(value, "AES-192-CBC,"sv)) {
+ 				value.remove_prefix(12);
+-				blocksize = AES_BLOCK_SIZE;
+-				keysize = AES192_KEY_SIZE;
++				blocksize = 16;
++				keysize = 24;
+ 			}
+ 			else if (starts_with(value, "AES-256-CBC,"sv)) {
+ 				value.remove_prefix(12);
+-				blocksize = AES_BLOCK_SIZE;
+-				keysize = AES256_KEY_SIZE;
+-			}
+-			else if (starts_with(value, "DES-EDE3-CBC,"sv)) {
+-				value.remove_prefix(13);
+-				blocksize = DES3_BLOCK_SIZE;
+-				keysize = DES3_KEY_SIZE;
++				blocksize = 16;
++				keysize = 32;
+ 			}
+ 			else {
+ 				logger.log(logmsg::debug_warning, "Key is encrypted with unsupported cipher"sv);
+@@ -1072,37 +1006,8 @@
+ 		}
+ 		key.resize(keysize);
+ 
+-		if (blocksize == 16) {
+-			switch (keysize) {
+-				case 16: {
+-					aes128_ctx ctx{};
+-					nettle_aes128_set_decrypt_key(&ctx, key.data());
+-					nettle_cbc_decrypt(&ctx, reinterpret_cast<nettle_cipher_func*>(&nettle_aes128_decrypt), blocksize, reinterpret_cast<uint8_t*>(iv.data()), data.size(), reinterpret_cast<uint8_t*>(out.data()), reinterpret_cast<uint8_t const*>(data.data()));
+-					wipe(&ctx, sizeof(ctx));
+-					break;
+-				}
+-				case 24: {
+-					aes192_ctx ctx{};
+-					nettle_aes192_set_decrypt_key(&ctx, key.data());
+-					nettle_cbc_decrypt(&ctx, reinterpret_cast<nettle_cipher_func*>(&nettle_aes192_decrypt), blocksize, reinterpret_cast<uint8_t*>(iv.data()), data.size(), reinterpret_cast<uint8_t*>(out.data()), reinterpret_cast<uint8_t const*>(data.data()));
+-					wipe(&ctx, sizeof(ctx));
+-					break;
+-				}
+-				case 32: {
+-					aes256_ctx ctx{};
+-					nettle_aes256_set_decrypt_key(&ctx, key.data());
+-					nettle_cbc_decrypt(&ctx, reinterpret_cast<nettle_cipher_func*>(&nettle_aes256_decrypt), blocksize, reinterpret_cast<uint8_t*>(iv.data()), data.size(), reinterpret_cast<uint8_t*>(out.data()), reinterpret_cast<uint8_t const*>(data.data()));
+-					wipe(&ctx, sizeof(ctx));
+-					break;
+-				}
+-			}
+-		}
+-		else {
+-			des3_ctx ctx{};
+-			nettle_des3_set_key(&ctx, key.data());
+-			nettle_cbc_decrypt(&ctx, reinterpret_cast<nettle_cipher_func*>(&nettle_des3_decrypt), blocksize, reinterpret_cast<uint8_t*>(iv.data()), data.size(), reinterpret_cast<uint8_t*>(out.data()), reinterpret_cast<uint8_t const*>(data.data()));
+-			wipe(&ctx, sizeof(ctx));
+-		}
++		memcpy(out.data(), data.data(), data.size());
++		aes_cbc_decrypt(out.data(), out.size(), key.data(), keysize, iv.data());
+ 		wipe(iv);
+ 		auto ret = load_der_key(label, {}, out, logger, {});
+ 		if (!ret) {
+@@ -1316,27 +1221,27 @@
+ 			fz::scoped_wiper hw(hash);
+ 			hash.resize(32 + 16 + 32);
+ 
+-			auto func = [&]() {
+-				if (*derivation == "Argon2id"sv) {
+-					return &argon2id_hash_raw;
+-				}
+-				else if (*derivation == "Argon2i"sv) {
+-					return &argon2i_hash_raw;
+-				}
+-				else {
+-					return &argon2d_hash_raw;
+-				}
+-			}();
+-			if (func(argon2_passes, argon2_memory, argon2_parallelism, password->data(), password->size(), argon2_salt.data(), argon2_salt.size(), hash.data(), hash.size()) != ARGON2_OK) {
++			int const type = (*derivation == "Argon2id"sv) ? OC_ARGON2ID : ((*derivation == "Argon2i"sv) ? OC_ARGON2I : OC_ARGON2D);
++			if (argon2_memory > 0xffffffffu || argon2_passes > 0xffffffffu || argon2_parallelism > 0xffffffu) {
++				logger.log(logmsg::error, "Argon2 hash failed"sv);
++				return {};
++			}
++			auto const m_kib = static_cast<uint32_t>(argon2_memory);
++			auto const lanes = static_cast<uint32_t>(argon2_parallelism);
++			std::vector<uint64_t> memory((oc_argon2_memory(m_kib, lanes) + 7) / 8);
++			if (oc_argon2(type, reinterpret_cast<uint8_t*>(hash.data()), static_cast<uint32_t>(hash.size()),
++				password->data(), password->size(), argon2_salt.data(), argon2_salt.size(),
++				nullptr, 0, nullptr, 0, static_cast<uint32_t>(argon2_passes), m_kib, lanes, memory.data()) != 0)
++			{
+ 				logger.log(logmsg::error, "Argon2 hash failed"sv);
+ 				return {};
+ 			}
+ 
+-			aes256_ctx ctx;
+-			aes256_set_decrypt_key(&ctx, reinterpret_cast<unsigned char const*>(std::string_view(hash).substr(0, 32).data()));
+ 			std::string iv = hash.substr(32, 16);
+-			cbc_decrypt(&ctx, reinterpret_cast<nettle_cipher_func*>(&aes256_decrypt), blocksize, reinterpret_cast<unsigned char*>(iv.data()), privblob.size(), reinterpret_cast<unsigned char*>(privblob.data()), reinterpret_cast<unsigned char*>(privblob.data()));
+-			wipe(&ctx, sizeof(ctx));
++			if (!aes_cbc_decrypt(privblob.data(), privblob.size(), hash.data(), 32, iv.data())) {
++				logger.log(logmsg::error, "Malformed PuTTY private key"sv);
++				return {};
++			}
+ 
+ 			mac_key.resize(32);
+ 			memcpy(mac_key.data(), hash.data() + 32 + 16, 32);
+@@ -1348,14 +1253,15 @@
+ 			(hash_accumulator(hash_algorithm::sha1) << 0 << 0 << 0 << 0 << *password).digest(key.data(), 20);
+ 			(hash_accumulator(hash_algorithm::sha1) << 0 << 0 << 0 << 1 << *password).digest(key.data() + 20, 20);
+ 
+-			aes256_ctx ctx;
+-			aes256_set_decrypt_key(&ctx, reinterpret_cast<unsigned char const*>(key.data()));
+ 			std::string iv;
+ 			iv.resize(16);
+-			cbc_decrypt(&ctx, reinterpret_cast<nettle_cipher_func*>(&aes256_decrypt), blocksize, reinterpret_cast<unsigned char*>(iv.data()), privblob.size(), reinterpret_cast<unsigned char*>(privblob.data()), reinterpret_cast<unsigned char*>(privblob.data()));
++			bool const ok = aes_cbc_decrypt(privblob.data(), privblob.size(), key.data(), 32, iv.data());
+ 
+ 			wipe(key);
+-			wipe(&ctx, sizeof(ctx));
++			if (!ok) {
++				logger.log(logmsg::error, "Malformed PuTTY private key"sv);
++				return {};
++			}
+ 
+ 			mac_key = hash_accumulator(hash_algorithm::sha1) << "putty-private-key-file-mac-key"sv << *password;
+ 		}
+diff -ruN fzssh/lib/pubkey.cpp fzssh-ot/lib/pubkey.cpp
+--- fzssh/lib/pubkey.cpp	2026-08-18 15:04:46.000000000 +0000
++++ fzssh-ot/lib/pubkey.cpp	2026-11-06 23:03:25.172660321 +0000
+@@ -9,10 +9,7 @@
+ #include <libfilezilla/logger.hpp>
+ #include <libfilezilla/util.hpp>
+ 
+-#include <nettle/ecc-curve.h>
+-#include <nettle/ecdsa.h>
+-#include <nettle/eddsa.h>
+-#include <nettle/rsa.h>
++#include <gfopencrypto/gfopencrypto.h>
+ 
+ namespace fz::ssh {
+ 
+@@ -248,104 +245,10 @@
+ 		return false;
+ 	}
+ 
+-	return nettle_ed25519_sha512_verify(reinterpret_cast<uint8_t const*>(key_.data() + key_.size() - 32), data.size(), reinterpret_cast<uint8_t const*>(data.data()), reinterpret_cast<uint8_t const*>(s->data()));
++	return oc_ed25519_verify(reinterpret_cast<uint8_t const*>(s->data()), reinterpret_cast<uint8_t const*>(key_.data() + key_.size() - 32), data.data(), data.size()) == 1;
+ }
+ 
+ 
+-class public_key_ed448 final : public public_key
+-{
+-public:
+-	virtual std::string_view name() const override {
+-		return "ssh-ed448"sv;
+-	}
+-
+-	virtual std::unique_ptr<public_key> clone() const override {
+-		if (key_.empty()) {
+-			return {};
+-		}
+-		auto ret = std::make_unique<public_key_ed448>();
+-		ret->key_ = key_;
+-		ret->comment_ = comment_;
+-		return ret;
+-	}
+-
+-	virtual bool parse(std::string_view key) override;
+-	virtual bool parse_putty(std::string_view key) override;
+-	virtual bool verify(std::string_view const& data, std::string_view sig) const override;
+-};
+-
+-bool public_key_ed448::parse(std::string_view key)
+-{
+-	key_.clear();
+-
+-	auto const inkey = key;
+-
+-	auto n = extract_blob(key);
+-	if (!n || *n != name()) {
+-		return false;
+-	}
+-
+-	auto k = extract_blob(key);
+-	if (!k || k->size() != ED448_KEY_SIZE) {
+-		return false;
+-	}
+-
+-	if (!key.empty()) {
+-		return false;
+-	}
+-	key_ = inkey;
+-
+-	return true;
+-}
+-
+-bool public_key_ed448::parse_putty(std::string_view key)
+-{
+-	key_.clear();
+-
+-	auto tokens = strtok(key, ',', false);
+-	if (tokens.size() != 2) {
+-		return false;
+-	}
+-
+-	auto x = putty_hex_decode(tokens[0], true, ED448_KEY_SIZE);
+-	auto y = putty_hex_decode(tokens[1], true, ED448_KEY_SIZE);
+-	if (x.size() != ED448_KEY_SIZE || y.size() != ED448_KEY_SIZE) {
+-		return false;
+-	}
+-
+-	// Point compression, set sign of x coordinate to y
+-	auto c = static_cast<unsigned char>(y.back());
+-	c &= 0x7fu;
+-	c |= (static_cast<unsigned char>(x.front()) & 0x1u) << 7u;
+-	y.back() = static_cast<char>(c);
+-
+-	fz::buffer buf;
+-	write_string(buf, name());
+-	write_string(buf, y);
+-	key_ = buf.to_view();
+-
+-	return true;
+-}
+-
+-bool public_key_ed448::verify(std::string_view const& data, std::string_view sig) const
+-{
+-	if (key_.empty() || data.empty()) {
+-		return false;
+-	}
+-
+-	auto n = extract_string(sig, string_type::ascii, false);
+-	if (!n || *n != name()) {
+-		return false;
+-	}
+-
+-	auto s = extract_blob(sig);
+-	if (!s || s->size() != ED448_SIGNATURE_SIZE) {
+-		return false;
+-	}
+-
+-	return nettle_ed448_shake256_verify(reinterpret_cast<uint8_t const*>(key_.data() + key_.size() - ED448_KEY_SIZE), data.size(), reinterpret_cast<uint8_t const*>(data.data()), reinterpret_cast<uint8_t const*>(s->data()));
+-}
+-
+ class public_key_ecdsa_sha2_nistp final : public public_key
+ {
+ public:
+@@ -413,13 +316,7 @@
+ 	std::string_view x = raw->substr(1, curve_bytes(curve_));
+ 	std::string_view y = raw->substr(1 + curve_bytes(curve_), curve_bytes(curve_));
+ 
+-	mpz xz;
+-	mpz yz;
+-
+-	nettle_mpz_set_str_256_u(xz, x.size(), reinterpret_cast<uint8_t const*>(x.data()));
+-	nettle_mpz_set_str_256_u(yz, y.size(), reinterpret_cast<uint8_t const*>(y.data()));
+-
+-	if (!nettle_ecc_point_set(point_, xz, yz)) {
++	if (!point_.set(curve_, {reinterpret_cast<uint8_t const*>(x.data()), x.size()}, {reinterpret_cast<uint8_t const*>(y.data()), y.size()})) {
+ 		return false;
+ 	}
+ 
+@@ -488,30 +385,28 @@
+ 	acc.update(data);
+ 	auto digest = acc.digest();
+ 
+-	dsa_signature dsa_sig;
+-	dsa_signature_init(&dsa_sig);
+-	mpz_import(dsa_sig.r, r->size(), 1, 1, 0, 0, reinterpret_cast<uint8_t const*>(r->data()));
+-	mpz_import(dsa_sig.s, s->size(), 1, 1, 0, 0, reinterpret_cast<uint8_t const*>(s->data()));
+-
+-	bool ret = nettle_ecdsa_verify(point_, digest.size(), digest.data(), &dsa_sig);
+-
+-	dsa_signature_clear(&dsa_sig);
++	// r and s as the curve's size; ones that don't fit are invalid
++	auto rz = mpint_from_blob(*r, false);
++	auto sz = mpint_from_blob(*s, false);
++	if (!rz || !sz) {
++		return false;
++	}
++	size_t const bytes = curve_bytes(curve_);
++	std::vector<uint8_t> rb(bytes), sb(bytes);
++	if (!to_string_append(rb.data(), bytes, *rz, bytes) || !to_string_append(sb.data(), bytes, *sz, bytes)) {
++		return false;
++	}
+ 
+-	return ret;
++	auto x = point_.x();
++	auto y = point_.y();
++	return oc_ecdsa_verify(oc_curve(curve_), x.data(), y.data(), rb.data(), sb.data(), digest.data(), digest.size()) == 1;
+ }
+ 
+ class public_key_rsa final : public public_key
+ {
+ public:
+-	public_key_rsa()
+-	{
+-		nettle_rsa_public_key_init(&pub_);
+-	}
+-
+-	virtual ~public_key_rsa() override
+-	{
+-		nettle_rsa_public_key_clear(&pub_);
+-	}
++	public_key_rsa() = default;
++	virtual ~public_key_rsa() override = default;
+ 
+ 	virtual std::string_view name() const override {
+ 		return "ssh-rsa"sv;
+@@ -524,9 +419,8 @@
+ 		auto ret = std::make_unique<public_key_rsa>();
+ 		ret->key_ = key_;
+ 		ret->comment_ = comment_;
+-		mpz_set(ret->pub_.n, pub_.n);
+-		mpz_set(ret->pub_.e, pub_.e);
+-		ret->pub_.size = pub_.size;
++		ret->n_ = n_;
++		ret->e_ = e_;
+ 
+ 		return ret;
+ 	}
+@@ -536,7 +430,8 @@
+ 	virtual bool verify(std::string_view const& data, std::string_view sig) const override;
+ 
+ private:
+-	rsa_public_key pub_;
++	mpz n_;
++	mpz e_;
+ };
+ 
+ bool public_key_rsa::parse(std::string_view key)
+@@ -560,13 +455,10 @@
+ 		return false;
+ 	}
+ 
+-	mpz_import(pub_.e, e->size(), 1, 1, 0, 0, reinterpret_cast<uint8_t const*>(e->data()));
+-	mpz_import(pub_.n, n->size(), 1, 1, 0, 0, reinterpret_cast<uint8_t const*>(n->data()));
+-	if (mpz_sizeinbase(pub_.n, 2) < 1024) {
+-		return false;
+-	}
+-
+-	if (nettle_rsa_public_key_prepare(&pub_) != 1) {
++	e_.set(*e);
++	n_.set(*n);
++	// 1024 to 8192 bits, odd; e odd, at least 3, below n
++	if (n_.bits() < 1024 || n_.bytes() > OC_RSA_MAX_BYTES || !n_.is_odd() || !e_.is_odd() || e_ <= 1 || e_ >= n_) {
+ 		return false;
+ 	}
+ 
+@@ -631,27 +523,24 @@
+ 		return false;
+ 	}
+ 
+-	mpz mpsig;
+-	mpz_import(mpsig, raw_sig->size(), 1, 1, 0, 0, reinterpret_cast<uint8_t const*>(raw_sig->data()));
++	// The signature as long as the modulus (some servers leave out leading zeros)
++	mpz mpsig(reinterpret_cast<uint8_t const*>(raw_sig->data()), raw_sig->size());
++	size_t const k = n_.bytes();
++	if (mpsig >= n_) {
++		return false;
++	}
++	std::vector<uint8_t> s(k), em(k);
++	if (!to_string_append(s.data(), k, mpsig, k)) {
++		return false;
++	}
++	if (oc_rsa_public(em.data(), s.data(), n_.data(), k, e_.data(), e_.bytes())) {
++		return false;
++	}
+ 
+ 	hash_accumulator h(a);
+ 	h.update(data);
+-	auto do_verify = [&]() {
+-		switch (a) {
+-			case hash_algorithm::sha1:
+-				return nettle_rsa_sha1_verify_digest(&pub_, h.digest().data(), mpsig);
+-			case hash_algorithm::sha256:
+-				return nettle_rsa_sha256_verify_digest(&pub_, h.digest().data(), mpsig);
+-			case hash_algorithm::sha512:
+-				return nettle_rsa_sha512_verify_digest(&pub_, h.digest().data(), mpsig);
+-			default:
+-				return 0;
+-		}
+-	};
+-
+-	bool ret = do_verify() == 1;
+-
+-	return ret;
++	auto expected = emsa_pkcs1_v15(a, h.digest(), k);
++	return !expected.empty() && oc_ct_equal(expected.data(), em.data(), k);
+ }
+ 
+ 
+@@ -661,9 +550,6 @@
+ 	if (alg == "ssh-ed25519"sv) {
+ 		ret = std::make_unique<public_key_ed25519>();
+ 	}
+-	else if (alg == "ssh-ed448"sv) {
+-		ret = std::make_unique<public_key_ed448>();
+-	}
+ 	else if (alg == "ecdsa-sha2-nistp256"sv) {
+ 		ret = std::make_unique<public_key_ecdsa_sha2_nistp>(nistp_curve::nistp256);
+ 	}
+@@ -690,7 +576,7 @@
+ 
+ std::string_view get_known_pubkey_signature_algorithms()
+ {
+-	return "ssh-ed25519,ssh-ed448,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-512,rsa-sha2-256,ssh-rsa"sv;
++	return "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-512,rsa-sha2-256,ssh-rsa"sv;
+ }
+ 
+ bool supports_signature_algorithm(std::string_view key_alg, std::string_view sig_alg)
+@@ -698,9 +584,6 @@
+ 	if (sig_alg == "ssh-ed25519"sv) {
+ 		return key_alg == sig_alg;
+ 	}
+-	else if (sig_alg == "ssh-ed448"sv) {
+-		return key_alg == sig_alg;
+-	}
+ 	else if (sig_alg == "ecdsa-sha2-nistp256"sv) {
+ 		return key_alg == sig_alg;
+ 	}
+diff -ruN fzssh/lib/ssh.cpp fzssh-ot/lib/ssh.cpp
+--- fzssh/lib/ssh.cpp	2026-08-18 15:04:46.000000000 +0000
++++ fzssh-ot/lib/ssh.cpp	2026-11-06 23:01:01.664573625 +0000
+@@ -14,7 +14,7 @@
+ parameters get_insecure_algorithms()
+ {
+ 	return parameters{
+-		"diffie-hellman-group1-sha1,diffie-hellman-group-exchange-sha1"s,
++		"diffie-hellman-group-exchange-sha1"s,
+ 		"aes256-cbc,aes192-cbc,aes128-cbc"s,
+ 		"hmac-sha1-96"s,
+ 		"ssh-rsa"s,
+@@ -25,9 +25,9 @@
+ parameters get_parameters_with_all_algorithms()
+ {
+ 	return parameters{
+-		"mlkem768x25519-sha256,curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group14-sha256,diffie-hellman-group15-sha512,diffie-hellman-group16-sha512,diffie-hellman-group17-sha512,diffie-hellman-group18-sha512,diffie-hellman-group-exchange-sha256,ecdh-sha2-nistp521,ecdh-sha2-nistp384,ecdh-sha2-nistp256,diffie-hellman-group-exchange-sha1,diffie-hellman-group14-sha1,diffie-hellman-group1-sha1"s,
++		"mlkem768x25519-sha256,curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group14-sha256,diffie-hellman-group15-sha512,diffie-hellman-group16-sha512,diffie-hellman-group17-sha512,diffie-hellman-group18-sha512,diffie-hellman-group-exchange-sha256,ecdh-sha2-nistp521,ecdh-sha2-nistp384,ecdh-sha2-nistp256,diffie-hellman-group-exchange-sha1,diffie-hellman-group14-sha1"s,
+ 		"aes256-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-gcm@openssh.com,aes128-ctr,aes256-cbc,aes192-cbc,aes128-cbc"s,
+-		"umac-128-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-256,hmac-sha2-512,umac-64-etm@openssh.com,hmac-sha1,hmac-sha1-96"s,
++		"hmac-sha2-256-etm@openssh.com,hmac-sha2-256,hmac-sha2-512,hmac-sha1,hmac-sha1-96"s,
+ 		std::string(get_known_pubkey_signature_algorithms()),
+ 		""s
+ 	};
+diff -ruN fzssh/meson.build fzssh-ot/meson.build
+--- fzssh/meson.build	2026-08-18 15:05:42.687509800 +0000
++++ fzssh-ot/meson.build	2026-11-06 23:05:49.088974975 +0000
+@@ -13,10 +13,7 @@
+ soversion = '14.0.0'
+ 
+ lfz_dep = dependency('libfilezilla', version: '>= 0.57.0')
+-nettle_dep = dependency('nettle', version: '>= 3.10')
+-hogweed_dep = dependency('hogweed', version: '>= 3.10')
+-gmp_dep = dependency('gmp', version: '>= 6.2')
+-argon2_dep = dependency('libargon2')
++crypto_dep = dependency('gfopencrypto')
+ 
+ if host_machine.system() == 'windows'
+ 	platform = 'windows'
+@@ -60,7 +57,7 @@
+ 	'lib/crypt/util.cpp'
+ ]
+ 
+-fzssh_crypt_deps = [lfz_dep, nettle_dep]
++fzssh_crypt_deps = [lfz_dep, crypto_dep]
+ 
+ if platform == 'windows'
+ 	fzssh_crypt_deps += meson.get_compiler('cpp').find_library('ws2_32')
+@@ -129,7 +126,7 @@
+ 	subdir: 'fzssh/sftp'
+ )
+ 
+-fzssh_deps = [lfz_dep, nettle_dep, hogweed_dep, gmp_dep, argon2_dep]
++fzssh_deps = [lfz_dep, crypto_dep]
+ if platform == 'windows'
+ 	version_rc = configure_file(
+ 		input: 'lib/version.rc.in',
+@@ -173,7 +170,7 @@
+ 	subdir: 'fzssh/sftp'
+ )
+ 
+-fzssh_client_deps = [lfz_dep, nettle_dep, hogweed_dep, gmp_dep]
++fzssh_client_deps = [lfz_dep, crypto_dep]
+ 
+ if platform == 'windows'
+ 	fzssh_client_deps += meson.get_compiler('cpp').find_library('crypt32')
+diff -ruN fzssh/tests/keyfile_test.cpp fzssh-ot/tests/keyfile_test.cpp
+--- fzssh/tests/keyfile_test.cpp	2026-08-18 15:04:46.000000000 +0000
++++ fzssh-ot/tests/keyfile_test.cpp	2026-11-06 23:07:25.172372402 +0000
+@@ -148,7 +148,8 @@
+ 	assert(fz::ssh::load_private_keys(putty_ppkv2, log, "PuTTY PPK v2"sv).size() == 1);
+ 	assert(fz::ssh::load_private_keys(putty_plain_ppk, log).size() == 1);
+ 	assert(fz::ssh::load_private_keys(putty_plain_ppkv2, log).size() == 1);
+-	assert(fz::ssh::load_private_keys(putty_plain_ed448, log).size() == 1);
++	// Ed448 is not supported
++	assert(fz::ssh::load_private_keys(putty_plain_ed448, log).empty());
+ 
+ 	auto info = fz::ssh::load_private_key_infos(putty_ppk, log);
+ 	assert(info.size() == 1);
+@@ -286,7 +287,7 @@
+ 	assert(test_key(openssh_ed25519_encrypted_with_aes256_gcm, log, "aes256-gcm@openssh.com encrypted"sv));
+ 	assert(test_key(openssh_ed25519_encrypted_with_aes128_gcm, log, "passphrase"sv));
+ 	assert(test_key(openssh_ed25519_encrypted_with_aes256_ctr, log, "counter"sv));
+-	assert(test_key(openssh_ed448_plain, log));
++	assert(!test_key(openssh_ed448_plain, log)); // Ed448 is not supported
+ 
+ 	auto info = fz::ssh::load_private_key_infos(openssh_ed25519_encrypted_with_aes256_gcm, log);
+ 	assert(info.size() == 1);
+@@ -491,7 +492,8 @@
+ 	assert(fz::ssh::load_private_keys(encrypted_rsa_aes128_cbc_pem, log, "password"sv).size() == 1);
+ 	assert(fz::ssh::load_private_keys(encrypted_rsa_aes192_cbc_pem, log, "testpass"sv).size() == 1);
+ 	assert(fz::ssh::load_private_keys(encrypted_rsa_aes256_cbc_pem, log, "testpass"sv).size() == 1);
+-	assert(fz::ssh::load_private_keys(encrypted_rsa_des3_cbc_pem, log, "testpass"sv).size() == 1);
++	// 3DES is not supported
++	assert(fz::ssh::load_private_keys(encrypted_rsa_des3_cbc_pem, log, "testpass"sv).empty());
+ 
+ 	auto info = fz::ssh::load_private_key_infos(encrypted_rsa_aes128_cbc_pem, log);
+ 	assert(info.size() == 1);
+@@ -757,13 +759,13 @@
+ 	assert(test_key(fz::base64_decode_s(ed25519_v163), log));
+ 	assert(test_key(ed25519_encrypted, log, "password"sv));
+ 	assert(test_key(ed25519_with_pubblob, log));
+-	assert(test_key(ed448_encrypted, log, "ed448"sv));
++	assert(!test_key(ed448_encrypted, log, "ed448"sv)); // Ed448 is not supported
+ 	assert(test_key(aes256cb_hmac_sha1_encrypted, log, "herebepassword"sv));
+ 	assert(test_key(aes256cbc_with_optiona_keylen_encrypted, log, "the_password_used_in_production"sv));
+ 	assert(test_key(aes256cbc_hmac_sha512_encrypted, log, "testpass"sv));
+ 	assert(test_key(aes192cbc_hmac_sha256_encrypted, log, "testpass"sv));
+-	assert(test_key(pbes1_des_md5, log, "testpass"sv));
+-	assert(test_key(pbes1_3des_sha1, log, "testpass"sv));
++	assert(!test_key(pbes1_des_md5, log, "testpass"sv)); // DES is not supported
++	assert(!test_key(pbes1_3des_sha1, log, "testpass"sv)); // 3DES is not supported
+ 
+ 	auto info = fz::ssh::load_private_key_infos(ed25519_encrypted, log);
+ 	assert(info.size() == 1);
+@@ -781,16 +783,13 @@
+ 
+ 	for (size_t i = 0; i < 100; ++i) {
+ 		test("ssh-ed25519"sv);
+-		test("ssh-ed448"sv);
+ 		test("ecdsa-sha2-nistp256"sv);
+ 		test("ecdsa-sha2-nistp384"sv);
+ 		test("ecdsa-sha2-nistp521"sv);
+ 	}
+ 
+-	// RSA keygen is very slow
+-	for (size_t i = 0; i < 10; ++i) {
+-		test("ssh-rsa"sv);
+-	}
++	// RSA keys are not generated, only loaded
++	assert(!fz::ssh::create_private_key("ssh-rsa"sv));
+ }
+ 
+ void test_pubkeys(fz::logger_interface & log)
+@@ -851,11 +850,11 @@
+ 	assert(test(rfc4716_nocomment, "SHA256:csG+ujEVjJLZpYPqLUDdw20LVTQMjD4FWsNmsr1etGE"sv));
+ 	assert(test(rfc4716, "SHA256:csG+ujEVjJLZpYPqLUDdw20LVTQMjD4FWsNmsr1etGE"sv));
+ 	assert(test(rfc4716_multiline_comment, "SHA256:csG+ujEVjJLZpYPqLUDdw20LVTQMjD4FWsNmsr1etGE"sv));
+-	assert(test(ed448, "SHA256:GIXBS6zwSIsjxXfEeKdV3NXeNvpH+D51T6t6lZGVkzw"sv));
++	assert(!test(ed448, "SHA256:GIXBS6zwSIsjxXfEeKdV3NXeNvpH+D51T6t6lZGVkzw"sv)); // Ed448 is not supported
+ 	assert(test(putty_saved_hostkey_rsa, "SHA256:fZ0GwkEuogt+eBg+ocohfCkQiF1eqylCRVfT5+//EV0"sv));
+ 	assert(test(putty_saved_hostkey_ed2219, "SHA256:4zPBIPP5d0G4RmGgvZ7/QRn7LUYSLt472+SKUm6HAII"sv));
+ 	assert(test(putty_saved_hostkey_ed2219_2, "SHA256:2uLSBHqs3HX9DkIF1U09PetC394rzfAgE6k5rY3t+Ns"sv));
+-	assert(test(putty_saved_hostkey_ed448, "SHA256:HSOKW9LTbxZcwGj5QOYZ+Iz/2SZG7i2pSpKmmRrsd/U"sv));
++	assert(!test(putty_saved_hostkey_ed448, "SHA256:HSOKW9LTbxZcwGj5QOYZ+Iz/2SZG7i2pSpKmmRrsd/U"sv)); // Ed448 is not supported
+ 	assert(test(putty_saved_hostkey_nistp256, "SHA256:gvQRa3NeNDAS9CJB+IxDN1XocqEaKuuA20Mpfu768WM"sv));
+ 	assert(test(putty_saved_hostkey_nistp256_2, "SHA256:D9g2Tam9iS5UhJH+PMA5W1M3L7xeDV/OZJikHK9K/vM"sv));
+ }

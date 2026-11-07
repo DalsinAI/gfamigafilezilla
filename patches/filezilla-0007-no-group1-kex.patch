@@ -1,0 +1,15 @@
+FileZilla offers diffie-hellman-group1-sha1 when insecure algorithms are
+allowed; fzssh on GFOpenCrypto no longer has that 1024-bit group, so it is
+not offered.
+
+--- a/src/engine/sftp/connect.cpp	2026-11-06 23:18:51.787323978 +0000
++++ b/src/engine/sftp/connect.cpp	2026-11-06 23:18:51.790344450 +0000
+@@ -39,7 +39,7 @@
+ 	case sftpConnectStates::connection:
+ 		{
+ 			fz::ssh::client_parameters params;
+-			params.kex_ += ",diffie-hellman-group1-sha1,diffie-hellman-group-exchange-sha1"sv;
++			params.kex_ += ",diffie-hellman-group-exchange-sha1"sv; // group1 (1024 bits) is gone from fzssh here
+ 			params.cipher_ += ",aes256-cbc,aes192-cbc,aes128-cbc"sv;
+ 			params.hostkey_signatures_ += ",ssh-rsa"sv;
+ 			params.single_channel_ = true;

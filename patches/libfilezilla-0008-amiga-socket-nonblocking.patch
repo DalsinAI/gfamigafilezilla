@@ -1,0 +1,34 @@
+AmigaOS: fcntl() fails on sockets, so libfilezilla's sockets stayed blocking
+and the event loop stopped in a read (FTP data never seen, SFTP stalled
+after the password). Set the mode with FIONBIO.
+
+diff -ruN a/lib/glue/unix.cpp b/lib/glue/unix.cpp
+--- a/lib/glue/unix.cpp	2026-11-07 08:12:37.941961425 +0000
++++ b/lib/glue/unix.cpp	2026-11-07 08:12:37.952632241 +0000
+@@ -4,6 +4,9 @@
+ 
+ #include <errno.h>
+ #include <fcntl.h>
++#ifdef __AMIGA__
++#include <sys/ioctl.h>
++#endif
+ #include <signal.h>
+ #include <string.h>
+ #include <unistd.h>
+@@ -209,6 +212,16 @@
+ 
+ int set_nonblocking(int fd, bool non_blocking)
+ {
++#ifdef __AMIGA__
++	// AmigaOS: fcntl() knows only files and fails on a socket, which then
++	// stays blocking, so a read with nothing to read waits instead of
++	// returning EAGAIN and the event loop stops. A socket's mode is set with
++	// FIONBIO, as bsdsocket.library's IoctlSocket() takes it.
++	int value = non_blocking ? 1 : 0;
++	if (ioctl(fd, FIONBIO, &value) == 0) {
++		return 0;
++	}
++#endif
+ 	int flags = fcntl(fd, F_GETFL);
+ 	if (flags == -1) {
+ 		return errno;

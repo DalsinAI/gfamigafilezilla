@@ -1,6 +1,6 @@
 #!/bin/sh
 # What the stove's C library, bsdsocket glue and pthreads give: the calls
-# libfilezilla, fzssh and GnuTLS look for. Prints one line for each.
+# libfilezilla and fzssh look for. Prints one line for each.
 #   TC=.../prefix scripts/probe.sh
 # Copyright (c) 2026 AmiCradle Team
 TC=${TC:?}

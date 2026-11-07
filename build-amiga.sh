@@ -2,8 +2,8 @@
 # Builds FileZilla 3.71.0 for AmigaOS 3: 68040, the FPU when there is one
 # (fpuauto), on the GFOpenWX Toolkit. Stages, each again only when its
 # inputs change, so a run that stops at the time cap goes on next run:
-#   1 the stove probe, fpuauto, GMP, Nettle, GnuTLS (scripts/build-crypto.sh)
-#   2 libfilezilla, Argon2, fzssh, SQLite (scripts/build-fz.sh)
+#   1 the stove probe, fpuauto, the GFOpenTLS and GFOpenCrypto link stubs (scripts/build-crypto.sh)
+#   2 libfilezilla, fzssh, SQLite (scripts/build-fz.sh)
 #   3 the toolkit SDK, then FileZilla (scripts/build-filezilla.sh)
 #   STOVE=.../stoves/os32-gcc16-open6 OUT=out ./build-amiga.sh
 # Everything third-party is fetched at the versions filezilla.lock gives.
@@ -50,13 +50,27 @@ if [ "$(cat "$FAL/.commit" 2>/dev/null)" != "$FPUAUTO_COMMIT" ]; then
     echo "$FPUAUTO_COMMIT" > "$FAL/.commit"
 fi
 
-# ---- 1: GMP, Nettle, GnuTLS
+# ---- 1: the GFOpenTLS and GFOpenCrypto link stubs
 TC="$TC" WORK="$WORK" SYS="$SYS" JOBS=$JOBS sh "$HERE/scripts/build-crypto.sh"
+# the two libraries themselves, for the package's Libs/ (the installer puts
+# them in LIBS: when the ones there are older): gfopencrypto.library from
+# the stub build, gfopentls.library from build-amiga-tls.sh
+G="$WORK/gfopentls"
+if [ ! -f "$OUT/Libs/gfopentls.library" ] || [ "$(cat "$WORK/.gfopentls-libs" 2>/dev/null)" != "$GFOPENTLS_COMMIT" ]; then
+    (cd "$G" && STOVE="$STOVE" OUT="$G/out-tls" sh ./build-amiga-tls.sh) > "$WORK/gfopentls-tls.log" 2>&1 \
+        || { tail -20 "$WORK/gfopentls-tls.log"; echo "gfopentls.library failed"; exit 1; }
+    mkdir -p "$OUT/Libs"
+    cp "$G/out-tls/lib/gfopentls.library" "$G/out/lib/gfopencrypto.library" "$OUT/Libs/"
+    echo "$GFOPENTLS_COMMIT" > "$WORK/.gfopentls-libs"
+fi
+ls -l "$OUT/Libs/"
 echo "crypto: $(( $(date +%s) - t0 )) s"
 
-# ---- 2: libfilezilla, Argon2, fzssh
+# ---- 2: libfilezilla, fzssh, SQLite
 TC="$TC" WORK="$WORK" SYS="$SYS" JOBS=$JOBS sh "$HERE/scripts/build-fz.sh"
 echo "libfilezilla and fzssh: $(( $(date +%s) - t0 )) s"
+# the Shell probe for SFTP, FTP and FTPS (tests/amiga/fzprobe.cpp)
+TC="$TC" WORK="$WORK" SYS="$SYS" FPUSPECS="$FA/fpuauto.specs" FPULIB="$FAL" OUT="$OUT" sh "$HERE/scripts/build-probe.sh"
 
 # ---- 3: the toolkit's SDK (when its commit changed), then FileZilla
 fetch gfopenwxtoolkit "$WXT_REPO" "$WXT_COMMIT"
