@@ -205,7 +205,10 @@ private:
 			t0_ = ms();
 			ds_ = std::make_unique<fz::socket>(pool_, this);
 			// the control connection's address: servers behind NAT give their inside one
-			ds_->connect(fz::to_native(host_), e * 256 + f);
+			// DATAIP=1: the address PASV gave, as FileZilla's own default does
+			std::string dh = getenv("DATAIP") ? std::to_string(a) + "." + std::to_string(b) + "." + std::to_string(c) + "." + std::to_string(d) : host_;
+			say("data connect %s", dh + ":" + std::to_string(e * 256 + f));
+			if (int err = ds_->connect(fz::to_native(dh), e * 256 + f)) { say("data connect error %s", fz::socket_error_description(err)); fail("data connect"); return; }
 			if (tls_) {
 				dtl_ = std::make_unique<fz::tls_layer>(event_loop_, this, *ds_, &ts_, log_);
 				if (!dtl_->client_handshake(ctl_->get_raw_certificate(), ctl_->get_session_parameters(), ctl_->get_hostname())) { fail("data handshake"); return; }
