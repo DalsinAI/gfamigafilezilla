@@ -54,7 +54,7 @@ diff -ruN a2/src/interface/Mainfrm.cpp b/src/interface/Mainfrm.cpp
 +#endif
 diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
 --- a/src/interface/amiga_arexx.cpp	1970-01-01 00:00:00.000000000 +0000
-+++ b/src/interface/amiga_arexx.cpp	2026-11-07 10:21:11.395239659 +0000
++++ b/src/interface/amiga_arexx.cpp	2026-11-07 10:32:49.788375089 +0000
 @@ -0,0 +1,639 @@
 +// amiga_arexx.cpp - FileZilla's ARexx port FILEZILLA.1 (AmigaOS).
 +//
@@ -576,7 +576,7 @@ diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
 +		if (nowait) {
 +			return Reply{};
 +		}
-+		if (!p.WaitFor([frame] { CQueueView* q = frame->GetQueue(); return !q || q->empty(); })) {
++		if (!p.WaitFor([frame] { CQueueView* q = frame->GetQueue(); return !q || (q->GetFileCount() == 0); })) {
 +			return rexx_error(E_TRANSFER);
 +		}
 +		int64_t const got = fz::local_filesys::get_size(fz::to_native(target));
@@ -626,7 +626,7 @@ diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
 +		if (nowait) {
 +			return Reply{};
 +		}
-+		if (!p.WaitFor([frame] { CQueueView* q = frame->GetQueue(); return !q || q->empty(); })) {
++		if (!p.WaitFor([frame] { CQueueView* q = frame->GetQueue(); return !q || (q->GetFileCount() == 0); })) {
 +			return rexx_error(E_TRANSFER);
 +		}
 +		// the server's own listing says whether it all arrived
@@ -648,7 +648,7 @@ diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
 +				return;
 +			}
 +			CQueueView* q = frame->GetQueue();
-+			bool const transferring = q && !q->empty();
++			bool const transferring = q && !(q->GetFileCount() == 0);
 +			bool const connected = s->IsRemoteConnected();
 +			r.result = connected ? "CONNECTED" : "CONNECTING";
 +			r.result += transferring ? " TRANSFERRING" : (s->IsRemoteIdle() ? " IDLE" : " BUSY");
