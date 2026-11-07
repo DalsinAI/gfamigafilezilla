@@ -52,9 +52,21 @@ fi
 
 # ---- 1: the GFOpenTLS and GFOpenCrypto link stubs
 TC="$TC" WORK="$WORK" SYS="$SYS" JOBS=$JOBS sh "$HERE/scripts/build-crypto.sh"
+# the two libraries themselves, for the package's Libs/ (the installer puts
+# them in LIBS: when the ones there are older): gfopencrypto.library from
+# the stub build, gfopentls.library from build-amiga-tls.sh
+G="$WORK/gfopentls"
+if [ ! -f "$OUT/Libs/gfopentls.library" ] || [ "$(cat "$WORK/.gfopentls-libs" 2>/dev/null)" != "$GFOPENTLS_COMMIT" ]; then
+    (cd "$G" && STOVE="$STOVE" OUT="$G/out-tls" sh ./build-amiga-tls.sh) > "$WORK/gfopentls-tls.log" 2>&1 \
+        || { tail -20 "$WORK/gfopentls-tls.log"; echo "gfopentls.library failed"; exit 1; }
+    mkdir -p "$OUT/Libs"
+    cp "$G/out-tls/lib/gfopentls.library" "$G/out/lib/gfopencrypto.library" "$OUT/Libs/"
+    echo "$GFOPENTLS_COMMIT" > "$WORK/.gfopentls-libs"
+fi
+ls -l "$OUT/Libs/"
 echo "crypto: $(( $(date +%s) - t0 )) s"
 
-# ---- 2: libfilezilla, Argon2, fzssh
+# ---- 2: libfilezilla, fzssh, SQLite
 TC="$TC" WORK="$WORK" SYS="$SYS" JOBS=$JOBS sh "$HERE/scripts/build-fz.sh"
 echo "libfilezilla and fzssh: $(( $(date +%s) - t0 )) s"
 
