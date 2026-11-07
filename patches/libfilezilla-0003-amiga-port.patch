@@ -355,19 +355,3 @@ diff -ruN pa/lib/process.cpp pb/lib/process.cpp
  }
  #endif
  
-diff -ruN pa/lib/tls_layer_impl.cpp pb/lib/tls_layer_impl.cpp
---- a/lib/tls_layer_impl.cpp	2026-11-06 01:28:44.794808778 +0000
-+++ b/lib/tls_layer_impl.cpp	2026-11-06 01:29:03.789182072 +0000
-@@ -29,6 +29,12 @@
- 	reinterpret_cast<decltype(&f)>(get_gnutls_dll()[ #f ])
- }
- 
-+#elif defined(__AMIGA__)
-+
-+// Static GnuTLS built without PKCS#11: the optional calls are not there.
-+#define dynamic_gnutls_func(f) \
-+	static_cast<decltype(&f)>(nullptr)
-+
- #else
- 
- #include <dlfcn.h>

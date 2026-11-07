@@ -1,0 +1,6070 @@
+AmigaOS: libfilezilla on our own libraries. TLS on GFOpenTLS (gfopentls.library),
+hashes, encryption and signatures on GFOpenCrypto (gfopencrypto.library), in
+place of GnuTLS and Nettle. A client only (FileZilla FTPS); certificate
+making, client certificates, PKCS#11 and JWS answer "not supported".
+Copyright (c) 2026 AmiCradle Team. libfilezilla is GPL v2 or later.
+
+diff -ruN a/lib/encryption.cpp b/lib/encryption.cpp
+--- a/lib/encryption.cpp	2026-11-06 22:54:30.495520701 +0000
++++ b/lib/encryption.cpp	2026-11-06 22:54:30.497078534 +0000
+@@ -6,16 +6,107 @@
+ 
+ #include <cstring>
+ 
+-#include <nettle/aes.h>
+-#include <nettle/ctr.h>
+-#include <nettle/curve25519.h>
+-#include <nettle/gcm.h>
+-#include <nettle/memops.h>
+-#include <nettle/sha2.h>
+-#include <nettle/version.h>
++#include <gfopencrypto/gfopencrypto.h>
++
++/* On GFOpenCrypto in place of Nettle: X25519, AES-256 (CTR) and GHASH, with
++ * AES-256-GCM (NIST SP 800-38D, 96-bit IV) put together here.
++ * Copyright (c) 2026 AmiCradle Team. libfilezilla is GPL v2 or later. */
+ 
+ namespace fz {
+ 
++namespace {
++size_t constexpr GCM_IV_SIZE = 12;
++size_t constexpr GCM_DIGEST_SIZE = 16;
++size_t constexpr SHA256_DIGEST_SIZE = 32;
++
++class gcm_aes256 final
++{
++public:
++	gcm_aes256(uint8_t const* key, uint8_t const* iv)
++	{
++		memcpy(key_, key, 32);
++		uint8_t zero[16]{};
++		memset(h_, 0, 16);
++		oc_aes(h_, 16, key_, 32, zero, OC_AES_ECB_ENCRYPT);
++		memcpy(j0_, iv, 12);
++		j0_[12] = 0; j0_[13] = 0; j0_[14] = 0; j0_[15] = 1;
++		memcpy(ctr_, j0_, 16);
++		ctr_[15] = 2;
++	}
++
++	~gcm_aes256()
++	{
++		oc_cleanse(this, sizeof(*this));
++	}
++
++	void update(uint8_t const* ad, size_t size)
++	{
++		oc_ghash(y_, h_, ad, size);
++		ad_size_ = size;
++	}
++
++	void encrypt(uint8_t* out, uint8_t const* in, size_t size)
++	{
++		if (out != in) {
++			memmove(out, in, size);
++		}
++		oc_aes(out, size, key_, 32, ctr_, OC_AES_CTR);
++		oc_ghash(y_, h_, out, size);
++		size_ = size;
++	}
++
++	void decrypt(uint8_t* out, uint8_t const* in, size_t size)
++	{
++		oc_ghash(y_, h_, in, size);
++		if (out != in) {
++			memmove(out, in, size);
++		}
++		oc_aes(out, size, key_, 32, ctr_, OC_AES_CTR);
++		size_ = size;
++	}
++
++	void digest(uint8_t* tag)
++	{
++		uint8_t lens[16];
++		uint64_t const a = static_cast<uint64_t>(ad_size_) * 8;
++		uint64_t const c = static_cast<uint64_t>(size_) * 8;
++		for (int i = 0; i < 8; ++i) {
++			lens[7 - i] = static_cast<uint8_t>(a >> (8 * i));
++			lens[15 - i] = static_cast<uint8_t>(c >> (8 * i));
++		}
++		oc_ghash(y_, h_, lens, 16);
++		uint8_t ek[16]{};
++		oc_aes(ek, 16, key_, 32, j0_, OC_AES_CTR);
++		for (int i = 0; i < 16; ++i) {
++			tag[i] = y_[i] ^ ek[i];
++		}
++	}
++
++private:
++	uint8_t key_[32];
++	uint8_t h_[16];
++	uint8_t j0_[16];
++	uint8_t ctr_[16];
++	uint8_t y_[16]{};
++	size_t ad_size_{};
++	size_t size_{};
++};
++
++void aes256_ctr(uint8_t const* key, uint8_t const* ctr, uint8_t* out, uint8_t const* in, size_t size)
++{
++	if (out != in) {
++		memmove(out, in, size);
++	}
++	oc_aes(out, size, key, 32, ctr, OC_AES_CTR);
++}
++
++void curve25519_mul(uint8_t* out, uint8_t const* scalar, uint8_t const* point)
++{
++	// An all-zero answer (a small-order point) stays all zeros, as Nettle's did
++	oc_x25519(out, scalar, point);
++}
++}
++
+ std::string public_key::to_base64(bool pad) const
+ {
+ 	auto raw = std::string(key_.cbegin(), key_.cend());
+@@ -76,7 +167,7 @@
+ 			0, 0, 0, 0, 0, 0, 0, 0 };
+ 
+ 		ret.key_.resize(32);
+-		nettle_curve25519_mul(ret.key_.data(), key_.data(), nine);
++		curve25519_mul(ret.key_.data(), key_.data(), nine);
+ 
+ 		ret.salt_ = salt_;
+ 	}
+@@ -134,7 +225,7 @@
+ 	if (*this && pub) {
+ 		ret.resize(32);
+ 
+-		nettle_curve25519_mul(ret.data(), key_.data(), pub.key_.data());
++		curve25519_mul(ret.data(), key_.data(), pub.key_.data());
+ 	}
+ 
+ 	return ret;
+@@ -160,39 +251,30 @@
+ 			static_assert(SHA256_DIGEST_SIZE >= GCM_IV_SIZE, "iv too small");
+ 			iv.resize(GCM_IV_SIZE);
+ 
+-			gcm_aes256_ctx ctx;
+-			nettle_gcm_aes256_set_key(&ctx, aes_key.data());
+-			nettle_gcm_aes256_set_iv(&ctx, GCM_IV_SIZE, iv.data());
++			gcm_aes256 ctx(aes_key.data(), iv.data());
+ 
+ 			if (authenticated_data_size) {
+-				nettle_gcm_aes256_update(&ctx, authenticated_data_size, authenticated_data);
++				ctx.update(authenticated_data, authenticated_data_size);
+ 			}
+ 
+ 			// Encrypt plaintext with AES256-GCM
+ 			ret.resize(public_key::key_size + public_key::salt_size + size + GCM_DIGEST_SIZE);
+ 			if (size) {
+-				nettle_gcm_aes256_encrypt(&ctx, size, ret.data() + public_key::key_size + public_key::salt_size, plain);
++				ctx.encrypt(ret.data() + public_key::key_size + public_key::salt_size, plain, size);
+ 			}
+ 
+ 			// Return ephemeral_pub.key_||ephemeral_pub.salt_||ciphertext||tag
+ 			memcpy(ret.data(), ephemeral_pub.key_.data(), public_key::key_size);
+ 			memcpy(ret.data() + public_key::key_size, ephemeral_pub.salt_.data(), public_key::salt_size);
+-#if NETTLE_VERSION_MAJOR >= 4
+-			nettle_gcm_aes256_digest(&ctx, ret.data() + public_key::key_size + public_key::salt_size + size);
+-#else
+-			nettle_gcm_aes256_digest(&ctx, GCM_DIGEST_SIZE, ret.data() + public_key::key_size + public_key::salt_size + size);
+-#endif
++			ctx.digest(ret.data() + public_key::key_size + public_key::salt_size + size);
+ 		}
+ 		else {
+ 			std::vector<uint8_t> ctr = hash_accumulator(hash_algorithm::sha256) << ephemeral_pub.salt_ << 1 << secret << ephemeral_pub.key_ << pub.key_ << pub.salt_;
+ 
+-			aes256_ctx ctx;
+-			nettle_aes256_set_encrypt_key(&ctx, aes_key.data());
+-
+ 			// Encrypt plaintext with AES256-CTR
+ 			ret.resize(public_key::key_size + public_key::salt_size + size);
+ 			if (size) {
+-				nettle_ctr_crypt(&ctx, reinterpret_cast<nettle_cipher_func*>(nettle_aes256_encrypt), 16, ctr.data(), size, ret.data() + public_key::key_size + public_key::salt_size, plain);
++				aes256_ctr(aes_key.data(), ctr.data(), ret.data() + public_key::key_size + public_key::salt_size, plain, size);
+ 			}
+ 
+ 			// Return ephemeral_pub.key_||ephemeral_pub.salt_||ciphertext
+@@ -264,28 +346,22 @@
+ 			static_assert(SHA256_DIGEST_SIZE >= GCM_IV_SIZE, "iv too small");
+ 			iv.resize(GCM_IV_SIZE);
+ 
+-			gcm_aes256_ctx ctx;
+-			nettle_gcm_aes256_set_key(&ctx, aes_key.data());
+-			nettle_gcm_aes256_set_iv(&ctx, GCM_IV_SIZE, iv.data());
++			gcm_aes256 ctx(aes_key.data(), iv.data());
+ 
+ 			if (authenticated_data_size) {
+-				nettle_gcm_aes256_update(&ctx, authenticated_data_size, authenticated_data);
++				ctx.update(authenticated_data, authenticated_data_size);
+ 			}
+ 
+ 			// Decrypt ciphertext with AES256-GCM
+ 			ret.resize(message_size);
+ 			if (message_size) {
+-				nettle_gcm_aes256_decrypt(&ctx, message_size, ret.data(), cipher + public_key::key_size + public_key::salt_size);
++				ctx.decrypt(ret.data(), cipher + public_key::key_size + public_key::salt_size, message_size);
+ 			}
+ 
+ 			// Last but not least, verify the tag
+ 			uint8_t tag[GCM_DIGEST_SIZE];
+-#if NETTLE_VERSION_MAJOR >= 4
+-			nettle_gcm_aes256_digest(&ctx, tag);
+-#else
+-			nettle_gcm_aes256_digest(&ctx, GCM_DIGEST_SIZE, tag);
+-#endif
+-			if (!nettle_memeql_sec(tag, cipher + size - GCM_DIGEST_SIZE, GCM_DIGEST_SIZE)) {
++			ctx.digest(tag);
++			if (!oc_ct_equal(tag, cipher + size - GCM_DIGEST_SIZE, GCM_DIGEST_SIZE)) {
+ 				ret.clear();
+ 			}
+ 		}
+@@ -293,13 +369,10 @@
+ 			// Derive AES2556 key and CTR nonce from shared secret
+ 			std::vector<uint8_t> ctr = hash_accumulator(hash_algorithm::sha256) << ephemeral_pub.salt_ << 1 << secret << ephemeral_pub.key_ << pub.key_ << pub.salt_;
+ 
+-			aes256_ctx ctx;
+-			nettle_aes256_set_encrypt_key(&ctx, aes_key.data());
+-
+ 			// Decrypt ciphertext with AES256-CTR
+ 			ret.resize(message_size);
+ 			if (message_size) {
+-				nettle_ctr_crypt(&ctx, reinterpret_cast<nettle_cipher_func*>(nettle_aes256_encrypt), 16, ctr.data(), ret.size(), ret.data(), cipher + public_key::key_size + public_key::salt_size);
++				aes256_ctr(aes_key.data(), ctr.data(), ret.data(), cipher + public_key::key_size + public_key::salt_size, ret.size());
+ 			}
+ 		}
+ 	}
+@@ -440,7 +513,7 @@
+ 	}
+ 
+ 	// By definition both key and salt are non-empty and have the same size in each.
+-	return nettle_memeql_sec(lhs.salt().data(), rhs.salt().data(), lhs.salt().size()) && nettle_memeql_sec(lhs.key().data(), rhs.key().data(), lhs.key().size());
++	return oc_ct_equal(lhs.salt().data(), rhs.salt().data(), lhs.salt().size()) && oc_ct_equal(lhs.key().data(), rhs.key().data(), lhs.key().size());
+ }
+ 
+ size_t symmetric_key::encryption_overhead()
+@@ -462,27 +535,21 @@
+ 		static_assert(SHA256_DIGEST_SIZE >= GCM_IV_SIZE, "iv too small");
+ 		iv.resize(GCM_IV_SIZE);
+ 
+-		gcm_aes256_ctx ctx;
+-		nettle_gcm_aes256_set_key(&ctx, aes_key.data());
+-		nettle_gcm_aes256_set_iv(&ctx, GCM_IV_SIZE, iv.data());
++		gcm_aes256 ctx(aes_key.data(), iv.data());
+ 
+ 		if (authenticated_data_size) {
+-			nettle_gcm_aes256_update(&ctx, authenticated_data_size, authenticated_data);
++			ctx.update(authenticated_data, authenticated_data_size);
+ 		}
+ 
+ 		// Encrypt plaintext with AES256-GCM
+ 		ret.resize(symmetric_key::salt_size + size + GCM_DIGEST_SIZE);
+ 		if (size) {
+-			nettle_gcm_aes256_encrypt(&ctx, size, ret.data() + symmetric_key::salt_size, plain);
++			ctx.encrypt(ret.data() + symmetric_key::salt_size, plain, size);
+ 		}
+ 
+ 		// Return nonce||ciphertext||tag
+ 		memcpy(ret.data(), nonce.data(), symmetric_key::salt_size);
+-#if NETTLE_VERSION_MAJOR >= 4
+-		nettle_gcm_aes256_digest(&ctx, ret.data() + symmetric_key::salt_size + size);
+-#else
+-		nettle_gcm_aes256_digest(&ctx, GCM_DIGEST_SIZE, ret.data() + symmetric_key::salt_size + size);
+-#endif
++		ctx.digest(ret.data() + symmetric_key::salt_size + size);
+ 	}
+ 
+ 	return ret;
+@@ -531,28 +598,22 @@
+ 		static_assert(SHA256_DIGEST_SIZE >= GCM_IV_SIZE, "iv too small");
+ 		iv.resize(GCM_IV_SIZE);
+ 
+-		gcm_aes256_ctx ctx;
+-		nettle_gcm_aes256_set_key(&ctx, aes_key.data());
+-		nettle_gcm_aes256_set_iv(&ctx, GCM_IV_SIZE, iv.data());
++		gcm_aes256 ctx(aes_key.data(), iv.data());
+ 
+ 		if (authenticated_data_size) {
+-			nettle_gcm_aes256_update(&ctx, authenticated_data_size, authenticated_data);
++			ctx.update(authenticated_data, authenticated_data_size);
+ 		}
+ 
+ 		// Decrypt ciphertext with AES256-GCM
+ 		ret.resize(message_size);
+ 		if (message_size) {
+-			nettle_gcm_aes256_decrypt(&ctx, message_size, ret.data(), cipher + symmetric_key::salt_size);
++			ctx.decrypt(ret.data(), cipher + symmetric_key::salt_size, message_size);
+ 		}
+ 
+ 		// Last but not least, verify the tag
+ 		uint8_t tag[GCM_DIGEST_SIZE];
+-#if NETTLE_VERSION_MAJOR >= 4
+-		nettle_gcm_aes256_digest(&ctx, tag);
+-#else
+-		nettle_gcm_aes256_digest(&ctx, GCM_DIGEST_SIZE, tag);
+-#endif
+-		if (!nettle_memeql_sec(tag, cipher + size - GCM_DIGEST_SIZE, GCM_DIGEST_SIZE)) {
++		ctx.digest(tag);
++		if (!oc_ct_equal(tag, cipher + size - GCM_DIGEST_SIZE, GCM_DIGEST_SIZE)) {
+ 			ret.clear();
+ 		}
+ 	}
+diff -ruN a/lib/hash.cpp b/lib/hash.cpp
+--- a/lib/hash.cpp	2026-11-06 22:54:30.492666791 +0000
++++ b/lib/hash.cpp	2026-11-06 22:54:30.493954541 +0000
+@@ -1,3 +1,9 @@
++/* libfilezilla's hashes on GFOpenCrypto (gfopencrypto.library on the Amiga,
++ * libopencrypto on the host) in place of Nettle: MD5, SHA-1 and SHA-2 kept
++ * here over the library's block functions (so their state can be exported
++ * as Nettle's was), SHA-3 and PBKDF2 straight from the library, HMAC over
++ * the hashes here.
++ * Copyright (c) 2026 AmiCradle Team. libfilezilla is GPL v2 or later. */
+ #include "libfilezilla/libfilezilla.hpp"
+ 
+ #include "libfilezilla/buffer.hpp"
+@@ -5,36 +11,9 @@
+ #include "libfilezilla/hash.hpp"
+ #include "libfilezilla/util.hpp"
+ 
+-#include <nettle/hmac.h>
+-#include <nettle/md5.h>
+-#include <nettle/memops.h>
+-#include <nettle/pbkdf2.h>
+-#include <nettle/sha3.h>
+-#include <nettle/version.h>
+-
+-// Undo Nettle's horrible namespace mangling fuckery
+-#ifdef pbkdf2
+-#undef pbkdf2
+-#endif
+-#ifdef pbkdf2_hmac_sha1
+-#undef pbkdf2_hmac_sha1
+-#endif
+-#ifdef pbkdf2_hmac_sha256
+-#undef pbkdf2_hmac_sha256
+-#endif
+-#ifdef pbkdf2_hmac_sha512
+-#undef pbkdf2_hmac_sha512
+-#endif
+-
+-#include <nettle/sha2.h>
++#include <gfopencrypto/gfopencrypto.h>
+ 
+ #include <string.h>
+-#if FZ_WINDOWS
+-#include "libfilezilla/glue/windows.hpp"
+-#include <winsock.h>
+-#else
+-#include <arpa/inet.h>
+-#endif
+ 
+ namespace fz {
+ 
+@@ -84,134 +63,229 @@
+ 	virtual void digest(uint8_t* out) = 0;
+ };
+ 
+-class hash_accumulator_md5 final : public hash_accumulator::impl
++namespace {
++
++enum class md { md5, sha1, sha256, sha384, sha512 };
++
++// A Merkle-Damgard hash over the library's block function
++class md_hash final
+ {
+ public:
+-	hash_accumulator_md5()
++	explicit md_hash(md t)
++		: t_(t)
+ 	{
+-		reinit();
++		init();
+ 	}
+ 
+-	~hash_accumulator_md5() noexcept
++	~md_hash()
+ 	{
+-		wipe(&ctx_, sizeof(ctx_));
++		wipe(this, sizeof(*this));
+ 	}
+ 
+-	virtual size_t digest_size() const override { return MD5_DIGEST_SIZE; }
+-
+-	virtual void update(uint8_t const* data, size_t size) override
++	size_t block_size() const { return (t_ == md::sha384 || t_ == md::sha512) ? 128 : 64; }
++	size_t state_size() const
+ 	{
+-		nettle_md5_update(&ctx_, size, data);
++		switch (t_) {
++		case md::md5: return 16;
++		case md::sha1: return 20;
++		case md::sha256: return 32;
++		default: return 64;
++		}
+ 	}
+-
+-	virtual void reinit() override
++	size_t digest_size() const
+ 	{
+-		nettle_md5_init(&ctx_);
++		switch (t_) {
++		case md::md5: return 16;
++		case md::sha1: return 20;
++		case md::sha256: return 32;
++		case md::sha384: return 48;
++		default: return 64;
++		}
+ 	}
+ 
+-	virtual void digest(uint8_t* out) override
++	void init()
+ 	{
+-#if NETTLE_VERSION_MAJOR >= 4
+-		nettle_md5_digest(&ctx_, out);
+-#else
+-		nettle_md5_digest(&ctx_, MD5_DIGEST_SIZE, out);
+-#endif
++		static uint8_t const iv_md5[16] = { 0x01,0x23,0x45,0x67, 0x89,0xab,0xcd,0xef, 0xfe,0xdc,0xba,0x98, 0x76,0x54,0x32,0x10 };
++		static uint8_t const iv_sha1[20] = { 0x67,0x45,0x23,0x01, 0xef,0xcd,0xab,0x89, 0x98,0xba,0xdc,0xfe, 0x10,0x32,0x54,0x76, 0xc3,0xd2,0xe1,0xf0 };
++		static uint8_t const iv_sha256[32] = {
++			0x6a,0x09,0xe6,0x67, 0xbb,0x67,0xae,0x85, 0x3c,0x6e,0xf3,0x72, 0xa5,0x4f,0xf5,0x3a,
++			0x51,0x0e,0x52,0x7f, 0x9b,0x05,0x68,0x8c, 0x1f,0x83,0xd9,0xab, 0x5b,0xe0,0xcd,0x19 };
++		static uint8_t const iv_sha384[64] = {
++			0xcb,0xbb,0x9d,0x5d,0xc1,0x05,0x9e,0xd8, 0x62,0x9a,0x29,0x2a,0x36,0x7c,0xd5,0x07,
++			0x91,0x59,0x01,0x5a,0x30,0x70,0xdd,0x17, 0x15,0x2f,0xec,0xd8,0xf7,0x0e,0x59,0x39,
++			0x67,0x33,0x26,0x67,0xff,0xc0,0x0b,0x31, 0x8e,0xb4,0x4a,0x87,0x68,0x58,0x15,0x11,
++			0xdb,0x0c,0x2e,0x0d,0x64,0xf9,0x8f,0xa7, 0x47,0xb5,0x48,0x1d,0xbe,0xfa,0x4f,0xa4 };
++		static uint8_t const iv_sha512[64] = {
++			0x6a,0x09,0xe6,0x67,0xf3,0xbc,0xc9,0x08, 0xbb,0x67,0xae,0x85,0x84,0xca,0xa7,0x3b,
++			0x3c,0x6e,0xf3,0x72,0xfe,0x94,0xf8,0x2b, 0xa5,0x4f,0xf5,0x3a,0x5f,0x1d,0x36,0xf1,
++			0x51,0x0e,0x52,0x7f,0xad,0xe6,0x82,0xd1, 0x9b,0x05,0x68,0x8c,0x2b,0x3e,0x6c,0x1f,
++			0x1f,0x83,0xd9,0xab,0xfb,0x41,0xbd,0x6b, 0x5b,0xe0,0xcd,0x19,0x13,0x7e,0x21,0x79 };
++		switch (t_) {
++		case md::md5: memcpy(state_, iv_md5, 16); break;
++		case md::sha1: memcpy(state_, iv_sha1, 20); break;
++		case md::sha256: memcpy(state_, iv_sha256, 32); break;
++		case md::sha384: memcpy(state_, iv_sha384, 64); break;
++		case md::sha512: memcpy(state_, iv_sha512, 64); break;
++		}
++		blocks_ = 0;
++		used_ = 0;
+ 	}
+ 
+-private:
+-	md5_ctx ctx_;
+-};
+-
+-class hash_accumulator_sha1 final : public hash_accumulator::impl
+-{
+-public:
+-	hash_accumulator_sha1()
++	void compress(uint8_t const* data, size_t n)
+ 	{
+-		reinit();
++		switch (t_) {
++		case md::md5: oc_md5_blocks(state_, data, n); break;
++		case md::sha1: oc_sha1_blocks(state_, data, n); break;
++		case md::sha256: oc_sha256_blocks(state_, data, n); break;
++		default: oc_sha512_blocks(state_, data, n); break;
++		}
++		blocks_ += n;
+ 	}
+ 
+-	~hash_accumulator_sha1() noexcept
++	void update(uint8_t const* data, size_t size)
+ 	{
+-		wipe(&ctx_, sizeof(ctx_));
+-	}
+-
+-	virtual size_t digest_size() const override { return SHA1_DIGEST_SIZE; }
+-
+-	virtual void update(uint8_t const* data, size_t size) override
+-	{
+-		nettle_sha1_update(&ctx_, size, data);
++		size_t const bs = block_size();
++		if (used_) {
++			size_t n = std::min(bs - used_, size);
++			memcpy(block_ + used_, data, n);
++			used_ += n;
++			data += n;
++			size -= n;
++			if (used_ < bs) {
++				return;
++			}
++			compress(block_, 1);
++			used_ = 0;
++		}
++		if (size >= bs) {
++			size_t const n = size / bs;
++			compress(data, n);
++			data += n * bs;
++			size -= n * bs;
++		}
++		if (size) {
++			memcpy(block_, data, size);
++			used_ = size;
++		}
+ 	}
+ 
+-	virtual void reinit() override
++	void digest(uint8_t* out)
+ 	{
+-		nettle_sha1_init(&ctx_);
++		size_t const bs = block_size();
++		size_t const lenbytes = bs == 128 ? 16 : 8;
++		uint64_t const bits = (blocks_ * bs + used_) * 8;
++		block_[used_++] = 0x80;
++		if (used_ > bs - lenbytes) {
++			memset(block_ + used_, 0, bs - used_);
++			compress(block_, 1);
++			used_ = 0;
++		}
++		memset(block_ + used_, 0, bs - used_);
++		for (size_t i = 0; i < 8; ++i) {
++			uint8_t const b = static_cast<uint8_t>(bits >> (8 * i));
++			if (t_ == md::md5) {
++				block_[bs - 8 + i] = b;
++			}
++			else {
++				block_[bs - 1 - i] = b;
++			}
++		}
++		compress(block_, 1);
++		memcpy(out, state_, digest_size());
++		init();
+ 	}
+ 
+-	virtual std::vector<uint8_t> export_state() override
++	// SHA-1's state as Nettle exported it: version 0, the five words
++	// little-endian, the block count, the bytes of the unfinished block
++	std::vector<uint8_t> export_sha1() const
+ 	{
+-		static_assert(sizeof(ctx_.state[0]) == 4);
+-		static_assert(sizeof(ctx_.count) == 8);
+-
+-		std::vector<uint8_t> ret;
+-		ret.resize(1 + _SHA1_DIGEST_LENGTH * 4 + 8 + ctx_.index);
+-
+-		// version
++		std::vector<uint8_t> ret(1 + 20 + 8 + used_);
+ 		uint8_t* out = ret.data();
+ 		*(out++) = 0;
+-
+-		// state
+-		for (size_t i = 0; i < _SHA1_DIGEST_LENGTH; ++i) {
+-			uint32_t s = ctx_.state[i];
++		for (size_t i = 0; i < 5; ++i) {
+ 			for (size_t j = 0; j < 4; ++j) {
+-				*(out++) = s & 0xffu;
+-				s >>= 8;
++				*(out++) = state_[i * 4 + 3 - j];
+ 			}
+ 		}
+-
+-		// count
+-		uint64_t c = ctx_.count;
++		uint64_t c = blocks_;
+ 		for (size_t i = 0; i < 8; ++i) {
+ 			*(out++) = c & 0xffu;
+ 			c >>= 8;
+ 		}
+-
+-		// index and block
+-		memcpy(out, ctx_.block, ctx_.index);
+-
++		memcpy(out, block_, used_);
+ 		return ret;
+ 	}
+ 
+-	virtual bool import_state(std::vector<uint8_t> const& state) override
++	bool import_sha1(std::vector<uint8_t> const& state)
+ 	{
+-		if (state.size() < 1 + _SHA1_DIGEST_LENGTH * 4 + 8) {
++		if (state.size() < 1 + 20 + 8 || state.size() > 1 + 20 + 8 + 64) {
+ 			return false;
+ 		}
+-
+-		if (state.size() > 1 + _SHA1_DIGEST_LENGTH * 4 + 8 + SHA1_BLOCK_SIZE) {
+-			return false;
+-		}
+-
+ 		uint8_t const* in = state.data();
+ 		if (*(in++) != 0) {
+ 			return false;
+ 		}
+-
+-		for (size_t i = 0; i < _SHA1_DIGEST_LENGTH; ++i) {
+-			ctx_.state[i] = 0;
++		for (size_t i = 0; i < 5; ++i) {
+ 			for (size_t j = 0; j < 4; ++j) {
+-				ctx_.state[i] |= static_cast<uint32_t>(*(in++)) << (j * 8);
++				state_[i * 4 + 3 - j] = *(in++);
+ 			}
+ 		}
+-
+-		ctx_.count = 0;
++		blocks_ = 0;
+ 		for (size_t i = 0; i < 8; ++i) {
+-			ctx_.count |= static_cast<uint64_t>(*(in++)) << (i * 8);
++			blocks_ |= static_cast<uint64_t>(*(in++)) << (i * 8);
+ 		}
++		used_ = state.size() - (1 + 20 + 8);
++		if (used_ == 64) {
++			return false;
++		}
++		memcpy(block_, in, used_);
++		return true;
++	}
+ 
+-		ctx_.index = state.size() - (1 + _SHA1_DIGEST_LENGTH * 4 + 8);
+-		memcpy(ctx_.block, in, ctx_.index);
++private:
++	md t_;
++	uint8_t state_[64];
++	uint8_t block_[128];
++	uint64_t blocks_{};
++	size_t used_{};
++};
+ 
+-		return true;
++class hash_accumulator_md final : public hash_accumulator::impl
++{
++public:
++	explicit hash_accumulator_md(md t)
++		: h_(t)
++	{}
++
++	virtual size_t digest_size() const override { return h_.digest_size(); }
++	virtual void update(uint8_t const* data, size_t size) override { h_.update(data, size); }
++	virtual void reinit() override { h_.init(); }
++	virtual void digest(uint8_t* out) override { h_.digest(out); }
++
++protected:
++	md_hash h_;
++};
++
++class hash_accumulator_sha1 final : public hash_accumulator::impl
++{
++public:
++	hash_accumulator_sha1()
++		: h_(md::sha1)
++	{}
++
++	virtual size_t digest_size() const override { return 20; }
++	virtual void update(uint8_t const* data, size_t size) override { h_.update(data, size); }
++	virtual void reinit() override { h_.init(); }
++	virtual void digest(uint8_t* out) override { h_.digest(out); }
++
++	virtual std::vector<uint8_t> export_state() override
++	{
++		return h_.export_sha1();
++	}
++
++	virtual bool import_state(std::vector<uint8_t> const& state) override
++	{
++		return h_.import_sha1(state);
+ 	}
+ 
+ 	virtual bool selftest() override
+@@ -251,449 +325,155 @@
+ 		return result;
+ 	}
+ 
+-	virtual void digest(uint8_t* out) override
+-	{
+-#if NETTLE_VERSION_MAJOR >= 4
+-		nettle_sha1_digest(&ctx_, out);
+-#else
+-		nettle_sha1_digest(&ctx_, SHA1_DIGEST_SIZE, out);
+-#endif
+-	}
+-
+ private:
+-	sha1_ctx ctx_;
++	md_hash h_;
+ };
+ 
+-class hash_accumulator_sha256 final : public hash_accumulator::impl
++class hash_accumulator_sha3 final : public hash_accumulator::impl
+ {
+ public:
+-	hash_accumulator_sha256()
++	explicit hash_accumulator_sha3(int variant)
++		: variant_(variant)
+ 	{
+ 		reinit();
+ 	}
+ 
+-	~hash_accumulator_sha256() noexcept
++	~hash_accumulator_sha3() noexcept
+ 	{
+ 		wipe(&ctx_, sizeof(ctx_));
+ 	}
+ 
+-	virtual size_t digest_size() const override { return SHA256_DIGEST_SIZE; }
+-
+-	virtual void update(uint8_t const* data, size_t size) override
+-	{
+-		nettle_sha256_update(&ctx_, size, data);
+-	}
+-
+-	virtual void reinit() override
+-	{
+-		nettle_sha256_init(&ctx_);
+-	}
+-
++	virtual size_t digest_size() const override { return static_cast<size_t>(variant_) / 8; }
++	virtual void update(uint8_t const* data, size_t size) override { oc_sha3_update(&ctx_, data, size); }
++	virtual void reinit() override { oc_sha3_init(&ctx_, variant_); }
+ 	virtual void digest(uint8_t* out) override
+ 	{
+-#if NETTLE_VERSION_MAJOR >= 4
+-		nettle_sha256_digest(&ctx_, out);
+-#else
+-		nettle_sha256_digest(&ctx_, SHA256_DIGEST_SIZE, out);
+-#endif
+-	}
+-
+-private:
+-	sha256_ctx ctx_;
+-};
+-
+-class hash_accumulator_sha512 final : public hash_accumulator::impl
+-{
+-public:
+-	hash_accumulator_sha512()
+-	{
++		oc_sha3_final(&ctx_, out, digest_size());
+ 		reinit();
+ 	}
+ 
+-	~hash_accumulator_sha512() noexcept
+-	{
+-		wipe(&ctx_, sizeof(ctx_));
+-	}
+-
+-	virtual size_t digest_size() const override { return SHA512_DIGEST_SIZE; }
+-
+-	virtual void update(uint8_t const* data, size_t size) override final
+-	{
+-		nettle_sha512_update(&ctx_, size, data);
+-	}
+-
+-	virtual void reinit() override final
+-	{
+-		nettle_sha512_init(&ctx_);
+-	}
+-
+-	virtual void digest(uint8_t* out) override final
+-	{
+-#if NETTLE_VERSION_MAJOR >= 4
+-		nettle_sha512_digest(&ctx_, out);
+-#else
+-		nettle_sha512_digest(&ctx_, SHA512_DIGEST_SIZE, out);
+-#endif
+-	}
+-
+-protected:
+-	sha512_ctx ctx_;
+-};
+-
+-class hash_accumulator_sha384 final : public hash_accumulator::impl
+-{
+-public:
+-	hash_accumulator_sha384()
+-	{
+-		reinit();
+-	}
+-
+-	~hash_accumulator_sha384() noexcept
+-	{
+-		wipe(&ctx_, sizeof(ctx_));
+-	}
+-
+-	virtual size_t digest_size() const override { return SHA384_DIGEST_SIZE; }
+-
+-	virtual void update(uint8_t const* data, size_t size) override final
+-	{
+-		sha384_update(&ctx_, size, data);
+-	}
+-
+-	virtual void reinit() override final
+-	{
+-		nettle_sha384_init(&ctx_);
+-	}
+-
+-	virtual void digest(uint8_t* out) override
+-	{
+-#if NETTLE_VERSION_MAJOR >= 4
+-		nettle_sha384_digest(&ctx_, out);
+-#else
+-		nettle_sha384_digest(&ctx_, SHA384_DIGEST_SIZE, out);
+-#endif
+-	}
+-
+-protected:
+-	sha384_ctx ctx_;
+-};
+-
+-class hash_accumulator_sha3_256 : public hash_accumulator::impl
+-{
+-public:
+-	hash_accumulator_sha3_256()
+-	{
+-		reinit();
+-	}
+-
+-	~hash_accumulator_sha3_256() noexcept
+-	{
+-		wipe(&ctx_, sizeof(ctx_));
+-	}
+-
+-	virtual size_t digest_size() const override { return SHA3_256_DIGEST_SIZE; }
+-
+-	virtual void update(uint8_t const* data, size_t size) override final
+-	{
+-		nettle_sha3_256_update(&ctx_, size, data);
+-	}
+-
+-	virtual void reinit() override final
+-	{
+-#if NETTLE_VERSION_MAJOR >= 4
+-		nettle_sha3_init(&ctx_);
+-#else
+-		nettle_sha3_256_init(&ctx_);
+-#endif
+-	}
+-
+-	virtual void digest(uint8_t* out) override
+-	{
+-#if NETTLE_VERSION_MAJOR >= 4
+-		nettle_sha3_256_digest(&ctx_, out);
+-#else
+-		nettle_sha3_256_digest(&ctx_, SHA3_256_DIGEST_SIZE, out);
+-#endif
+-	}
+-
+-protected:
+-	sha3_256_ctx ctx_;
+-};
+-
+-
+-class hash_accumulator_sha3_384 : public hash_accumulator::impl
+-{
+-public:
+-	hash_accumulator_sha3_384()
+-	{
+-		reinit();
+-	}
+-
+-	~hash_accumulator_sha3_384() noexcept
+-	{
+-		wipe(&ctx_, sizeof(ctx_));
+-	}
+-
+-	virtual size_t digest_size() const override { return SHA3_384_DIGEST_SIZE; }
+-
+-	virtual void update(uint8_t const* data, size_t size) override final
+-	{
+-		nettle_sha3_384_update(&ctx_, size, data);
+-	}
+-
+-	virtual void reinit() override final
+-	{
+-#if NETTLE_VERSION_MAJOR >= 4
+-		nettle_sha3_init(&ctx_);
+-#else
+-		nettle_sha3_384_init(&ctx_);
+-#endif
+-	}
+-
+-	virtual void digest(uint8_t* out) override
+-	{
+-#if NETTLE_VERSION_MAJOR >= 4
+-		nettle_sha3_384_digest(&ctx_, out);
+-#else
+-		nettle_sha3_384_digest(&ctx_, SHA3_384_DIGEST_SIZE, out);
+-#endif
+-	}
+-
+-protected:
+-	sha3_384_ctx ctx_;
++private:
++	int variant_;
++	OCSHA3 ctx_;
+ };
+ 
+-
+-class hash_accumulator_sha3_512 : public hash_accumulator::impl
++// HMAC (RFC 2104) over the hashes above
++class hash_accumulator_hmac final : public hash_accumulator::impl
+ {
+ public:
+-	hash_accumulator_sha3_512()
++	hash_accumulator_hmac(md t, size_t keysize, uint8_t const* key)
++		: inner_(t)
++		, outer_(t)
++		, t_(t)
+ 	{
++		size_t const bs = inner_.block_size();
++		uint8_t k[128]{};
++		if (keysize > bs) {
++			md_hash h(t);
++			h.update(key, keysize);
++			h.digest(k);
++		}
++		else if (keysize) {
++			memcpy(k, key, keysize);
++		}
++		for (size_t i = 0; i < bs; ++i) {
++			ipad_[i] = k[i] ^ 0x36;
++			opad_[i] = k[i] ^ 0x5c;
++		}
++		wipe(k, sizeof(k));
+ 		reinit();
+ 	}
+ 
+-	~hash_accumulator_sha3_512() noexcept
+-	{
+-		wipe(&ctx_, sizeof(ctx_));
+-	}
+-
+-	virtual size_t digest_size() const override { return SHA3_512_DIGEST_SIZE; }
+-
+-	virtual void update(uint8_t const* data, size_t size) override final
+-	{
+-		nettle_sha3_512_update(&ctx_, size, data);
+-	}
+-
+-	virtual void reinit() override final
+-	{
+-#if NETTLE_VERSION_MAJOR >= 4
+-		nettle_sha3_init(&ctx_);
+-#else
+-		nettle_sha3_512_init(&ctx_);
+-#endif
+-	}
+-
+-	virtual void digest(uint8_t* out) override
+-	{
+-#if NETTLE_VERSION_MAJOR >= 4
+-		nettle_sha3_512_digest(&ctx_, out);
+-#else
+-		nettle_sha3_512_digest(&ctx_, SHA3_512_DIGEST_SIZE, out);
+-#endif
+-	}
+-
+-protected:
+-	sha3_512_ctx ctx_;
+-};
+-
+-
+-class hash_accumulator_hmac_sha256 final : public hash_accumulator::impl
+-{
+-public:
+-	hash_accumulator_hmac_sha256(size_t keysize, uint8_t const* key)
+-	{
+-		nettle_hmac_sha256_set_key(&ctx_, keysize, key);
+-	}
+-
+-	~hash_accumulator_hmac_sha256() noexcept
++	~hash_accumulator_hmac() noexcept
+ 	{
+-		wipe(&ctx_, sizeof(ctx_));
+-	}
+-
+-	virtual size_t digest_size() const override { return SHA256_DIGEST_SIZE; }
+-
+-	virtual void update(uint8_t const* data, size_t size) override
+-	{
+-		nettle_hmac_sha256_update(&ctx_, size, data);
++		wipe(ipad_, sizeof(ipad_));
++		wipe(opad_, sizeof(opad_));
+ 	}
+ 
++	virtual size_t digest_size() const override { return inner_.digest_size(); }
++	virtual void update(uint8_t const* data, size_t size) override { inner_.update(data, size); }
+ 	virtual void reinit() override
+ 	{
+-		uint8_t buf[SHA256_DIGEST_SIZE];
+-#if NETTLE_VERSION_MAJOR >= 4
+-		nettle_hmac_sha256_digest(&ctx_, buf);
+-#else
+-		nettle_hmac_sha256_digest(&ctx_, SHA256_DIGEST_SIZE, buf);
+-#endif
++		inner_.init();
++		inner_.update(ipad_, inner_.block_size());
+ 	}
+-
+ 	virtual void digest(uint8_t* out) override
+ 	{
+-#if NETTLE_VERSION_MAJOR >= 4
+-		nettle_hmac_sha256_digest(&ctx_, out);
+-#else
+-		nettle_hmac_sha256_digest(&ctx_, SHA256_DIGEST_SIZE, out);
+-#endif
++		uint8_t d[64];
++		inner_.digest(d);
++		outer_.init();
++		outer_.update(opad_, outer_.block_size());
++		outer_.update(d, inner_.digest_size());
++		outer_.digest(out);
++		wipe(d, sizeof(d));
++		reinit();
+ 	}
+ 
+ private:
+-	hmac_sha256_ctx ctx_;
++	md_hash inner_;
++	md_hash outer_;
++	md t_;
++	uint8_t ipad_[128];
++	uint8_t opad_[128];
+ };
+ 
+-class hash_accumulator_hmac_sha512 final : public hash_accumulator::impl
++md to_md(hmac_algorithm a)
+ {
+-public:
+-	hash_accumulator_hmac_sha512(size_t keysize, uint8_t const* key)
+-	{
+-		nettle_hmac_sha512_set_key(&ctx_, keysize, key);
+-	}
+-
+-	~hash_accumulator_hmac_sha512() noexcept
+-	{
+-		wipe(&ctx_, sizeof(ctx_));
++	switch (a) {
++	case hmac_algorithm::sha1: return md::sha1;
++	case hmac_algorithm::sha256: return md::sha256;
++	default: return md::sha512;
+ 	}
++}
+ 
+-	virtual size_t digest_size() const override { return SHA512_DIGEST_SIZE; }
+-
+-	virtual void update(uint8_t const* data, size_t size) override
+-	{
+-		nettle_hmac_sha512_update(&ctx_, size, data);
+-	}
+-
+-	virtual void reinit() override
+-	{
+-		uint8_t buf[SHA512_DIGEST_SIZE];
+-#if NETTLE_VERSION_MAJOR >= 4
+-		nettle_hmac_sha512_digest(&ctx_, buf);
+-#else
+-		nettle_hmac_sha512_digest(&ctx_, SHA512_DIGEST_SIZE, buf);
+-#endif
+-	}
+-
+-	virtual void digest(uint8_t* out) override
+-	{
+-#if NETTLE_VERSION_MAJOR >= 4
+-		nettle_hmac_sha512_digest(&ctx_, out);
+-#else
+-		nettle_hmac_sha512_digest(&ctx_, SHA512_DIGEST_SIZE, out);
+-#endif
+-	}
+-
+-private:
+-	hmac_sha512_ctx ctx_;
+-};
+-
+-class hash_accumulator_hmac_sha1 final : public hash_accumulator::impl
++int to_oc_hash(hmac_algorithm a)
+ {
+-public:
+-	hash_accumulator_hmac_sha1(size_t keysize, uint8_t const* key)
+-	{
+-		nettle_hmac_sha1_set_key(&ctx_, keysize, key);
+-	}
+-
+-	~hash_accumulator_hmac_sha1() noexcept
+-	{
+-		wipe(&ctx_, sizeof(ctx_));
++	switch (a) {
++	case hmac_algorithm::sha1: return OC_HASH_SHA1;
++	case hmac_algorithm::sha256: return OC_HASH_SHA256;
++	default: return OC_HASH_SHA512;
+ 	}
+-
+-	virtual size_t digest_size() const override { return SHA1_DIGEST_SIZE; }
+-
+-	virtual void update(uint8_t const* data, size_t size) override
+-	{
+-		nettle_hmac_sha1_update(&ctx_, size, data);
+-	}
+-
+-	virtual void reinit() override
+-	{
+-		uint8_t buf[SHA1_DIGEST_SIZE];
+-#if NETTLE_VERSION_MAJOR >= 4
+-		nettle_hmac_sha1_digest(&ctx_, buf);
+-#else
+-		nettle_hmac_sha1_digest(&ctx_, SHA1_DIGEST_SIZE, buf);
+-#endif
+-	}
+-
+-	virtual void digest(uint8_t* out) override
+-	{
+-#if NETTLE_VERSION_MAJOR >= 4
+-		nettle_hmac_sha1_digest(&ctx_, out);
+-#else
+-		nettle_hmac_sha1_digest(&ctx_, SHA1_DIGEST_SIZE, out);
+-#endif
+-	}
+-
+-private:
+-	hmac_sha1_ctx ctx_;
+-};
++}
++}
+ 
+ hash_accumulator::hash_accumulator(hash_algorithm algorithm)
+ {
+ 	switch (algorithm) {
+ 	case hash_algorithm::md5:
+-		impl_ = new hash_accumulator_md5;
++		impl_ = new hash_accumulator_md(md::md5);
+ 		break;
+ 	case hash_algorithm::sha1:
+ 		impl_ = new hash_accumulator_sha1;
+ 		break;
+ 	case hash_algorithm::sha256:
+-		impl_ = new hash_accumulator_sha256;
++		impl_ = new hash_accumulator_md(md::sha256);
+ 		break;
+ 	case hash_algorithm::sha384:
+-		impl_ = new hash_accumulator_sha384;
++		impl_ = new hash_accumulator_md(md::sha384);
+ 		break;
+ 	case hash_algorithm::sha512:
+-		impl_ = new hash_accumulator_sha512;
++		impl_ = new hash_accumulator_md(md::sha512);
+ 		break;
+ 	case hash_algorithm::sha3_256:
+-		impl_ = new hash_accumulator_sha3_256;
++		impl_ = new hash_accumulator_sha3(OC_SHA3_256);
+ 		break;
+ 	case hash_algorithm::sha3_384:
+-		impl_ = new hash_accumulator_sha3_384;
++		impl_ = new hash_accumulator_sha3(OC_SHA3_384);
+ 		break;
+ 	case hash_algorithm::sha3_512:
+-		impl_ = new hash_accumulator_sha3_512;
++		impl_ = new hash_accumulator_sha3(OC_SHA3_512);
+ 		break;
+ 	}
+ }
+ 
+ hash_accumulator::hash_accumulator(hmac_algorithm algorithm, std::vector<uint8_t> const& key)
+ {
+-	switch (algorithm) {
+-	case hmac_algorithm::sha512:
+-		impl_ = new hash_accumulator_hmac_sha512(key.size(), key.data());
+-		break;
+-	case hmac_algorithm::sha256:
+-		impl_ = new hash_accumulator_hmac_sha256(key.size(), key.data());
+-		break;
+-	case hmac_algorithm::sha1:
+-		impl_ = new hash_accumulator_hmac_sha1(key.size(), key.data());
+-		break;
+-	}
++	impl_ = new hash_accumulator_hmac(to_md(algorithm), key.size(), key.data());
+ }
+ 
+ hash_accumulator::hash_accumulator(hmac_algorithm algorithm, std::string_view const& key)
+ {
+-	switch (algorithm) {
+-	case hmac_algorithm::sha512:
+-		impl_ = new hash_accumulator_hmac_sha512(key.size(), reinterpret_cast<uint8_t const*>(key.data()));
+-		break;
+-	case hmac_algorithm::sha256:
+-		impl_ = new hash_accumulator_hmac_sha256(key.size(), reinterpret_cast<uint8_t const*>(key.data()));
+-		break;
+-	case hmac_algorithm::sha1:
+-		impl_ = new hash_accumulator_hmac_sha1(key.size(), reinterpret_cast<uint8_t const*>(key.data()));
+-		break;
+-	}
++	impl_ = new hash_accumulator_hmac(to_md(algorithm), key.size(), reinterpret_cast<uint8_t const*>(key.data()));
+ }
+ 
+ hash_accumulator::~hash_accumulator()
+@@ -778,7 +558,7 @@
+ 	}
+ 	uint8_t buf[max_digest_length];
+ 	impl_->digest(buf);
+-	return memeql_sec(ref, buf, s);
++	return oc_ct_equal(ref, buf, s) != 0;
+ }
+ 
+ std::vector<std::uint8_t> hash_accumulator::export_state()
+@@ -804,8 +584,8 @@
+ 
+ void hash_accumulator::update_uint32_be(uint32_t v)
+ {
+-	v = htonl(v);
+-	update(reinterpret_cast<uint8_t const*>(&v), 4);
++	uint8_t const b[4] = { static_cast<uint8_t>(v >> 24), static_cast<uint8_t>(v >> 16), static_cast<uint8_t>(v >> 8), static_cast<uint8_t>(v) };
++	update(b, 4);
+ }
+ 
+ void hash_accumulator::update_with_length(std::string_view const& data)
+@@ -815,207 +595,55 @@
+ }
+ 
+ namespace {
+-// In C++17, require ContiguousContainer
+-template<typename DataContainer>
+-std::vector<uint8_t> md5_impl(DataContainer const& in)
+-{
+-	static_assert(sizeof(typename DataContainer::value_type) == 1, "Bad container type");
+-
+-	hash_accumulator_md5 acc;
+-	if (!in.empty()) {
+-		acc.update(reinterpret_cast<uint8_t const*>(in.data()), in.size());
+-	}
+-	std::vector<uint8_t> ret;
+-	ret.resize(MD5_DIGEST_SIZE);
+-	acc.digest(ret.data());
+-	return ret;
+-}
+-
+ template<typename DataContainer>
+-std::vector<uint8_t> sha1_impl(DataContainer const& in)
++std::vector<uint8_t> md_impl(md t, DataContainer const& in)
+ {
+ 	static_assert(sizeof(typename DataContainer::value_type) == 1, "Bad container type");
+ 
+-	hash_accumulator_sha1 acc;
++	md_hash h(t);
+ 	if (!in.empty()) {
+-		acc.update(reinterpret_cast<uint8_t const*>(in.data()), in.size());
++		h.update(reinterpret_cast<uint8_t const*>(in.data()), in.size());
+ 	}
+-	std::vector<uint8_t> ret;
+-	ret.resize(SHA1_DIGEST_SIZE);
+-	acc.digest(ret.data());
+-	return ret;
+-
+-}
+-
+-template<typename DataContainer>
+-std::vector<uint8_t> sha256_impl(DataContainer const& in)
+-{
+-	static_assert(sizeof(typename DataContainer::value_type) == 1, "Bad container type");
+-
+-	hash_accumulator_sha256 acc;
+-	if (!in.empty()) {
+-		acc.update(reinterpret_cast<uint8_t const*>(in.data()), in.size());
+-	}
+-	std::vector<uint8_t> ret;
+-	ret.resize(SHA256_DIGEST_SIZE);
+-	acc.digest(ret.data());
+-	return ret;
+-
+-}
+-
+-template<typename DataContainer>
+-std::vector<uint8_t> sha384_impl(DataContainer const& in)
+-{
+-	static_assert(sizeof(typename DataContainer::value_type) == 1, "Bad container type");
+-
+-	hash_accumulator_sha384 acc;
+-	if (!in.empty()) {
+-		acc.update(reinterpret_cast<uint8_t const*>(in.data()), in.size());
+-	}
+-	std::vector<uint8_t> ret;
+-	ret.resize(SHA384_DIGEST_SIZE);
+-	acc.digest(ret.data());
+-	return ret;
+-
+-}
+-
+-template<typename DataContainer>
+-std::vector<uint8_t> sha512_impl(DataContainer const& in)
+-{
+-	static_assert(sizeof(typename DataContainer::value_type) == 1, "Bad container type");
+-
+-	hash_accumulator_sha512 acc;
+-	if (!in.empty()) {
+-		acc.update(reinterpret_cast<uint8_t const*>(in.data()), in.size());
+-	}
+-	std::vector<uint8_t> ret;
+-	ret.resize(SHA512_DIGEST_SIZE);
+-	acc.digest(ret.data());
+-	return ret;
+-}
+-
+-template<typename KeyContainer, typename DataContainer>
+-std::vector<uint8_t> hmac_sha1_impl(KeyContainer const& key, DataContainer const& data)
+-{
+-	static_assert(sizeof(typename KeyContainer::value_type) == 1, "Bad container type");
+-	static_assert(sizeof(typename DataContainer::value_type) == 1, "Bad container type");
+-
+-	hash_accumulator_hmac_sha1 acc(key.size(), reinterpret_cast<uint8_t const*>(key.data()));
+-	if (!data.empty()) {
+-		acc.update(reinterpret_cast<uint8_t const*>(data.data()), data.size());
+-	}
+-	std::vector<uint8_t> ret;
+-	ret.resize(SHA1_DIGEST_SIZE);
+-	acc.digest(ret.data());
++	std::vector<uint8_t> ret(h.digest_size());
++	h.digest(ret.data());
+ 	return ret;
+ }
+ 
+ template<typename KeyContainer, typename DataContainer>
+-std::vector<uint8_t> hmac_sha256_impl(KeyContainer const& key, DataContainer const& data)
++std::vector<uint8_t> hmac_impl(md t, KeyContainer const& key, DataContainer const& data)
+ {
+ 	static_assert(sizeof(typename KeyContainer::value_type) == 1, "Bad container type");
+ 	static_assert(sizeof(typename DataContainer::value_type) == 1, "Bad container type");
+ 
+-	hash_accumulator_hmac_sha256 acc(key.size(), reinterpret_cast<uint8_t const*>(key.data()));
++	hash_accumulator_hmac acc(t, key.size(), reinterpret_cast<uint8_t const*>(key.data()));
+ 	if (!data.empty()) {
+ 		acc.update(reinterpret_cast<uint8_t const*>(data.data()), data.size());
+ 	}
+-	std::vector<uint8_t> ret;
+-	ret.resize(SHA256_DIGEST_SIZE);
++	std::vector<uint8_t> ret(acc.digest_size());
+ 	acc.digest(ret.data());
+ 	return ret;
+ }
+ }
+ 
+-std::vector<uint8_t> md5(std::vector<uint8_t> const& data)
+-{
+-	return md5_impl(data);
+-}
+-
+-std::vector<uint8_t> md5(std::string_view const& data)
+-{
+-	return md5_impl(data);
+-}
+-
+-std::vector<uint8_t> sha1(std::vector<uint8_t> const& data)
+-{
+-	return sha1_impl(data);
+-}
+-
+-std::vector<uint8_t> sha1(std::string_view const& data)
+-{
+-	return sha1_impl(data);
+-}
+-
+-std::vector<uint8_t> sha256(std::vector<uint8_t> const& data)
+-{
+-	return sha256_impl(data);
+-}
+-
+-std::vector<uint8_t> sha256(std::string_view const& data)
+-{
+-	return sha256_impl(data);
+-}
+-
+-std::vector<uint8_t> sha384(std::vector<uint8_t> const& data)
+-{
+-	return sha384_impl(data);
+-}
+-
+-std::vector<uint8_t> sha384(std::string_view const& data)
+-{
+-	return sha384_impl(data);
+-}
+-
+-std::vector<uint8_t> sha512(std::vector<uint8_t> const& data)
+-{
+-	return sha512_impl(data);
+-}
+-
+-std::vector<uint8_t> sha512(std::string_view const& data)
+-{
+-	return sha512_impl(data);
+-}
+-
+-std::vector<uint8_t> hmac_sha1(std::string_view const& key, std::string_view const& data)
+-{
+-	return hmac_sha1_impl(key, data);
+-}
+-
+-std::vector<uint8_t> hmac_sha1(std::vector<uint8_t> const& key, std::vector<uint8_t> const& data)
+-{
+-	return hmac_sha1_impl(key, data);
+-}
+-
+-std::vector<uint8_t> hmac_sha1(std::vector<uint8_t> const& key, std::string_view const& data)
+-{
+-	return hmac_sha1_impl(key, data);
+-}
+-
+-std::vector<uint8_t> hmac_sha1(std::string_view const& key, std::vector<uint8_t> const& data)
+-{
+-	return hmac_sha1_impl(key, data);
+-}
+-
+-std::vector<uint8_t> hmac_sha256(std::string_view const& key, std::string_view const& data)
+-{
+-	return hmac_sha256_impl(key, data);
+-}
+-
+-std::vector<uint8_t> hmac_sha256(std::vector<uint8_t> const& key, std::vector<uint8_t> const& data)
+-{
+-	return hmac_sha256_impl(key, data);
+-}
+-
+-std::vector<uint8_t> hmac_sha256(std::vector<uint8_t> const& key, std::string_view const& data)
+-{
+-	return hmac_sha256_impl(key, data);
+-}
+-
+-std::vector<uint8_t> hmac_sha256(std::string_view const& key, std::vector<uint8_t> const& data)
+-{
+-	return hmac_sha256_impl(key, data);
+-}
++std::vector<uint8_t> md5(std::vector<uint8_t> const& data) { return md_impl(md::md5, data); }
++std::vector<uint8_t> md5(std::string_view const& data) { return md_impl(md::md5, data); }
++std::vector<uint8_t> sha1(std::vector<uint8_t> const& data) { return md_impl(md::sha1, data); }
++std::vector<uint8_t> sha1(std::string_view const& data) { return md_impl(md::sha1, data); }
++std::vector<uint8_t> sha256(std::vector<uint8_t> const& data) { return md_impl(md::sha256, data); }
++std::vector<uint8_t> sha256(std::string_view const& data) { return md_impl(md::sha256, data); }
++std::vector<uint8_t> sha384(std::vector<uint8_t> const& data) { return md_impl(md::sha384, data); }
++std::vector<uint8_t> sha384(std::string_view const& data) { return md_impl(md::sha384, data); }
++std::vector<uint8_t> sha512(std::vector<uint8_t> const& data) { return md_impl(md::sha512, data); }
++std::vector<uint8_t> sha512(std::string_view const& data) { return md_impl(md::sha512, data); }
++
++std::vector<uint8_t> hmac_sha1(std::string_view const& key, std::string_view const& data) { return hmac_impl(md::sha1, key, data); }
++std::vector<uint8_t> hmac_sha1(std::vector<uint8_t> const& key, std::vector<uint8_t> const& data) { return hmac_impl(md::sha1, key, data); }
++std::vector<uint8_t> hmac_sha1(std::vector<uint8_t> const& key, std::string_view const& data) { return hmac_impl(md::sha1, key, data); }
++std::vector<uint8_t> hmac_sha1(std::string_view const& key, std::vector<uint8_t> const& data) { return hmac_impl(md::sha1, key, data); }
++std::vector<uint8_t> hmac_sha256(std::string_view const& key, std::string_view const& data) { return hmac_impl(md::sha256, key, data); }
++std::vector<uint8_t> hmac_sha256(std::vector<uint8_t> const& key, std::vector<uint8_t> const& data) { return hmac_impl(md::sha256, key, data); }
++std::vector<uint8_t> hmac_sha256(std::vector<uint8_t> const& key, std::string_view const& data) { return hmac_impl(md::sha256, key, data); }
++std::vector<uint8_t> hmac_sha256(std::string_view const& key, std::vector<uint8_t> const& data) { return hmac_impl(md::sha256, key, data); }
+ 
+ std::vector<uint8_t> pbkdf2_hmac_sha256(std::basic_string_view<uint8_t> const& password, std::basic_string_view<uint8_t> const& salt, size_t length, unsigned int iterations)
+ {
+@@ -1023,7 +651,9 @@
+ 
+ 	if (!password.empty() && !salt.empty() && iterations) {
+ 		ret.resize(length);
+-		nettle_pbkdf2_hmac_sha256(password.size(), password.data(), iterations, salt.size(), salt.data(), length, ret.data());
++		if (oc_pbkdf2(OC_HASH_SHA256, password.data(), password.size(), salt.data(), salt.size(), iterations, ret.data(), length)) {
++			ret.clear();
++		}
+ 	}
+ 
+ 	return ret;
+@@ -1033,9 +663,11 @@
+ {
+ 	std::vector<uint8_t> ret;
+ 
+-	if (!password.empty() && !salt.empty()) {
++	if (!password.empty() && !salt.empty() && iterations) {
+ 		ret.resize(length);
+-		nettle_pbkdf2_hmac_sha1(password.size(), password.data(), iterations, salt.size(), salt.data(), length, ret.data());
++		if (oc_pbkdf2(OC_HASH_SHA1, password.data(), password.size(), salt.data(), salt.size(), iterations, ret.data(), length)) {
++			ret.clear();
++		}
+ 	}
+ 
+ 	return ret;
+@@ -1049,18 +681,10 @@
+ 
+ 	secure_buffer ret;
+ 	ret.resize(length);
+-	switch (alg) {
+-	case hmac_algorithm::sha1:
+-		nettle_pbkdf2_hmac_sha1(password.size(), reinterpret_cast<uint8_t const*>(password.data()), iterations, salt.size(), reinterpret_cast<uint8_t const*>(salt.data()), length, ret.data());
+-		return ret;
+-	case hmac_algorithm::sha256:
+-		nettle_pbkdf2_hmac_sha256(password.size(), reinterpret_cast<uint8_t const*>(password.data()), iterations, salt.size(), reinterpret_cast<uint8_t const*>(salt.data()), length, ret.data());
+-		return ret;
+-	case hmac_algorithm::sha512:
+-		nettle_pbkdf2_hmac_sha512(password.size(), reinterpret_cast<uint8_t const*>(password.data()), iterations, salt.size(), reinterpret_cast<uint8_t const*>(salt.data()), length, ret.data());
+-		return ret;
++	if (oc_pbkdf2(to_oc_hash(alg), password.data(), password.size(), salt.data(), salt.size(), iterations, ret.data(), length)) {
++		return {};
+ 	}
+-	return {};
++	return ret;
+ }
+ 
+ }
+diff -ruN a/lib/jws.cpp b/lib/jws.cpp
+--- a/lib/jws.cpp	2026-11-06 22:54:30.505010279 +0000
++++ b/lib/jws.cpp	2026-11-06 22:54:30.506468642 +0000
+@@ -1,381 +1,33 @@
+-#include "libfilezilla/encode.hpp"
+-#include "libfilezilla/hash.hpp"
++/* JSON Web Keys and Signatures (ACME) are not built on GFOpenCrypto yet:
++ * FileZilla's client does not use them, so they answer nothing.
++ * Copyright (c) 2026 AmiCradle Team. libfilezilla is GPL v2 or later. */
+ #include "libfilezilla/jws.hpp"
+ #include "libfilezilla/logger.hpp"
+ #include "libfilezilla/translate.hpp"
+-#include "libfilezilla/util.hpp"
+-#include <nettle/ecdsa.h>
+-#include <nettle/ecc-curve.h>
+-#include <nettle/rsa.h>
+-
+-#if defined(_MSC_VER)
+-typedef std::make_signed_t<size_t> ssize_t;
+-#endif
+-
+-#include <gnutls/x509.h>
+-
+-#include <memory.h>
+ 
+ namespace fz {
+-namespace {
+-extern "C" void rnd(void *, size_t length, uint8_t *dst)
+-{
+-	random_bytes(length, dst);
+-}
+-
+-std::string to_string(mpz_t n, size_t pad = 0)
+-{
+-	std::string ret;
+-	size_t s = nettle_mpz_sizeinbase_256_u(n);
+-	if (s) {
+-		ret.resize(std::max(s, pad));
+-		size_t offset{};
+-		if (s < pad) {
+-			offset = pad - s;
+-		}
+-		nettle_mpz_get_str_256(s, reinterpret_cast<unsigned char*>(ret.data() + offset), n);
+-	}
+-	return ret;
+-}
+-
+-std::pair<json, json> create_jwk_ecdsa()
+-{
+-	auto curve = nettle_get_secp_256r1();
+-	if (!curve) {
+-		return {};
+-	}
+-
+-	ecc_scalar key;
+-	ecc_point pub;
+-	nettle_ecc_scalar_init(&key, curve);
+-	nettle_ecc_point_init(&pub, curve);
+-	nettle_ecdsa_generate_keypair(&pub, &key, nullptr, &rnd);
+-
+-	mpz_t d;
+-	mpz_init(d);
+-	nettle_ecc_scalar_get(&key, d);
+-
+-	json jpriv;
+-	jpriv["kty"] = "EC";
+-	jpriv["crv"] = "P-256";
+-	jpriv["d"] = fz::base64_encode(to_string(d), base64_type::url, false);
+-
+-	mpz_clear(d);
+-
+-	mpz_t x, y;
+-	mpz_init(x);
+-	mpz_init(y);
+-	nettle_ecc_point_get(&pub, x, y);
+-
+-	json jpub;
+-	jpub["kty"] = "EC";
+-	jpub["crv"] = "P-256";
+-	jpub["x"] = fz::base64_encode(to_string(x), base64_type::url, false);
+-	jpub["y"] = fz::base64_encode(to_string(y), base64_type::url, false);
+-
+-	mpz_clear(x);
+-	mpz_clear(y);
+-
+-	nettle_ecc_scalar_clear(&key);
+-	nettle_ecc_point_clear(&pub);
+-
+-	return {jpriv, jpub};
+-}
+-
+-extern "C" void genramdom(void*, size_t length, uint8_t *dst)
+-{
+-	auto ret = fz::random_bytes(length);
+-	memcpy(dst, ret.data(), length);
+-}
+ 
+-std::pair<json, json> create_jwk_rsa()
++std::pair<json, json> create_jwk(jwk_type)
+ {
+-	rsa_public_key pub;
+-	nettle_rsa_public_key_init(&pub);
+-	mpz_set_ui(pub.e, 65537);
+-
+-	rsa_private_key priv;
+-	nettle_rsa_private_key_init(&priv);
+-
+-	if (!nettle_rsa_generate_keypair(&pub, &priv, nullptr, &genramdom, nullptr, nullptr, 2048, 0)) {
+-		nettle_rsa_public_key_clear(&pub);
+-		nettle_rsa_private_key_clear(&priv);
+-		return {};
+-	}
+-
+-
+-	json jpriv;
+-	jpriv["kty"] = "RSA";
+-	jpriv["p"] = fz::base64_encode(to_string(priv.p), base64_type::url, false);
+-	jpriv["q"] = fz::base64_encode(to_string(priv.q), base64_type::url, false);
+-	jpriv["d"] = fz::base64_encode(to_string(priv.d), base64_type::url, false);
+-	jpriv["dp"] = fz::base64_encode(to_string(priv.a), base64_type::url, false);
+-	jpriv["dq"] = fz::base64_encode(to_string(priv.b), base64_type::url, false);
+-	jpriv["qi"] = fz::base64_encode(to_string(priv.c), base64_type::url, false);
+-	nettle_rsa_private_key_clear(&priv);
+-
+-	json jpub;
+-	jpub["kty"] = "RSA";
+-	jpub["n"] = fz::base64_encode(to_string(pub.n), base64_type::url, false);
+-	jpub["e"] = fz::base64_encode(to_string(pub.e), base64_type::url, false);
+-	nettle_rsa_public_key_clear(&pub);
+-
+-	return {jpriv, jpub};
+-}
+-}
+-
+-// Private and public key
+-std::pair<json, json> create_jwk(jwk_type t)
+-{
+-	switch (t) {
+-	case jwk_type::ecdsa:
+-		return create_jwk_ecdsa();
+-	case jwk_type::rsa:
+-		return create_jwk_rsa();
+-	}
+ 	return {};
+ }
+ 
+-std::string_view FZ_PRIVATE_SYMBOL to_view(gnutls_datum_t const& d);
+-
+-std::pair<json, json> jwk_from_x509_privkey(std::string_view const& data, bool pem, logger_interface* logger)
++std::pair<json, json> jwk_from_x509_privkey(std::string_view const&, bool, logger_interface * logger)
+ {
+-	if (!logger) {
+-		logger = &get_null_logger();
+-	}
+-
+-	gnutls_x509_privkey_t pvk;
+-	gnutls_x509_privkey_init(&pvk);
+-
+-	gnutls_datum_t d;
+-	d.data = const_cast<unsigned char *>(reinterpret_cast<unsigned char const *>(data.data()));
+-	d.size = unsigned(data.size());
+-
+-	auto res = gnutls_x509_privkey_import2(pvk, &d, pem ? GNUTLS_X509_FMT_PEM : GNUTLS_X509_FMT_DER, nullptr, 0);
+-	if (res < 0) {
+-		gnutls_x509_privkey_deinit(pvk);
+-		logger->log(logmsg::error, fztranslate("Could not convert private key to JWK, import failed: %s"), gnutls_strerror(res));
+-		return {};
+-	}
+-
+-	auto alg = gnutls_x509_privkey_get_pk_algorithm(pvk);
+-	if (alg != GNUTLS_PK_RSA && alg != GNUTLS_PK_ECDSA) {
+-		gnutls_x509_privkey_deinit(pvk);
+-		logger->log(logmsg::error, fztranslate("Could not convert private key to JWK, only RSA and ECDSA private keys are supported."));
+-		return {};
++	if (logger) {
++		logger->log(logmsg::error, fztranslate("Could not convert private key to JWK: not supported"));
+ 	}
+-
+-	if (alg == GNUTLS_PK_RSA) {
+-		gnutls_datum_t n{};
+-		gnutls_datum_t e{};
+-		gnutls_datum_t d{};
+-		gnutls_datum_t p{};
+-		gnutls_datum_t q{};
+-		gnutls_datum_t dp{};
+-		gnutls_datum_t dq{};
+-		gnutls_datum_t qi{};
+-
+-		int res = gnutls_x509_privkey_export_rsa_raw2(pvk, &n, &e, &d, &p, &q, &qi, &dp, &dq);
+-		gnutls_x509_privkey_deinit(pvk);
+-		if (res < 0) {
+-			logger->log(logmsg::error, fztranslate("Could not convert private key to JWK, exporting RSA parameters failed: %s"), gnutls_strerror(res));
+-			return {};
+-		}
+-
+-		json jpriv;
+-		jpriv["kty"] = "RSA";
+-		jpriv["p"] = fz::base64_encode(to_view(p), base64_type::url, false);
+-		jpriv["q"] = fz::base64_encode(to_view(q), base64_type::url, false);
+-		jpriv["d"] = fz::base64_encode(to_view(d), base64_type::url, false);
+-		jpriv["dp"] = fz::base64_encode(to_view(dp), base64_type::url, false);
+-		jpriv["dq"] = fz::base64_encode(to_view(dq), base64_type::url, false);
+-		jpriv["qi"] = fz::base64_encode(to_view(qi), base64_type::url, false);
+-		gnutls_free(p.data);
+-		gnutls_free(q.data);
+-		gnutls_free(d.data);
+-		gnutls_free(dp.data);
+-		gnutls_free(dq.data);
+-		gnutls_free(qi.data);
+-
+-		json jpub;
+-		jpub["kty"] = "RSA";
+-		jpub["n"] = fz::base64_encode(to_view(n), base64_type::url, false);
+-		jpub["e"] = fz::base64_encode(to_view(e), base64_type::url, false);
+-		gnutls_free(n.data);
+-		gnutls_free(e.data);
+-
+-		return {jpriv, jpub};
+-	}
+-	else {
+-		gnutls_ecc_curve_t curve{};
+-		gnutls_datum_t x{};
+-		gnutls_datum_t y{};
+-		gnutls_datum_t k{};
+-		int res = gnutls_x509_privkey_export_ecc_raw(pvk, &curve, &x, &y, &k);
+-		gnutls_x509_privkey_deinit(pvk);
+-		if (res < 0) {
+-			logger->log(logmsg::error, fztranslate("Could not convert private key to JWK, exporting ECC parameters failed: %s"), gnutls_strerror(res));
+-			return {};
+-		}
+-		if (curve != GNUTLS_ECC_CURVE_SECP256R1) {
+-			gnutls_free(k.data);
+-			gnutls_free(x.data);
+-			gnutls_free(y.data);
+-			logger->log(logmsg::error, fztranslate("Could not convert private key to JWK, unsupported elliptic curve, only SECP256R1 is supported."));
+-			return {};
+-		}
+-
+-		json jpriv;
+-		jpriv["kty"] = "EC";
+-		jpriv["crv"] = "P-256";
+-		jpriv["d"] = fz::base64_encode(to_view(k), base64_type::url, false);
+-		gnutls_free(k.data);
+-
+-		json jpub;
+-		jpub["kty"] = "EC";
+-		jpub["crv"] = "P-256";
+-		jpub["x"] = fz::base64_encode(to_view(x), base64_type::url, false);
+-		jpub["y"] = fz::base64_encode(to_view(y), base64_type::url, false);
+-		gnutls_free(x.data);
+-		gnutls_free(y.data);
+-
+-		return {jpriv, jpub};
+-	}
+-}
+-
+-namespace {
+-std::string jws_sign_ecdsa(json const& priv, std::vector<uint8_t> const& digest)
+-{
+-	auto const ds = fz::base64_decode_s(priv["d"].string_value());
+-	if (priv["kty"].string_value() != "EC" || priv["crv"].string_value() != "P-256"|| ds.empty()) {
+-		return {};
+-	}
+-
+-	auto curve = nettle_get_secp_256r1();
+-	if (!curve) {
+-		return {};
+-	}
+-
+-	mpz_t d;
+-	mpz_init(d);
+-	nettle_mpz_set_str_256_u(d, ds.size(), reinterpret_cast<uint8_t const*>(ds.c_str()));
+-
+-	ecc_scalar key;
+-	nettle_ecc_scalar_init(&key, curve);
+-	if (!nettle_ecc_scalar_set(&key, d)) {
+-		mpz_clear(d);
+-		nettle_ecc_scalar_clear(&key);
+-		return {};
+-	}
+-	mpz_clear(d);
+-
+-	struct dsa_signature sig;
+-	nettle_dsa_signature_init(&sig);
+-
+-	nettle_ecdsa_sign(&key, nullptr, rnd, digest.size(), digest.data(), &sig);
+-	nettle_ecc_scalar_clear(&key);
+-
+-	std::string ret = fz::base64_encode(to_string(sig.r, 32) + to_string(sig.s, 32), base64_type::url, false);
+-	nettle_dsa_signature_clear(&sig);
+-	return ret;
++	return {};
+ }
+ 
+-std::string jws_sign_rsa(json const& jpriv, std::vector<uint8_t> const& digest)
++json jws_sign_flattened(json const&, json const&, json const&)
+ {
+-	if (digest.size() != 256/8) {
+-		return {};
+-	}
+-
+-	auto p = fz::base64_decode(jpriv["p"].string_value());
+-	auto q = fz::base64_decode(jpriv["q"].string_value());
+-	auto d = fz::base64_decode(jpriv["d"].string_value());
+-	auto a = fz::base64_decode(jpriv["dp"].string_value());
+-	auto b = fz::base64_decode(jpriv["dq"].string_value());
+-	auto c = fz::base64_decode(jpriv["qi"].string_value());
+-	if (p.empty() || q.empty() || d.empty() || a.empty() || b.empty() || c.empty()) {
+-		return {};
+-	}
+-
+-	rsa_private_key priv;
+-	nettle_rsa_private_key_init(&priv);
+-	nettle_mpz_set_str_256_u(priv.p, p.size(), p.data());
+-	nettle_mpz_set_str_256_u(priv.q, q.size(), q.data());
+-	nettle_mpz_set_str_256_u(priv.d, d.size(), d.data());
+-	nettle_mpz_set_str_256_u(priv.a, a.size(), a.data());
+-	nettle_mpz_set_str_256_u(priv.b, b.size(), b.data());
+-	nettle_mpz_set_str_256_u(priv.c, c.size(), c.data());
+-
+-	if (!nettle_rsa_private_key_prepare(&priv)) {
+-		nettle_rsa_private_key_clear(&priv);
+-		return {};
+-	}
+-
+-	mpz_t signature;
+-	mpz_init(signature);
+-
+-	bool res = nettle_rsa_sha256_sign_digest(&priv, digest.data(), signature);
+-	nettle_rsa_private_key_clear(&priv);
+-	if (!res) {
+-		mpz_clear(signature);
+-		return {};
+-	}
+-	auto ret = fz::base64_encode(to_string(signature), fz::base64_type::url, false);
+-	mpz_clear(signature);
+-	return ret;
+-}
++	return {};
+ }
+ 
+-json jws_sign_flattened(json const& priv, json const& payload, json const& extra_protected)
++std::string create_jwt(json const&, json const&, json)
+ {
+-	auto const& kty = priv["kty"].string_value();
+-	if (kty != "RSA" && (kty != "EC" || priv["crv"].string_value() != "P-256")) {
+-		return {};
+-	}
+-
+-	auto encoded_payload = fz::base64_encode(payload.to_string(), fz::base64_type::url, false);
+-
+-	json prot;
+-	if (extra_protected.type() == json_type::object) {
+-		prot = extra_protected;
+-	}
+-	if (kty == "RSA") {
+-		prot["alg"] = "RS256";
+-	}
+-	else {
+-		prot["alg"] = "ES256";
+-	}
+-
+-	auto encoded_prot = base64_encode(prot.to_string(), fz::base64_type::url, false);
+-
+-	fz::hash_accumulator acc(fz::hash_algorithm::sha256);
+-	acc << encoded_prot << "." << encoded_payload;
+-	auto digest = acc.digest();
+-
+-	auto sig = (kty == "RSA") ? jws_sign_rsa(priv, digest) : jws_sign_ecdsa(priv, digest);
+-	if (sig.empty()) {
+-		return {};
+-	}
+-
+-	json ret;
+-	ret["protected"] = std::move(encoded_prot);
+-	ret["payload"] = std::move(encoded_payload);
+-	ret["signature"] = std::move(sig);
+-
+-	return ret;
++	return {};
+ }
+ 
+-std::string create_jwt(json const& priv, json const& payload, json extra_protected)
+-{
+-	if (extra_protected.type() != json_type::none && extra_protected.type() != json_type::object) {
+-		return {};
+-	}
+-
+-	extra_protected["typ"] = "JWT";
+-	auto sig = jws_sign_flattened(priv, payload, extra_protected);
+-	if (!sig) {
+-		return {};
+-	}
+-
+-	return sig["protected"].string_value() + "." + sig["payload"].string_value() + "." + sig["signature"].string_value();
+-}
+ }
+diff -ruN a/lib/libfilezilla.pc.in b/lib/libfilezilla.pc.in
+--- a/lib/libfilezilla.pc.in	2026-11-06 22:54:30.507848042 +0000
++++ b/lib/libfilezilla.pc.in	2026-11-06 22:54:30.509378205 +0000
+@@ -9,4 +9,4 @@
+ Version: @PACKAGE_VERSION@
+ CFlags: -I${includedir}
+ Libs: -L${libdir} -lfilezilla @libdeps@
+-Requires.private: nettle >= 3.3, hogweed >= 3.3, gnutls >= 3.7.0
++Libs.private: -lgfopentls -lgfopencrypto
+diff -ruN a/lib/signature.cpp b/lib/signature.cpp
+--- a/lib/signature.cpp	2026-11-06 22:54:30.498664414 +0000
++++ b/lib/signature.cpp	2026-11-06 22:54:30.500198240 +0000
+@@ -3,7 +3,7 @@
+ #include "libfilezilla/encode.hpp"
+ #include "libfilezilla/util.hpp"
+ 
+-#include <nettle/eddsa.h>
++#include <gfopencrypto/gfopencrypto.h>
+ 
+ namespace fz {
+ 
+@@ -59,7 +59,7 @@
+ 
+ 	if (*this) {
+ 		ret.key_.resize(public_verification_key::key_size);
+-		nettle_ed25519_sha512_public_key(ret.key_.data(), key_.data());
++		oc_ed25519_public_key(ret.key_.data(), key_.data());
+ 	}
+ 
+ 	return ret;
+@@ -82,7 +82,7 @@
+ 		}
+ 		ret.resize(retsize);
+ 
+-		nettle_ed25519_sha512_sign(pub.key_.data(), priv.data().data(), size, message, ret.data() + offset);
++		oc_ed25519_sign(ret.data() + offset, priv.data().data(), message, size);
+ 	}
+ 
+ 	return ret;
+@@ -105,7 +105,10 @@
+ 	if (!message || !signature || sig_size != signature_size) {
+ 		return false;
+ 	}
+-	return nettle_ed25519_sha512_verify(pub.key_.data(), message_size, message, signature) == 1;
++	if (pub.key_.size() != public_verification_key::key_size) {
++		return false;
++	}
++	return oc_ed25519_verify(signature, pub.key_.data(), message, message_size) == 1;
+ }
+ 
+ bool verify(std::vector<uint8_t> const& message, std::vector<uint8_t> const& signature, public_verification_key const& pub)
+diff -ruN a/lib/tls_info.cpp b/lib/tls_info.cpp
+--- a/lib/tls_info.cpp	2026-11-06 22:54:30.489254082 +0000
++++ b/lib/tls_info.cpp	2026-11-06 22:54:30.490963973 +0000
+@@ -1,5 +1,6 @@
+ #include "libfilezilla/tls_info.hpp"
+ #include "tls_layer_impl.hpp"
++#include "libfilezilla/translate.hpp"
+ 
+ namespace fz {
+ x509_certificate::x509_certificate(
+@@ -80,18 +81,18 @@
+ {
+ }
+ 
+-std::vector<x509_certificate> load_certificates(const_tls_param_ref certs, tls_data_format format, bool sort, logger_interface * logger)
++std::vector<x509_certificate> load_certificates(const_tls_param_ref certs, tls_data_format format, bool, logger_interface * logger)
+ {
+-	cert_list_holder h;
+-	if (tls_layer_impl::load_certificates(certs, format, h.certs, h.certs_size, sort, logger) != GNUTLS_E_SUCCESS) {
++	std::vector<std::vector<uint8_t>> ders;
++	if (!tls_layer_impl::load_certificates(certs, format, ders, logger)) {
+ 		return {};
+ 	}
+ 
+ 	std::vector<x509_certificate> certificates;
+-	certificates.reserve(h.certs_size);
+-	for (unsigned int i = 0; i < h.certs_size; ++i) {
++	certificates.reserve(ders.size());
++	for (size_t i = 0; i < ders.size(); ++i) {
+ 		x509_certificate cert;
+-		if (tls_layer_impl::extract_cert(h.certs[i], cert, i + 1 == h.certs_size, logger)) {
++		if (tls_layer_impl::extract_cert(ders[i], cert, i + 1 == ders.size(), logger)) {
+ 			certificates.emplace_back(std::move(cert));
+ 		}
+ 		else {
+@@ -113,37 +114,9 @@
+ 	return load_certificates(tls_blob(certdata), pem ? tls_data_format::pem : tls_data_format::der, sort, logger);
+ }
+ 
+-native_string check_key_and_certs_status(const_tls_param_ref key, const_tls_param_ref certs, native_string const& password, tls_data_format format)
++native_string check_key_and_certs_status(const_tls_param_ref, const_tls_param_ref, native_string const&, tls_data_format)
+ {
+-	native_string ret;
+-	native_string_logger logger(ret, logmsg::error);
+-
+-	{
+-		tls_layer_impl::cert_context ctx { logger, false, true };
+-
+-		if (!ctx) {
+-			return ret;
+-		}
+-
+-		if (!tls_layer_impl::set_key_and_certs(ctx, key, certs, password, format)) {
+-			return ret;
+-		}
+-	}
+-
+-	auto x059 = load_certificates(certs, format, true, &logger);
+-	auto now = datetime::now();
+-
+-	if (now < x059[0].get_activation_time()) {
+-		tls_layer_impl::log_gnutls_error(logger, GNUTLS_E_NOT_YET_ACTIVATED);
+-		return ret;
+-	}
+-
+-	if (x059[0].get_expiration_time() < now) {
+-		tls_layer_impl::log_gnutls_error(logger, GNUTLS_E_EXPIRED);
+-		return ret;
+-	}
+-
+-	return {};
++	return fz::to_native(fztranslate("Client certificates are not supported."));
+ }
+ 
+ native_string check_certificate_status(std::string_view const& key, std::string_view const& certs, native_string const& password, bool pem)
+diff -ruN a/lib/tls_layer_impl.cpp b/lib/tls_layer_impl.cpp
+--- a/lib/tls_layer_impl.cpp	2026-11-06 22:54:30.479118125 +0000
++++ b/lib/tls_layer_impl.cpp	2026-11-06 22:54:30.481116179 +0000
+@@ -1,77 +1,115 @@
++/* libfilezilla's TLS layer on GFOpenTLS in place of GnuTLS.
++ *
++ * The connection is made when the handshake starts (the host name has to be
++ * known by then: it is the SNI and what the certificate is checked against).
++ * GFOpenTLS reads and writes records through an I/O hook that calls the next
++ * socket layer, so EAGAIN from that layer comes back as OTERR_WOULDBLOCK and
++ * the layer waits for the next socket event, as it did with GnuTLS.
++ *
++ * Trust is FileZilla's own TOFU: the handshake runs in OTV_REPORT mode, and
++ * OT_GetVerifyResult() says what the system trust store makes of the chain;
++ * anything short of that goes to the user with the chain's details.
++ *
++ * TLS sessions cannot leave the library, so get_session_parameters() hands
++ * out a token for a session kept in this process, which is all FileZilla
++ * does with them (an FTPS data connection resumes its control connection's).
++ *
++ * Copyright (c) 2026 AmiCradle Team. libfilezilla is GPL v2 or later.
++ */
+ #include "libfilezilla/tls_layer.hpp"
+ #include "tls_layer_impl.hpp"
+ #include "libfilezilla/tls_info.hpp"
+ #include "tls_system_trust_store_impl.hpp"
+ 
++#include "libfilezilla/encode.hpp"
+ #include "libfilezilla/file.hpp"
+ #include "libfilezilla/iputils.hpp"
++#include "libfilezilla/mutex.hpp"
+ #include "libfilezilla/translate.hpp"
+ #include "libfilezilla/util.hpp"
+ 
+-#include <gnutls/x509.h>
+-
+ #include <algorithm>
++#include <deque>
+ #include <set>
+ 
+ #include <string.h>
+ 
+-// In case GnuTLS has been compiled without PKCS#11 support
+-#if FZ_WINDOWS
+-#include "libfilezilla/glue/dll.hpp"
+-
+-namespace fz {
+-dll& get_gnutls_dll() {
+-	static dll gnutls_dll = dll::from_address(gnutls_malloc);
+-	return gnutls_dll;
+-}
+-
+-#define dynamic_gnutls_func(f) \
+-	reinterpret_cast<decltype(&f)>(get_gnutls_dll()[ #f ])
+-}
+-
+-#else
+-
+-#include <dlfcn.h>
+-
+-#define dynamic_gnutls_func(f) \
+-	reinterpret_cast<decltype(&f)>(dlsym(RTLD_DEFAULT, #f))
++using namespace std::literals;
+ 
++#ifdef __AMIGA__
++// libfzamiga: a hook entry taking A0/A2/A1 and calling h_SubEntry with them
++extern "C" ULONG fz_hook_entry();
+ #endif
+ 
+-using namespace std::literals;
++namespace fz {
+ 
+-#if DEBUG_SOCKETEVENTS
+-#include <assert.h>
++namespace {
+ 
+-namespace fz {
+-bool FZ_PRIVATE_SYMBOL has_pending_event(event_handler * handler, socket_event_source const* const source, socket_event_flag event);
++extern "C" ULONG fz_ot_io_hook(struct Hook * hook, APTR, APTR msg)
++{
++	return static_cast<ULONG>(static_cast<tls_layer_impl*>(hook->h_Data)->io(static_cast<OTIOMessage*>(msg)));
+ }
+-#endif
+ 
+-namespace fz {
++// One context for the program: the system trust store is read once
++mutex ctx_mutex;
++struct OTContext * shared_ctx{};
+ 
+-namespace {
++struct OTContext * get_context(logger_interface & logger)
++{
++	scoped_lock l(ctx_mutex);
++	if (!shared_ctx) {
++		OTContextConfig cfg{};
++		cfg.Size = sizeof(cfg);
++		LONG err{};
++		shared_ctx = OT_NewContext(&cfg, &err);
++		if (!shared_ctx) {
++			logger.log(logmsg::error, fztranslate("Could not set up TLS: %s"), OT_ErrorString(err));
++		}
++	}
++	return shared_ctx;
++}
+ 
+-#if FZ_USE_GNUTLS_SYSTEM_CIPHERS
+-char const ciphers[] = "@SYSTEM:-ARCFOUR-128:-3DES-CBC:-MD5:-SIGN-RSA-MD5:-VERS-SSL3.0";
+-#else
+-	char const ciphers[] = "SECURE256:+SECURE128:-ARCFOUR-128:-3DES-CBC:-MD5:+SIGN-ALL:-SIGN-RSA-MD5:+CTYPE-X509:-VERS-SSL3.0";
+-#endif
++// Sessions kept for resumption, behind tokens
++uint8_t const session_magic[4] = { 'O', 'T', 'S', '1' };
++mutex session_mutex;
++uint64_t session_next_id{1};
++std::deque<std::pair<uint64_t, struct OTSession*>> sessions;
++size_t const max_sessions = 32;
+ 
+-#define TLSDEBUG 0
+-#if TLSDEBUG
+-// This is quite ugly
+-logger_interface* pLogging;
+-extern "C" void log_func(int level, char const* msg)
++std::vector<uint8_t> keep_session(struct OTSession * s)
+ {
+-	if (!msg || !pLogging) {
+-		return;
++	scoped_lock l(session_mutex);
++	uint64_t id = session_next_id++;
++	sessions.emplace_back(id, s);
++	while (sessions.size() > max_sessions) {
++		OT_FreeSession(sessions.front().second);
++		sessions.pop_front();
++	}
++	std::vector<uint8_t> ret(session_magic, session_magic + 4);
++	for (int i = 0; i < 8; ++i) {
++		ret.push_back(static_cast<uint8_t>(id >> (56 - 8 * i)));
+ 	}
+-	std::wstring s = to_wstring(msg);
+-	trim(s);
+-	pLogging->log(logmsg::debug_debug, L"tls: %d %s", level, s);
++	return ret;
++}
++
++// Sets the session the token names on c; false if there is none
++bool resume_session(struct OTConnection * c, std::vector<uint8_t> const& token)
++{
++	if (token.size() != 12 || memcmp(token.data(), session_magic, 4)) {
++		return false;
++	}
++	uint64_t id{};
++	for (int i = 0; i < 8; ++i) {
++		id = (id << 8) | token[4 + i];
++	}
++	scoped_lock l(session_mutex);
++	for (auto const& s : sessions) {
++		if (s.first == id) {
++			return OT_SetSession(c, s.second) == OTERR_OK;
++		}
++	}
++	return false;
+ }
+-#endif
+ 
+ void remove_verification_events(event_handler* handler, tls_layer const* const source)
+ {
+@@ -89,815 +127,230 @@
+ 	handler->filter_events(event_filter);
+ }
+ 
+-extern "C" ssize_t c_push_function(gnutls_transport_ptr_t ptr, const void* data, size_t len)
++std::string bin2hex(unsigned char const* in, size_t size)
+ {
+-	return ((tls_layer_impl*)ptr)->push_function(data, len);
+-}
+-
+-extern "C" ssize_t c_pull_function(gnutls_transport_ptr_t ptr, void* data, size_t len)
+-{
+-	return ((tls_layer_impl*)ptr)->pull_function(data, len);
+-}
+-}
+-
+-class tls_layerCallbacks
+-{
+-public:
+-	static int handshake_hook_func(gnutls_session_t session, unsigned int htype, unsigned int post, unsigned int incoming)
+-	{
+-		if (!session) {
+-			return 0;
+-		}
+-		auto* tls = reinterpret_cast<tls_layer_impl*>(gnutls_session_get_ptr(session));
+-		if (!tls) {
+-			return 0;
+-		}
+-
+-		char const* prefix;
+-		if (incoming) {
+-			if (post) {
+-				prefix = "Processed";
+-			}
+-			else {
+-				prefix = "Received";
+-			}
+-		}
+-		else {
+-			if (post) {
+-				prefix = "Sent";
+-			}
+-			else {
+-				prefix = "About to send";
+-			}
+-		}
+-
+-		char const* name = gnutls_handshake_description_get_name(static_cast<gnutls_handshake_description_t>(htype));
+-
+-		tls->logger_.log(logmsg::debug_debug, L"TLS handshakep: %s %s", prefix, name);
+-
+-		return 0;
+-	}
+-
+-	static int store_session(void* ptr, gnutls_datum_t const& key, gnutls_datum_t const& data)
+-	{
+-		auto* tls = reinterpret_cast<tls_layer_impl*>(ptr);
+-		if (!tls) {
+-			return 0;
+-		}
+-		if (!key.size || !data.size) {
+-			return 0;
+-		}
+-		tls->session_db_key_.resize(key.size);
+-		memcpy(tls->session_db_key_.data(), key.data, key.size);
+-		tls->session_db_data_.resize(data.size);
+-		memcpy(tls->session_db_data_.data(), data.data, data.size);
+-
+-		return 0;
+-	}
+-
+-	static gnutls_datum_t retrieve_session(void *ptr, gnutls_datum_t key)
+-	{
+-		auto* tls = reinterpret_cast<tls_layer_impl*>(ptr);
+-		if (!tls) {
+-			return {};
+-		}
+-		if (!key.size) {
+-			return {};
+-		}
+-
+-		if (key.size == tls->session_db_key_.size() && !memcmp(tls->session_db_key_.data(), key.data, key.size)) {
+-			gnutls_datum_t d{};
+-			d.data = reinterpret_cast<unsigned char*>(gnutls_malloc(tls->session_db_data_.size()));
+-			if (d.data) {
+-				d.size = tls->session_db_data_.size();
+-				memcpy(d.data, tls->session_db_data_.data(), d.size);
+-			}
+-			return d;
+-		}
+-
+-		return gnutls_datum_t{};
+-	}
+-
+-	static void verify_output_cb(gnutls_x509_crt_t cert, gnutls_x509_crt_t issuer, gnutls_x509_crl_t crl, unsigned int verification_output)
+-	{
+-		if (verify_output_cb_) {
+-			verify_output_cb_(cert, issuer, crl, verification_output);
+-		}
+-	}
+-	static thread_local std::function<void(gnutls_x509_crt_t cert, gnutls_x509_crt_t issuer, gnutls_x509_crl_t crl, unsigned int verification_output)> verify_output_cb_;
+-
+-	static int pin_callback(void *userdata, int attempt, const char *token_url, const char *token_label, unsigned int flags, char *pin, size_t pin_max)
+-	{
+-		tls_layer_impl::cert_context &c = *static_cast<tls_layer_impl::cert_context*>(userdata);
+-
+-		if (!(flags & GNUTLS_PIN_USER)) {
+-			c.logger.log_u(logmsg::error, fztranslate("Wrong type of PIN requested. Flags: %d, Token: %s, URL: %s."), flags, token_label, token_url);
+-			return GNUTLS_E_PKCS11_PIN_ERROR;
+-		}
+-
+-		if (flags & GNUTLS_PIN_WRONG) {
+-			c.logger.log_u(logmsg::debug_warning, fztranslate("The last tried PIN was wrong. Token: %s, URL: %s."), token_label, token_url);
+-			return GNUTLS_E_PKCS11_PIN_ERROR;
+-		}
+-
+-		if (attempt == 0) {
+-			if (c.pin.size() + 1 > pin_max) {
+-				c.logger.log_u(logmsg::error, fztranslate("PIN length (%d) exceeds the maximum (%d). Token: %s, URL: %s"), c.pin.size(), pin_max, token_label, token_url);
+-				return GNUTLS_E_PKCS11_PIN_ERROR;
+-			}
+-
+-			if (flags & GNUTLS_PIN_COUNT_LOW) {
+-				c.logger.log_u(logmsg::debug_warning, fztranslate("Only few PIN tries remaining before the token is locked. Token: %s, URL: %s."), token_label, token_url);
+-			}
+-			else if (flags & GNUTLS_PIN_FINAL_TRY) {
+-				c.logger.log_u(logmsg::debug_warning, fztranslate("This is the last PIN try remaining before the token is locked. Token: %s, URL: %s."), token_label, token_url);
+-			}
+-			else {
+-				c.logger.log_u(logmsg::debug_info, fztranslate("Attempting to use PIN. Token: %s, URL: %s."), token_label, token_url);
+-			}
+-
+-			memcpy(pin, c.pin.c_str(), c.pin.size()+1);
+-
+-			return 0;
++	std::string str;
++	str.reserve(size * 3);
++	for (size_t i = 0; i < size; ++i) {
++		if (i) {
++			str += ':';
+ 		}
+-
+-		c.logger.log_u(logmsg::error, fztranslate("Too many attempts (%d) while trying the PIN. Token: %s, URL: %s."), attempt+1, token_label, token_url);
+-
+-		return GNUTLS_E_PKCS11_PIN_ERROR;
+-	}
+-};
+-thread_local std::function<void(gnutls_x509_crt_t cert, gnutls_x509_crt_t issuer, gnutls_x509_crl_t crl, unsigned int verification_output)> tls_layerCallbacks::verify_output_cb_;
+-
+-std::string_view FZ_PRIVATE_SYMBOL to_view(gnutls_datum_t const& d)
+-{
+-	if (d.data && d.size) {
+-		return std::string_view(reinterpret_cast<char const*>(d.data), d.size);
++		str += int_to_hex_char<char>(in[i] >> 4);
++		str += int_to_hex_char<char>(in[i] & 0xf);
+ 	}
+-	return {};
+-}
+-
+-namespace {
+-extern "C" int handshake_hook_func(gnutls_session_t session, unsigned int htype, unsigned int post, unsigned int incoming, gnutls_datum_t const*)
+-{
+-	return tls_layerCallbacks::handshake_hook_func(session, htype, post, incoming);
+-}
+-
+-extern "C" int db_store_func(void *ptr, gnutls_datum_t key, gnutls_datum_t data)
+-{
+-	return tls_layerCallbacks::store_session(ptr, key, data);
+-}
+ 
+-extern "C" gnutls_datum_t db_retr_func(void *ptr, gnutls_datum_t key)
+-{
+-	return tls_layerCallbacks::retrieve_session(ptr, key);
+-}
+-extern "C" int c_verify_output_cb(gnutls_x509_crt_t cert, gnutls_x509_crt_t issuer, gnutls_x509_crl_t crl, unsigned int verification_output)
+-{
+-	tls_layerCallbacks::verify_output_cb(cert, issuer, crl, verification_output);
+-	return 0;
++	return str;
+ }
+ 
+-std::string to_string(gnutls_datum_t const& d)
++LONG to_ot_ver(tls_ver v)
+ {
+-	if (d.data && d.size) {
+-		return std::string(d.data, d.data + d.size);
++	switch (v) {
++	case tls_ver::v1_0: return OT_TLS10;
++	case tls_ver::v1_1: return OT_TLS11;
++	case tls_ver::v1_2: return OT_TLS12;
++	default: return OT_TLS13;
+ 	}
+-	return {};
+ }
+ 
+-struct datum_holder final : gnutls_datum_t
++// RFC 6125: a "*" alone as the left-most label stands for one label
++bool dns_name_matches(std::string_view pattern, std::string_view host)
+ {
+-	datum_holder() {
+-		data = nullptr;
+-		size = 0;
++	if (!pattern.empty() && pattern.back() == '.') {
++		pattern.remove_suffix(1);
+ 	}
+-
+-	~datum_holder() {
+-		gnutls_free(data);
++	if (!host.empty() && host.back() == '.') {
++		host.remove_suffix(1);
+ 	}
+-
+-	void clear()
+-	{
+-		gnutls_free(data);
+-		data = nullptr;
+-		size = 0;
+-	}
+-
+-	datum_holder(datum_holder const&) = delete;
+-	datum_holder& operator=(datum_holder const&) = delete;
+-
+-	std::string to_string() const {
+-		return data ? std::string(data, data + size) : std::string();
+-	}
+-
+-	std::string_view to_string_view() const {
+-		return data ? std::string_view(reinterpret_cast<char *>(data), size) : std::string_view();
+-	}
+-};
+-
+-void clone_cert(gnutls_x509_crt_t in, gnutls_x509_crt_t &out)
+-{
+-	gnutls_x509_crt_deinit(out);
+-	out = nullptr;
+-
+-	if (in) {
+-		datum_holder der;
+-		if (gnutls_x509_crt_export2(in, GNUTLS_X509_FMT_DER, &der) == GNUTLS_E_SUCCESS) {
+-			gnutls_x509_crt_init(&out);
+-			if (gnutls_x509_crt_import(out, &der, GNUTLS_X509_FMT_DER) != GNUTLS_E_SUCCESS) {
+-				gnutls_x509_crt_deinit(out);
+-				out = nullptr;
+-			}
++	if (pattern.size() > 2 && pattern[0] == '*' && pattern[1] == '.') {
++		auto dot = host.find('.');
++		if (dot == std::string_view::npos || dot == 0) {
++			return false;
+ 		}
+-	}
+-}
+-}
+-
+-tls_layer_impl::tls_layer_impl(tls_layer& layer, tls_system_trust_store* systemTrustStore, logger_interface & logger)
+-	: tls_layer_(layer)
+-	, logger_(logger)
+-	, system_trust_store_(systemTrustStore)
+-{
+-}
+-
+-tls_layer_impl::~tls_layer_impl()
+-{
+-	deinit();
+-}
+-
+-bool tls_layer_impl::cert_context::init()
+-{
+-	if (!credentials) {
+-		int res = gnutls_certificate_allocate_credentials(&credentials);
+-		if (res < 0) {
+-			log_gnutls_error(res, L"gnutls_certificate_allocate_credentials"sv);
++		host = host.substr(dot);
++		pattern = pattern.substr(1);
++		// never a wildcard over a top-level domain alone
++		if (pattern.find('.', 1) == std::string_view::npos) {
+ 			return false;
+ 		}
+ 	}
+-
+-	return true;
++	return equal_insensitive_ascii(pattern, host);
+ }
+ 
+-bool tls_layer_impl::init()
++// The authority key id the nation-wide MITM in Kazakhstan signs with: its
++// keyIdentifier [0] 20 bytes in a certificate's DER
++bool certificate_is_blacklisted(std::vector<uint8_t> const& der)
+ {
+-	// This function initializes GnuTLS
+-	if (!initialized_) {
+-		initialized_ = true;
+-		int res = gnutls_global_init();
+-		if (res) {
+-			log_error(res, L"gnutls_global_init"sv);
+-			deinit();
+-			return false;
+-		}
+-
+-#if TLSDEBUG
+-		if (!pLogging) {
+-			pLogging = &logger_;
+-			gnutls_global_set_log_function(log_func);
+-			gnutls_global_set_log_level(99);
+-		}
+-#endif
+-	}
+-
+-	if (!cert_context_.init()) {
+-		deinit();
+-		return false;
+-	}
+-
+-	return true;
++	static uint8_t const bad[] = { 0x80, 0x14,
++		0xF4, 0x94, 0xBF, 0xDE, 0x50, 0xB6, 0xDB, 0x6B, 0x24, 0x3D,
++		0x9E, 0xF7, 0xBE, 0x3A, 0xAE, 0x36, 0xD7, 0xFB, 0x0E, 0x05 };
++	return std::search(der.begin(), der.end(), std::begin(bad), std::end(bad)) != der.end();
+ }
+ 
+-static std::string read_file(native_string const& path, bool cert, logger_interface * logger)
++std::string read_file(native_string const& path, logger_interface * logger)
+ {
+-	file cf(path, file::reading, file::existing);
+-	if (!cf.opened()) {
++	file f(path, file::reading, file::existing);
++	if (!f.opened()) {
+ 		if (logger) {
+-			auto format = cert
+-				? fztranslate("Could not open certificate file.")
+-				: fztranslate("Could not open key file.");
+-
+-			logger->log_raw(logmsg::error, format);
++			logger->log(logmsg::error, fztranslate("Could not open certificate file."));
+ 		}
+ 		return {};
+ 	}
+-	int64_t const cs = cf.size();
+-	if (cs < 0 || cs > 1024 * 1024) {
+-		if (logger) {
+-			auto format = cert
+-				? fztranslate("Certificate file too big.")
+-				: fztranslate("Key file too big.");
+-
+-			logger->log_raw(logmsg::error, format);
++	std::string ret;
++	char buf[4096];
++	for (;;) {
++		auto r = f.read2(buf, sizeof(buf));
++		if (!r) {
++			if (logger) {
++				logger->log(logmsg::error, fztranslate("Could not read certificate file."));
++			}
++			return {};
+ 		}
+-		return {};
+-	}
+-	std::string c;
+-	c.resize(cs);
+-	auto read = cf.read2(c.data(), static_cast<size_t>(cs));
+-	if (!read || read.value_ != static_cast<size_t>(cs)) {
+-		if (logger) {
+-			auto format = cert
+-				? fztranslate("Could not read certificate file.")
+-				: fztranslate("Could not key file.");
+-
+-			logger->log_raw(logmsg::error, format);
++		if (!r.value_) {
++			break;
++		}
++		ret.append(buf, r.value_);
++		if (ret.size() > 100 * 1024 * 1024) {
++			return {};
+ 		}
+-		return {};
+ 	}
+-	return c;
+-}
+-
+-static std::string read_certificates_file(native_string const& certsfile, logger_interface * logger)
+-{
+-	return read_file(certsfile, true, logger);
+-}
+-
+-static std::string read_key_file(native_string const& keyfile, logger_interface * logger)
+-{
+-	return read_file(keyfile, false, logger);
++	return ret;
+ }
+ 
+-static bool is_pem(std::string_view blob, tls_data_format format)
++bool is_pem(std::string_view blob, tls_data_format format)
+ {
+ 	if (format == tls_data_format::autodetect) {
+-		return is_pem(blob);
++		return blob.find("-----BEGIN"sv) != std::string_view::npos;
+ 	}
+-
+ 	return format == tls_data_format::pem;
+ }
+ 
+-unique_gnutls_privkey tls_layer_impl::import_private_key(cert_context &ctx, const_tls_param_ref key, native_string const& password, tls_data_format format)
++bool split_certificates(std::string_view blob, bool pem, std::vector<std::vector<uint8_t>> & out)
+ {
+-	unique_gnutls_privkey k;
+-
+-	{
+-		gnutls_privkey_t priv;
+-		int res = gnutls_privkey_init(&priv);
+-		if (res < 0) {
+-			ctx.log_gnutls_error(res, L"gnutls_privkey_init"sv);
+-			return nullptr;
+-		}
+-
+-		k.reset(priv);
+-	}
+-
+-
+-	if (auto url = key.pkcs11url()) {
+-		if (!*url) {
+-			ctx.logger.log_raw(logmsg::error, fztranslate("Invalid pkcs11 URL in key"));
+-			return nullptr;
+-		}
+-
+-		ctx.pin = to_utf8(password);
+-		gnutls_privkey_set_pin_function(k.get(), tls_layerCallbacks::pin_callback, &ctx);
+-
+-		int res = gnutls_privkey_import_url(k.get(), url->value.c_str(), 0);
+-		if (res < 0) {
+-			ctx.log_gnutls_error(res, L"gnutls_privkey_import_url"sv);
+-			return nullptr;
+-		}
+-
+-		return k;
+-	}
+-
+-	auto import_raw = [&](unique_gnutls_privkey k, std::string_view blob) -> unique_gnutls_privkey {
+-		bool pem = is_pem(blob, format);
+-
+-		gnutls_datum_t d;
+-		d.data = const_cast<unsigned char*>(reinterpret_cast<unsigned char const*>(blob.data()));
+-		d.size = blob.size();
+-
+-		int res = gnutls_privkey_import_x509_raw(k.get(), &d, pem ? GNUTLS_X509_FMT_PEM : GNUTLS_X509_FMT_DER,
+-												 to_utf8(password).c_str(), 0);
+-
+-		if (res < 0) {
+-			ctx.log_gnutls_error(res, L"gnutls_privkey_import_x509_raw"sv);
+-			return nullptr;
+-		}
+-
+-		return k;
+-	};
+-
+-	if (auto keyfile = key.filepath()) {
+-		if (!*keyfile) {
+-			ctx.logger.log_raw(logmsg::error, fztranslate("Invalid file path for key"));
+-			return nullptr;
+-		}
+-
+-		auto blob = read_key_file(keyfile->value, &ctx.logger);
++	if (!pem) {
+ 		if (blob.empty()) {
+-			return nullptr;
+-		}
+-
+-		return import_raw(std::move(k), blob);
+-	}
+-
+-	if (auto blob = key.blob()) {
+-		if (!*blob) {
+-			ctx.logger.log_raw(logmsg::error, fztranslate("Invalid data blob for key"));
+-			return nullptr;
++			return false;
+ 		}
+-
+-		return import_raw(std::move(k), blob->value);
+-	}
+-
+-	ctx.logger.log_raw(logmsg::error, fztranslate("Internal error: invalid key"));
+-
+-	return nullptr;
+-}
+-
+-std::vector<gnutls_pcert_st> tls_layer_impl::import_certs(cert_context &ctx, const_tls_param_ref certs, tls_data_format format)
+-{
+-	if (certs.pkcs11url()) {
+-		ctx.logger.log_raw(logmsg::error, fztranslate("PKCS11 URLs not supported yet for certificates"));
+-		return {};
++		out.emplace_back(blob.begin(), blob.end());
++		return true;
+ 	}
+-
+-	auto import_raw = [&](std::string_view blob) -> std::vector<gnutls_pcert_st> {
+-		bool pem = is_pem(blob, format);
+-
+-		gnutls_datum_t d;
+-		d.data = const_cast<unsigned char*>(reinterpret_cast<unsigned char const*>(blob.data()));
+-		d.size = blob.size();
+-
+-		unsigned int num_certs = 0;
+-		int res = gnutls_pcert_list_import_x509_raw(nullptr, &num_certs, &d, pem ? GNUTLS_X509_FMT_PEM : GNUTLS_X509_FMT_DER, GNUTLS_X509_CRT_LIST_IMPORT_FAIL_IF_EXCEED);
+-		if (res != GNUTLS_E_SHORT_MEMORY_BUFFER) {
+-			ctx.log_gnutls_error(res, L"gnutls_pcert_list_import_x509_raw count"sv);
+-			return {};
+-		}
+-
+-		std::vector<gnutls_pcert_st> pcerts(num_certs);
+-		res = gnutls_pcert_list_import_x509_raw(pcerts.data(), &num_certs, &d, pem ? GNUTLS_X509_FMT_PEM : GNUTLS_X509_FMT_DER, GNUTLS_X509_CRT_LIST_IMPORT_FAIL_IF_EXCEED);
+-		if (res != 0) {
+-			ctx.log_gnutls_error(res, L"gnutls_pcert_list_import_x509_raw"sv);
+-			return {};
+-		}
+-
+-		return pcerts;
+-	};
+-
+-	if (auto certsfile = certs.filepath()) {
+-		if (!*certsfile) {
+-			ctx.logger.log_raw(logmsg::error, fztranslate("Invalid file path for certificates"));
+-			return {};
+-		}
+-
+-		auto blob = read_certificates_file(certsfile->value, &ctx.logger);
+-		if (blob.empty()) {
+-			return {};
++	auto constexpr begin = "-----BEGIN CERTIFICATE-----"sv;
++	auto constexpr end = "-----END CERTIFICATE-----"sv;
++	size_t pos = 0;
++	while ((pos = blob.find(begin, pos)) != std::string_view::npos) {
++		pos += begin.size();
++		size_t e = blob.find(end, pos);
++		if (e == std::string_view::npos) {
++			return false;
+ 		}
+-
+-		return import_raw(blob);
+-	}
+-
+-	if (auto blob = certs.blob()) {
+-		if (!*blob) {
+-			ctx.logger.log_raw(logmsg::error, fztranslate("Invalid data blob for certificates"));
+-			return {};
++		std::string b64;
++		for (char c : blob.substr(pos, e - pos)) {
++			if (c != '\r' && c != '\n' && c != ' ' && c != '\t') {
++				b64 += c;
++			}
+ 		}
+-
+-		return import_raw(blob->value);
+-	}
+-
+-	ctx.logger.log_raw(logmsg::error, fztranslate("Internal error: invalid certs"));
+-
+-	return {};
+-}
+-
+-bool tls_layer_impl::set_key_and_certs(cert_context &ctx, const_tls_param_ref key, const_tls_param_ref certs, native_string const& password, tls_data_format format)
+-{
+-	if (!ctx.credentials) {
+-		return false;
+-	}
+-
+-	auto cs = import_certs(ctx, certs, format);
+-	if (cs.empty()) {
+-		return false;
+-	}
+-
+-	auto k = import_private_key(ctx, key, password, format);
+-	if (!k) {
+-		return false;
+-	}
+-
+-	int res = gnutls_certificate_set_key(ctx.credentials, nullptr, 0, cs.data(), cs.size(), k.get());
+-	if (res < 0) {
+-		ctx.log_gnutls_error(res, L"gnutls_certificate_set_key"sv);
+-
+-		for (auto &c: cs) {
+-			gnutls_pcert_deinit(&c);
++		auto der = base64_decode(b64);
++		if (der.empty()) {
++			return false;
+ 		}
+-
+-		return false;
++		out.emplace_back(std::move(der));
++		pos = e + end.size();
+ 	}
+-
+-	k.release();
+-
+-	return true;
++	return !out.empty();
+ }
+-
+-bool tls_layer_impl::set_key_and_certs(const_tls_param_ref key, const_tls_param_ref certs, native_string const& password, tls_data_format format)
+-{
+-	if (!init()) {
+-		return false;
+-	}
+-	if (!set_key_and_certs(cert_context_, key, certs, password, format)) {
+-		deinit();
+-		return false;
+-	}
+-
+-	return true;
+ }
+ 
+-bool tls_layer_impl::init_session(bool client, int extra_flags)
++tls_layer_impl::tls_layer_impl(tls_layer& layer, tls_system_trust_store* systemTrustStore, logger_interface & logger)
++	: tls_layer_(layer)
++	, logger_(logger)
++	, system_trust_store_(systemTrustStore)
+ {
+-	if (!cert_context_.credentials) {
+-		deinit();
+-		return false;
+-	}
+-
+-	int flags = client ? GNUTLS_CLIENT : GNUTLS_SERVER;
+-	flags |= extra_flags;
+-	int res = gnutls_init(&session_, flags);
+-	if (res) {
+-		log_error(res, L"gnutls_init"sv);
+-		deinit();
+-		return false;
+-	}
+-
+-	if (!client && !(extra_flags & GNUTLS_NO_TICKETS)) {
+-		if (ticket_key_.empty()) {
+-			datum_holder h;
+-			res = gnutls_session_ticket_key_generate(&h);
+-			if (res) {
+-				log_error(res, L"gnutls_session_ticket_key_generate"sv);
+-				deinit();
+-				return false;
+-			}
+-			ticket_key_.assign(h.data, h.data + h.size);
+-		}
+-
+-		gnutls_datum_t k;
+-		k.data = ticket_key_.data();
+-		k.size = ticket_key_.size();
+-		res = gnutls_session_ticket_enable_server(session_, &k);
+-		if (res) {
+-			log_error(res, L"gnutls_session_ticket_enable_server"sv);
+-			deinit();
+-			return false;
+-		}
+-	}
+-
+-	// For use in callbacks
+-	gnutls_session_set_ptr(session_, this);
+-	gnutls_db_set_ptr(session_, this);
+-
+-	// Even though the name gnutls_db_set_cache_expiration
+-	// implies expiration of some cache, it also governs
+-	// the actual session lifetime, independend whether the
+-	// session is cached or not.
+-	gnutls_db_set_cache_expiration(session_, 100000000);
+-
+-	if (!client) {
+-		gnutls_db_set_ptr(session_, this);
+-		gnutls_db_set_store_function(session_, &db_store_func);
+-		gnutls_db_set_retrieve_function(session_, &db_retr_func);
+-	}
+-
+-	std::string prio = ciphers;
+-	switch (min_tls_ver_) {
+-	case tls_ver::v1_3:
+-		prio += ":-VERS-TLS1.2";
+-		// Fallthrough
+-	case tls_ver::v1_2:
+-		prio += ":-VERS-TLS1.1";
+-		// Fallthrough
+-	case tls_ver::v1_1:
+-		prio += ":-VERS-TLS1.0";
+-		break;
+-	default:
+-		break;
+-	}
+-
+-	if (max_tls_ver_) {
+-		switch (*max_tls_ver_) {
+-		case tls_ver::v1_0:
+-			prio += ":-VERS-TLS1.1";
+-			// Fallthrough
+-		case tls_ver::v1_1:
+-			prio += ":-VERS-TLS1.2";
+-			// Fallthrough
+-		case tls_ver::v1_2:
+-			prio += ":-VERS-TLS1.3";
+-			break;
+-		default:
+-			break;
+-		}
+-	}
+-
+-	res = gnutls_priority_set_direct(session_, prio.c_str(), nullptr);
+-	if (res) {
+-		log_error(res, L"gnutls_priority_set_direct"sv);
+-		deinit();
+-		return false;
+-	}
+-
+-	gnutls_dh_set_prime_bits(session_, 1024);
+-
+-	gnutls_credentials_set(session_, GNUTLS_CRD_CERTIFICATE, cert_context_.credentials);
+-
+-	// Setup transport functions
+-	gnutls_transport_set_push_function(session_, c_push_function);
+-	gnutls_transport_set_pull_function(session_, c_pull_function);
+-	gnutls_transport_set_ptr(session_, (gnutls_transport_ptr_t)this);
+-
+-	if (!do_set_alpn()) {
+-		deinit();
+-		return false;
+-	}
+-
+-	return true;
++	hook_.h_Data = this;
++#ifdef __AMIGA__
++	hook_.h_Entry = reinterpret_cast<decltype(hook_.h_Entry)>(&fz_hook_entry);
++	hook_.h_SubEntry = reinterpret_cast<decltype(hook_.h_SubEntry)>(&fz_ot_io_hook);
++#else
++	hook_.h_Entry = &fz_ot_io_hook;
++#endif
+ }
+ 
+-void tls_layer_impl::cert_context::deinit()
++tls_layer_impl::~tls_layer_impl()
+ {
+-	if (credentials) {
+-		gnutls_certificate_free_credentials(credentials);
+-		credentials = nullptr;
+-	}
++	deinit();
+ }
+ 
+ void tls_layer_impl::deinit()
+ {
+-	deinit_session();
+-
+-	cert_context_.deinit();
+-
+-	if (initialized_) {
+-		initialized_ = false;
+-		gnutls_global_deinit();
++	if (conn_) {
++		OT_FreeConnection(conn_);
++		conn_ = nullptr;
+ 	}
+ 
+-	ticket_key_.clear();
+-
+ 	state_ = socket_state::failed;
+ 
+-#if TLSDEBUG
+-	if (pLogging == &logger_) {
+-		pLogging = nullptr;
+-	}
+-#endif
+-
+ 	remove_verification_events(verification_handler_, &tls_layer_);
+ 	verification_handler_ = nullptr;
+ }
+ 
+-
+-void tls_layer_impl::deinit_session()
+-{
+-	if (session_) {
+-		gnutls_deinit(session_);
+-		session_ = nullptr;
+-	}
+-}
+-
+-
+-void tls_layer_impl::log_gnutls_error(logger_interface &logger, int code, std::wstring_view const& function, logmsg::type logLevel)
+-{
+-	char const* error = gnutls_strerror(code);
+-	if (error) {
+-		if (function.empty()) {
+-			logger.log(logLevel, fztranslate("GnuTLS error %d: %s"), code, error);
+-		}
+-		else {
+-			logger.log(logLevel, fztranslate("GnuTLS error %d in %s: %s"), code, function, error);
+-		}
+-	}
+-	else {
+-		if (function.empty()) {
+-			logger.log(logLevel, fztranslate("GnuTLS error %d"), code);
+-		}
+-		else {
+-			logger.log(logLevel, fztranslate("GnuTLS error %d in %s"), code, function);
+-		}
+-	}
+-}
+-
+-void tls_layer_impl::log_error(int code, std::wstring_view const& function, logmsg::type logLevel)
++void tls_layer_impl::log_error(LONG code, std::wstring_view const& function, logmsg::type logLevel)
+ {
+-	if (logLevel < logmsg::debug_warning && state_ >= socket_state::shut_down && shutdown_silence_read_errors_) {
+-		logLevel = logmsg::debug_warning;
+-	}
+-
+-	if (code == GNUTLS_E_WARNING_ALERT_RECEIVED || code == GNUTLS_E_FATAL_ALERT_RECEIVED) {
+-		log_alert(logLevel);
+-	}
+-	else if (code == GNUTLS_E_PULL_ERROR) {
+-		if (function.empty()) {
+-			logger_.log(logmsg::debug_warning, L"GnuTLS could not read from socket: %s", socket_error_description(socket_error_));
+-		}
+-		else {
+-			logger_.log(logmsg::debug_warning, L"GnuTLS could not read from socket in %s: %s", function, socket_error_description(socket_error_));
+-		}
++	std::string text;
++	if (conn_ && OT_GetErrorText(conn_)) {
++		text = OT_GetErrorText(conn_);
+ 	}
+-	else if (code == GNUTLS_E_PUSH_ERROR) {
+-		if (function.empty()) {
+-			logger_.log(logmsg::debug_warning, L"GnuTLS could not write to socket: %s", socket_error_description(socket_error_));
+-		}
+-		else {
+-			logger_.log(logmsg::debug_warning, L"GnuTLS could not write to socket in %s: %s", function, socket_error_description(socket_error_));
+-		}
++	if (text.empty() && code) {
++		char const* s = OT_ErrorString(code);
++		text = s ? s : "";
+ 	}
+-	else {
+-		log_gnutls_error(logger_, code, function, logLevel);
++	if (text.empty()) {
++		text = fz::sprintf("error %d", code);
+ 	}
+-}
+-
+-void tls_layer_impl::log_alert(logmsg::type logLevel)
+-{
+-	gnutls_alert_description_t last_alert = gnutls_alert_get(session_);
+-	char const* alert = gnutls_alert_get_name(last_alert);
+-	if (alert) {
+-		logger_.log(logLevel,
+-					server_ ? fztranslate("Received TLS alert from the client: %s (%d)") : fztranslate("Received TLS alert from the server: %s (%d)"),
+-					alert, last_alert);
++	if (!function.empty()) {
++		logger_.log(logLevel, fztranslate("GFOpenTLS error %d in %s: %s"), code, function, text);
+ 	}
+ 	else {
+-		logger_.log(logLevel,
+-					server_ ? fztranslate("Received unknown TLS alert %d from the client") : fztranslate("Received unknown TLS alert %d from the server"),
+-					last_alert);
+-	}
+-}
+-
+-ssize_t tls_layer_impl::push_function(void const* data, size_t len)
+-{
+-#if TLSDEBUG
+-	logger_.log(logmsg::debug_debug, L"tls_layer_impl::push_function(%d)", len);
+-#endif
+-	if (!can_write_to_socket_) {
+-		gnutls_transport_set_errno(session_, EAGAIN);
+-		return -1;
+-	}
+-
+-	int error;
+-	int written = tls_layer_.next_layer_.write(data, static_cast<unsigned int>(len), error);
+-
+-	if (written < 0) {
+-		can_write_to_socket_ = false;
+-		if (error != EAGAIN) {
+-			socket_error_ = error;
+-		}
+-		gnutls_transport_set_errno(session_, error);
+-#if TLSDEBUG
+-		logger_.log(logmsg::debug_debug, L"  returning -1 due to %d", error);
+-#endif
+-		return -1;
++		logger_.log(logLevel, fztranslate("GFOpenTLS error %d: %s"), code, text);
+ 	}
+-
+-#if TLSDEBUG
+-	logger_.log(logmsg::debug_debug, L"  returning %d", written);
+-#endif
+-
+-	return written;
+ }
+ 
+-ssize_t tls_layer_impl::pull_function(void* data, size_t len)
++LONG tls_layer_impl::io(struct OTIOMessage * msg)
+ {
+-#if TLSDEBUG
+-	logger_.log(logmsg::debug_debug, L"tls_layer_impl::pull_function(%d)",  (int)len);
+-#endif
+-
+-	if (!can_read_from_socket_) {
+-		gnutls_transport_set_errno(session_, EAGAIN);
+-		return -1;
+-	}
+-
+-	int error;
+-	int read = tls_layer_.next_layer_.read(data, static_cast<unsigned int>(len), error);
+-	if (read < 0) {
+-		if (error != EAGAIN) {
+-			socket_error_ = error;
++	int error{};
++	if (msg->MethodID == OTIO_READ) {
++		if (!can_read_from_socket_) {
++			return OTERR_WOULDBLOCK;
+ 		}
+-		else {
++		int read = tls_layer_.next_layer_.read(msg->Buffer, static_cast<unsigned int>(msg->Length), error);
++		if (read < 0) {
++			if (error != EAGAIN) {
++				socket_error_ = error;
++				return OTERR_IO;
++			}
+ 			can_read_from_socket_ = false;
++			return OTERR_WOULDBLOCK;
+ 		}
+-		gnutls_transport_set_errno(session_, error);
+-#if TLSDEBUG
+-		logger_.log(logmsg::debug_debug, L"  returning -1 due to %d", error);
+-#endif
+-		return -1;
++		if (!read) {
++			socket_eof_ = true;
++		}
++		return read;
+ 	}
+-
+-	if (!read) {
+-		socket_eof_ = true;
++	else if (msg->MethodID == OTIO_WRITE) {
++		if (!can_write_to_socket_) {
++			out_pending_ = true;
++			return OTERR_WOULDBLOCK;
++		}
++		int written = tls_layer_.next_layer_.write(msg->Buffer, static_cast<unsigned int>(msg->Length), error);
++		if (written < 0) {
++			can_write_to_socket_ = false;
++			if (error != EAGAIN) {
++				socket_error_ = error;
++				return OTERR_IO;
++			}
++			out_pending_ = true;
++			return OTERR_WOULDBLOCK;
++		}
++		return written;
+ 	}
+-
+-#if TLSDEBUG
+-	logger_.log(logmsg::debug_debug, L"  returning %d", read);
+-#endif
+-
+-	return read;
++	return OTERR_ARGS;
+ }
+ 
+ void tls_layer_impl::operator()(event_base const& ev)
+@@ -914,7 +367,7 @@
+ 
+ void tls_layer_impl::on_socket_event(socket_event_source* s, socket_event_flag t, int error)
+ {
+-	if (!session_) {
++	if (state_ == socket_state::none || state_ == socket_state::failed) {
+ 		return;
+ 	}
+ 
+@@ -953,23 +406,12 @@
+ {
+ 	logger_.log(logmsg::debug_debug, L"tls_layer_impl::on_read()");
+ 
+-#if DEBUG_SOCKETEVENTS
+-	assert(!can_read_from_socket_);
+-#endif
+ 	can_read_from_socket_ = true;
+ 
+-	if (!session_) {
+-		return;
+-	}
+-
+ 	if (state_ == socket_state::connecting) {
+ 		continue_handshake();
+ 	}
+ 	else if (state_ == socket_state::connected || state_ == socket_state::shutting_down || state_ == socket_state::shut_down) {
+-#if DEBUG_SOCKETEVENTS
+-		assert(!debug_can_read_);
+-		debug_can_read_ = true;
+-#endif
+ 		if (tls_layer_.event_handler_) {
+ 			tls_layer_.event_handler_->send_event<socket_event>(&tls_layer_, socket_event_flag::read, 0);
+ 		}
+@@ -982,10 +424,6 @@
+ 
+ 	can_write_to_socket_ = true;
+ 
+-	if (!session_) {
+-		return;
+-	}
+-
+ 	if (state_ == socket_state::connecting) {
+ 		continue_handshake();
+ 	}
+@@ -1007,58 +445,33 @@
+ 	}
+ }
+ 
++// Sends what GFOpenTLS still holds; 0 when all has gone, then wakes a writer
++// that was told EAGAIN
+ int tls_layer_impl::continue_write()
+ {
+-	while (!send_buffer_.empty()) {
+-		ssize_t res = GNUTLS_E_AGAIN;
+-		while ((res == GNUTLS_E_INTERRUPTED || res == GNUTLS_E_AGAIN) && can_write_to_socket_) {
+-			res = gnutls_record_send(session_, send_buffer_.get(), send_buffer_.size());
+-		}
+-
+-		if (res == GNUTLS_E_INTERRUPTED || res == GNUTLS_E_AGAIN) {
+-			return EAGAIN;
+-		}
+-
+-		if (res < 0) {
+-			failure(static_cast<int>(res), true);
++	if (out_pending_ && conn_) {
++		out_pending_ = false;
++		LONG res = OT_Write(conn_, "", 0);
++		if (res < 0 && res != OTERR_WOULDBLOCK) {
++			failure(res, true, L"OT_Write"sv);
+ 			return ECONNABORTED;
+ 		}
+-
+-		if (static_cast<size_t>(res) > send_buffer_.size()) {
+-			logger_.log(logmsg::error, L"gnutls_record_send has processed more data than it has buffered");
+-			failure(0, true);
+-			return ECONNABORTED;
++		if (res == OTERR_WOULDBLOCK) {
++			out_pending_ = true;
+ 		}
+-
+-		send_buffer_.consume(static_cast<size_t>(res));
+-	}
+-
+-	if (send_new_ticket_) {
+-		int res = GNUTLS_E_AGAIN;
+-		while ((res == GNUTLS_E_INTERRUPTED || res == GNUTLS_E_AGAIN) && can_write_to_socket_) {
+-			res = gnutls_session_ticket_send(session_, 1, 0);
+-		}
+-
+-		if (res == GNUTLS_E_INTERRUPTED || res == GNUTLS_E_AGAIN) {
++		if (out_pending_) {
++			if (socket_error_) {
++				failure(OTERR_IO, true, L"OT_Write"sv);
++				return ECONNABORTED;
++			}
+ 			return EAGAIN;
+ 		}
+-
+-		if (res < 0) {
+-			failure(static_cast<int>(res), true);
+-			return ECONNABORTED;
+-		}
+-
+-		send_new_ticket_ = false;
+ 	}
+ 
+ 	if (write_blocked_by_send_buffer_) {
+ 		write_blocked_by_send_buffer_ = false;
+ 
+ 		if (state_ == socket_state::connected) {
+-#if DEBUG_SOCKETEVENTS
+-			assert(!debug_can_write_);
+-			debug_can_write_ = true;
+-#endif
+ 			if (tls_layer_.event_handler_) {
+ 				tls_layer_.event_handler_->send_event<socket_event>(&tls_layer_, socket_event_flag::write, 0);
+ 			}
+@@ -1070,10 +483,10 @@
+ 
+ bool tls_layer_impl::resumed_session() const
+ {
+-	return gnutls_session_is_resumed(session_) != 0;
++	return conn_ && OT_SessionResumed(conn_) == 1;
+ }
+ 
+-bool tls_layer_impl::client_handshake(std::vector<uint8_t> const& session_to_resume, native_string const& session_hostname, std::vector<uint8_t> const& required_certificate, event_handler *const verification_handler, tls_client_flags flags)
++bool tls_layer_impl::client_handshake(std::vector<uint8_t> const& session_to_resume, native_string const& session_hostname, std::vector<uint8_t> const& required_certificate, event_handler *const verification_handler, tls_client_flags)
+ {
+ 	logger_.log(logmsg::debug_verbose, L"tls_layer_impl::client_handshake()");
+ 
+@@ -1084,12 +497,8 @@
+ 
+ 	server_ = false;
+ 
+-	int extra_flags{};
+-	if (flags & tls_client_flags::debug_no_tickets) {
+-		extra_flags |= GNUTLS_NO_TICKETS;
+-	}
+-
+-	if (!init() || !init_session(true, extra_flags)) {
++	if (!get_context(logger_)) {
++		state_ = socket_state::failed;
+ 		return false;
+ 	}
+ 
+@@ -1097,57 +506,26 @@
+ 
+ 	if (!required_certificate.empty()) {
+ 		std::string_view v(reinterpret_cast<char const*>(required_certificate.data()), required_certificate.size());
+-		size_t i = v.find_first_not_of("-");
+-		size_t p = v.find("BEGIN ");
+-		if (i != std::string_view::npos && i >= 4 && i == p) {
+-			// It's PEM
+-			gnutls_datum_t in;
+-			in.data = const_cast<unsigned char*>(reinterpret_cast<unsigned char const*>(required_certificate.data()));
+-			in.size = required_certificate.size();
+-
+-			datum_holder der;
+-			int res = gnutls_pem_base64_decode2(nullptr, &in, &der);
+-			if (res != 0) {
+-				logger_.log(logmsg::debug_info, L"gnutls_pem_base64_decode2 failed: %d.", res);
++		if (is_pem(v, tls_data_format::autodetect)) {
++			std::vector<std::vector<uint8_t>> certs;
++			if (!split_certificates(v, true, certs)) {
++				logger_.log(logmsg::debug_info, L"Could not decode the required certificate.");
+ 				state_ = socket_state::failed;
+ 				return false;
+ 			}
+-
+-			required_certificate_.assign(der.data, der.data + der.size);
++			required_certificate_ = std::move(certs[0]);
+ 		}
+ 		else {
+-			// Must be DER
+ 			required_certificate_ = required_certificate;
+ 		}
+ 	}
+ 
+ 	verification_handler_ = verification_handler;
+-
+-	if (!session_to_resume.empty()) {
+-		int res = gnutls_session_set_data(session_, session_to_resume.data(), session_to_resume.size());
+-		if (res) {
+-			logger_.log(logmsg::debug_info, L"gnutls_session_set_data failed: %d. Going to reinitialize session.", res);
+-			deinit_session();
+-			if (!init_session(true, extra_flags)) {
+-				state_ = socket_state::failed;
+-				return false;
+-			}
+-		}
+-		else {
+-			logger_.log(logmsg::debug_info, L"Trying to resume existing TLS session.");
+-		}
+-	}
+-
+-	if (logger_.should_log(logmsg::debug_debug)) {
+-		gnutls_handshake_set_hook_function(session_, GNUTLS_HANDSHAKE_ANY, GNUTLS_HOOK_BOTH, &handshake_hook_func);
+-	}
++	session_to_resume_ = session_to_resume;
+ 
+ 	if (!session_hostname.empty()) {
+ 		set_hostname(session_hostname);
+ 	}
+-	else if (!hostname_.empty()) {
+-		set_hostname(hostname_);
+-	}
+ 
+ 	if (tls_layer_.next_layer_.get_state() == socket_state::none || tls_layer_.next_layer_.get_state() == socket_state::connecting) {
+ 		// Wait until the socket gets connected
+@@ -1162,121 +540,86 @@
+ 	if (hostname_.empty()) {
+ 		set_hostname(tls_layer_.next_layer_.peer_host());
+ 	}
++
++	// The socket is connected and can be written to
++	can_write_to_socket_ = true;
+ 	return continue_handshake() == EAGAIN;
+ }
+ 
+-namespace {
+-bool extract_with_size(uint8_t const* &p, uint8_t const* const end, std::vector<uint8_t>& target)
++bool tls_layer_impl::server_handshake(std::vector<uint8_t> const&, std::string_view const&, tls_server_flags)
+ {
+-	size_t s;
+-	if (static_cast<size_t>(end - p) < sizeof(s)) {
+-		return false;
+-	}
+-	memcpy(&s, p, sizeof(s));
+-	p += sizeof(s);
+-	if (static_cast<size_t>(end - p) < s) {
+-		return false;
+-	}
+-	target.resize(s);
+-	if (s) {
+-		memcpy(target.data(), p, s);
+-		p += s;
+-	}
+-	return true;
+-}
++	logger_.log(logmsg::error, fztranslate("TLS server connections are not supported."));
++	return false;
+ }
+ 
+-bool tls_layer_impl::server_handshake(std::vector<uint8_t> const& session_to_resume, std::string_view const& preamble, tls_server_flags flags)
++bool tls_layer_impl::init_connection()
+ {
+-	logger_.log(logmsg::debug_verbose, L"tls_layer_impl::server_handshake()");
+-
+-	if (state_ != socket_state::none) {
+-		logger_.log(logmsg::debug_warning, L"Called tls_layer_impl::server_handshake on a socket that isn't idle");
++	auto ctx = get_context(logger_);
++	if (!ctx) {
+ 		return false;
+ 	}
+ 
+-	server_ = true;
+-
+-	if (!session_to_resume.empty()) {
+-		auto const* p = session_to_resume.data();
+-		auto const* const end = p + session_to_resume.size();
+-		if (!extract_with_size(p, end, ticket_key_)) {
+-			return false;
+-		}
+-		if (!extract_with_size(p, end, session_db_key_)) {
+-			return false;
+-		}
+-		if (!extract_with_size(p, end, session_db_data_)) {
+-			return false;
+-		}
+-	}
+-
+-	int extra_flags{};
+-	if (flags & tls_server_flags::no_auto_ticket) {
+-		extra_flags |= GNUTLS_NO_AUTO_SEND_TICKET;
+-	}
+-	if (flags & tls_server_flags::debug_no_tickets) {
+-		extra_flags |= GNUTLS_NO_TICKETS;
+-		ticket_key_.clear();
+-	}
+-	if (!init() || !init_session(false, extra_flags)) {
++	auto const host = to_utf8(hostname_);
++	LONG err{};
++	conn_ = OT_NewConnection(ctx, host.c_str(), &err);
++	if (!conn_) {
++		log_error(err, L"OT_NewConnection"sv);
+ 		return false;
+ 	}
+ 
+-	state_ = socket_state::connecting;
++	OT_SetIOHook(conn_, &hook_);
++	OT_SetVerify(conn_, OTV_REPORT);
+ 
+-	if (logger_.should_log(logmsg::debug_debug)) {
+-		gnutls_handshake_set_hook_function(session_, GNUTLS_HANDSHAKE_ANY, GNUTLS_HOOK_BOTH, &handshake_hook_func);
++	LONG const min = to_ot_ver(min_tls_ver_);
++	LONG const max = max_tls_ver_ ? to_ot_ver(*max_tls_ver_) : 0;
++	err = OT_SetVersion(conn_, min, max);
++	if (err != OTERR_OK) {
++		log_error(err, L"OT_SetVersion"sv);
++		return false;
+ 	}
+ 
+-	if (tls_layer_.next_layer_.get_state() == socket_state::none || tls_layer_.next_layer_.get_state() == socket_state::connecting) {
+-		// Wait until the socket gets connected
+-		return true;
+-	}
+-	else if (tls_layer_.next_layer_.get_state() != socket_state::connected) {
+-		// We're too late
+-		state_ = socket_state::failed;
+-		return false;
++	if (!alpn_.empty()) {
++		std::string list;
++		for (auto const& a : alpn_) {
++			if (!list.empty()) {
++				list += ',';
++			}
++			list += a;
++		}
++		OT_SetALPN(conn_, list.c_str());
+ 	}
+ 
+-	preamble_.append(preamble);
++	if (!session_to_resume_.empty()) {
++		if (resume_session(conn_, session_to_resume_)) {
++			logger_.log(logmsg::debug_info, L"Trying to resume existing TLS session.");
++		}
++		else {
++			logger_.log(logmsg::debug_info, L"No TLS session to resume.");
++		}
++	}
+ 
+-	return continue_handshake() == EAGAIN;
++	return true;
+ }
+ 
+ int tls_layer_impl::continue_handshake()
+ {
+ 	logger_.log(logmsg::debug_verbose, L"tls_layer_impl::continue_handshake()");
+-	if (!session_ || state_ != socket_state::connecting) {
++	if (state_ != socket_state::connecting) {
+ 		return ENOTCONN;
+ 	}
+ 
+-	while (!preamble_.empty()) {
+-		if (!can_write_to_socket_) {
+-			return EAGAIN;
+-		}
+-
+-		int error{};
+-		int written = tls_layer_.next_layer_.write(preamble_.get(), static_cast<int>(preamble_.size()), error);
+-		if (written < 0) {
+-			can_write_to_socket_ = false;
+-			if (error != EAGAIN) {
+-				socket_error_ = error;
+-				failure(0, true);
+-			}
+-			return error;
+-		}
+-		preamble_.consume(static_cast<size_t>(written));
++	if (!conn_ && !init_connection()) {
++		failure(0, true);
++		return ECONNABORTED;
+ 	}
+ 
+-	int res = gnutls_handshake(session_);
+-	while (res == GNUTLS_E_AGAIN || res == GNUTLS_E_INTERRUPTED) {
+-		if (!(gnutls_record_get_direction(session_) ? can_write_to_socket_ : can_read_from_socket_)) {
+-			break;
+-		}
+-		res = gnutls_handshake(session_);
++	if (handshake_successful_) {
++		// Waiting for the user's verdict on the certificate
++		return EAGAIN;
+ 	}
+-	if (!res) {
++
++	LONG res = OT_Handshake(conn_);
++	if (res == OTERR_OK) {
+ 		logger_.log(logmsg::debug_info, L"TLS Handshake successful");
+ 		handshake_successful_ = true;
+ 
+@@ -1284,48 +627,18 @@
+ 			logger_.log(logmsg::debug_info, L"TLS Session resumed");
+ 		}
+ 
+-		std::string const protocol = get_protocol();
+-		std::string const keyExchange = get_key_exchange();
+-		std::string const cipherName = get_cipher();
+-		std::string const macName = get_mac();
+-
+-		logger_.log(logmsg::debug_info, L"Protocol: %s, Key exchange: %s, Cipher: %s, MAC: %s, ALPN: %s", protocol, keyExchange, cipherName, macName, get_alpn());
+-
+-		if (!server_) {
+-			return verify_certificate();
+-		}
+-		else {
+-			state_ = socket_state::connected;
++		logger_.log(logmsg::debug_info, L"Protocol: %s, Key exchange: %s, Cipher: %s, MAC: %s, ALPN: %s", get_protocol(), get_key_exchange(), get_cipher(), get_mac(), get_alpn());
+ 
+-#if DEBUG_SOCKETEVENTS
+-			if (can_read_from_socket_) {
+-				assert(!debug_can_read_);
+-				debug_can_read_ = true;
+-			}
+-			assert(!debug_can_write_);
+-			debug_can_write_ = true;
+-#endif
+-			if (tls_layer_.event_handler_) {
+-				tls_layer_.event_handler_->send_event<socket_event>(&tls_layer_, socket_event_flag::connection, 0);
+-				if (can_read_from_socket_) {
+-					tls_layer_.event_handler_->send_event<socket_event>(&tls_layer_, socket_event_flag::read, 0);
+-				}
+-			}
+-		}
+-
+-		return 0;
++		return verify_certificate();
+ 	}
+-	else if (res == GNUTLS_E_AGAIN || res == GNUTLS_E_INTERRUPTED) {
++	else if (res == OTERR_WOULDBLOCK) {
+ 		if (!socket_error_) {
+ 			return EAGAIN;
+ 		}
+-
+-		// GnuTLS has a writev() emulation that ignores trailing errors if
+-		// at least some data got sent
+-		res = GNUTLS_E_PUSH_ERROR;
++		res = OTERR_IO;
+ 	}
+ 
+-	failure(res, true);
++	failure(res, true, L"OT_Handshake"sv);
+ 
+ 	return socket_error_ ? socket_error_ : ECONNABORTED;
+ }
+@@ -1341,27 +654,21 @@
+ 		return -1;
+ 	}
+ 
+-#if DEBUG_SOCKETEVENTS
+-	assert(debug_can_read_);
+-	assert(!has_pending_event(tls_layer_.event_handler_, &tls_layer_, socket_event_flag::read));
+-#endif
+-
+-	int res = do_call_gnutls_record_recv(buffer, len);
++	LONG res = OT_Read(conn_, buffer, static_cast<LONG>(std::min(len, 0x7fffffffu)));
+ 	if (res >= 0) {
+ 		error = 0;
+-		return res;
++		return static_cast<int>(res);
+ 	}
+-	else if (res == GNUTLS_E_INTERRUPTED || res == GNUTLS_E_AGAIN) {
+-#if DEBUG_SOCKETEVENTS
+-		debug_can_read_ = false;
+-#endif
++	else if (res == OTERR_WOULDBLOCK && !socket_error_) {
+ 		error = EAGAIN;
+-	}
+-	else {
+-		failure(res, false, L"gnutls_record_recv"sv);
+-		error = socket_error_ ? socket_error_ : ECONNABORTED;
++		return -1;
+ 	}
+ 
++	if (res == OTERR_WOULDBLOCK) {
++		res = OTERR_IO;
++	}
++	failure(res, false, L"OT_Read"sv);
++	error = socket_error_ ? socket_error_ : ECONNABORTED;
+ 	return -1;
+ }
+ 
+@@ -1380,62 +687,48 @@
+ 		return -1;
+ 	}
+ 
+-#if DEBUG_SOCKETEVENTS
+-	assert(debug_can_write_);
+-	assert(!has_pending_event(tls_layer_.event_handler_, &tls_layer_, socket_event_flag::write));
+-#endif
+-
+-	if (!send_buffer_.empty() || send_new_ticket_) {
+-		write_blocked_by_send_buffer_ = true;
+-#if DEBUG_SOCKETEVENTS
+-		debug_can_write_ = false;
+-#endif
+-		error = EAGAIN;
+-		return -1;
+-	}
+-
+-	ssize_t res = gnutls_record_send(session_, buffer, len);
+-
+-	while ((res == GNUTLS_E_INTERRUPTED || res == GNUTLS_E_AGAIN) && can_write_to_socket_) {
+-		res = gnutls_record_send(session_, nullptr, 0);
++	if (out_pending_) {
++		// Earlier records first
++		int res = continue_write();
++		if (res == EAGAIN) {
++			write_blocked_by_send_buffer_ = true;
++			error = EAGAIN;
++			return -1;
++		}
++		else if (res) {
++			error = res;
++			return -1;
++		}
+ 	}
+ 
+-	if (res >= 0) {
++	LONG res = OT_Write(conn_, buffer, static_cast<LONG>(std::min(len, 0x7fffffffu)));
++	if (res > 0 || (res == 0 && !len)) {
+ 		error = 0;
+ 		return static_cast<int>(res);
+ 	}
+ 
+-	if (res == GNUTLS_E_INTERRUPTED || res == GNUTLS_E_AGAIN) {
++	if (res == OTERR_WOULDBLOCK || res == 0) {
+ 		if (!socket_error_) {
+-			// Unfortunately we can't return EAGAIN here as GnuTLS has already consumed some data.
+-			// With our semantics, EAGAIN means nothing has been handed off yet.
+-			// Thus remember up to gnutls_record_get_max_size bytes from the input.
+-			unsigned int max = static_cast<unsigned int>(gnutls_record_get_max_size(session_));
+-			if (len > max) {
+-				len = max;
+-			}
+-			send_buffer_.append(reinterpret_cast<unsigned char const*>(buffer), len);
+-			return static_cast<int>(len);
++			write_blocked_by_send_buffer_ = true;
++			error = EAGAIN;
++			return -1;
+ 		}
+-
+-		// GnuTLS has a writev() emulation that ignores trailing errors if
+-		// at least some data got sent
+-		res = GNUTLS_E_PUSH_ERROR;
++		res = OTERR_IO;
+ 	}
+ 
+-	failure(static_cast<int>(res), false, L"gnutls_record_send"sv);
++	failure(res, false, L"OT_Write"sv);
+ 	error = socket_error_ ? socket_error_ : ECONNABORTED;
+ 	return -1;
+ }
+ 
+-void tls_layer_impl::failure(int code, bool send_close, std::wstring_view const& function)
++void tls_layer_impl::failure(LONG code, bool send_close, std::wstring_view const& function)
+ {
+ 	logger_.log(logmsg::debug_debug, L"tls_layer_impl::failure(%d)", code);
+ 	if (code) {
+ 		bool suppress{};
+ 		auto level = logmsg::error;
+ 
+-		bool const premature_eof = socket_eof_ && (code == GNUTLS_E_UNEXPECTED_PACKET_LENGTH || code == GNUTLS_E_PREMATURE_TERMINATION);
++		bool const premature_eof = code == OTERR_CLOSED;
+ 
+ 		if (premature_eof) {
+ 			suppress = state_ == socket_state::shut_down && shutdown_silence_read_errors_;
+@@ -1448,7 +741,7 @@
+ 		}
+ 		log_error(code, function, level);
+ 		if (!suppress && premature_eof) {
+-			logger_.log(logmsg::status, server_ ? fztranslate("Client did not properly shut down TLS connection") : fztranslate("Server did not properly shut down TLS connection"));
++			logger_.log(logmsg::status, fztranslate("Server did not properly shut down TLS connection"));
+ 		}
+ 	}
+ 
+@@ -1486,8 +779,8 @@
+ 
+ 	state_ = socket_state::shutting_down;
+ 
+-	if (!send_buffer_.empty() || send_new_ticket_) {
+-		logger_.log(logmsg::debug_verbose, L"Postponing shutdown, send_buffer_ not empty");
++	if (out_pending_) {
++		logger_.log(logmsg::debug_verbose, L"Postponing shutdown, records still to send");
+ 		return EAGAIN;
+ 	}
+ 
+@@ -1499,21 +792,20 @@
+ 	logger_.log(logmsg::debug_verbose, L"tls_layer_impl::continue_shutdown()");
+ 
+ 	if (!sent_closure_alert_) {
+-		int res = gnutls_bye(session_, GNUTLS_SHUT_WR);
+-		while ((res == GNUTLS_E_INTERRUPTED || res == GNUTLS_E_AGAIN) && can_write_to_socket_) {
+-			res = gnutls_bye(session_, GNUTLS_SHUT_WR);
+-		}
+-		if (res == GNUTLS_E_INTERRUPTED || res == GNUTLS_E_AGAIN) {
++		out_pending_ = false;
++		LONG res = OT_Close(conn_);
++		if (res == OTERR_WOULDBLOCK || (res == OTERR_OK && out_pending_)) {
+ 			if (!socket_error_) {
+ 				return EAGAIN;
+ 			}
+-
+-			// GnuTLS has a writev() emulation that ignores trailing errors if
+-			// at least some data got sent
+-			res = GNUTLS_E_PUSH_ERROR;
++			res = OTERR_IO;
+ 		}
+-		if (res) {
+-			failure(res, false, L"gnutls_bye"sv);
++		if (res == OTERR_STATE) {
++			// Already closed by the peer: nothing to send
++			res = OTERR_OK;
++		}
++		if (res != OTERR_OK) {
++			failure(res, false, L"OT_Close"sv);
+ 			return socket_error_ ? socket_error_ : ECONNABORTED;
+ 		}
+ 		sent_closure_alert_ = true;
+@@ -1549,17 +841,9 @@
+ 	if (trusted) {
+ 		state_ = socket_state::connected;
+ 
+-#if DEBUG_SOCKETEVENTS
+-		if (can_read_from_socket_) {
+-			assert(!debug_can_read_);
+-			debug_can_read_ = true;
+-		}
+-		assert(!debug_can_write_);
+-		debug_can_write_ = true;
+-#endif
+ 		if (tls_layer_.event_handler_) {
+ 			tls_layer_.event_handler_->send_event<socket_event>(&tls_layer_, socket_event_flag::connection, 0);
+-			if (can_read_from_socket_) {
++			if (can_read_from_socket_ || (conn_ && OT_Pending(conn_) > 0)) {
+ 				tls_layer_.event_handler_->send_event<socket_event>(&tls_layer_, socket_event_flag::read, 0);
+ 			}
+ 		}
+@@ -1571,26 +855,23 @@
+ 	failure(0, true);
+ }
+ 
+-static std::string bin2hex(unsigned char const* in, size_t size)
++bool tls_layer_impl::extract_cert(std::vector<uint8_t> const& der, x509_certificate& out, bool last, logger_interface * logger)
+ {
+-	std::string str;
+-	str.reserve(size * 3);
+-	for (size_t i = 0; i < size; ++i) {
+-		if (i) {
+-			str += ':';
++	OTCertInfo info{};
++	info.Size = sizeof(info);
++	LONG res = OT_CertInfo(der.data(), static_cast<LONG>(der.size()), &info);
++	if (res != OTERR_OK) {
++		if (logger) {
++			logger->log(logmsg::error, fztranslate("Could not read certificate: %s"), OT_ErrorString(res));
+ 		}
+-		str += int_to_hex_char<char>(in[i] >> 4);
+-		str += int_to_hex_char<char>(in[i] & 0xf);
++		return false;
+ 	}
+ 
+-	return str;
+-}
+-
+-
+-bool tls_layer_impl::extract_cert(gnutls_x509_crt_t const& cert, x509_certificate& out, bool last, logger_interface * logger)
+-{
+-	datetime expiration_time(gnutls_x509_crt_get_expiration_time(cert), datetime::seconds);
+-	datetime activation_time(gnutls_x509_crt_get_activation_time(cert), datetime::seconds);
++	auto to_datetime = [](OTCertTime const& t) {
++		return datetime(datetime::utc, t.Year, t.Month, t.Day, t.Hour, t.Minute, t.Second);
++	};
++	datetime const activation_time = to_datetime(info.NotBefore);
++	datetime const expiration_time = to_datetime(info.NotAfter);
+ 
+ 	if (!activation_time || !expiration_time || expiration_time < activation_time) {
+ 		if (logger) {
+@@ -1599,387 +880,110 @@
+ 		return false;
+ 	}
+ 
+-	// Get the serial number of the certificate
+-	unsigned char buffer[40];
+-	size_t size = sizeof(buffer);
+-	int res = gnutls_x509_crt_get_serial(cert, buffer, &size);
+-	if (res != 0) {
+-		size = 0;
+-	}
+-
+-	auto serial = bin2hex(buffer, size);
+-
+-	unsigned int pk_bits;
+-	int pkAlgo = gnutls_x509_crt_get_pk_algorithm(cert, &pk_bits);
+-	std::string pk_algo_name;
+-	if (pkAlgo >= 0) {
+-		char const* pAlgo = gnutls_pk_algorithm_get_name((gnutls_pk_algorithm_t)pkAlgo);
+-		if (pAlgo) {
+-			pk_algo_name = pAlgo;
+-		}
+-	}
+-
+-	int signAlgo = gnutls_x509_crt_get_signature_algorithm(cert);
+-	std::string signAlgoName;
+-	if (signAlgo >= 0) {
+-		char const* pAlgo = gnutls_sign_algorithm_get_name((gnutls_sign_algorithm_t)signAlgo);
+-		if (pAlgo) {
+-			signAlgoName = pAlgo;
+-		}
+-	}
+-
+-	std::string subject, issuer;
+-
+-	datum_holder raw_subject;
+-	res = gnutls_x509_crt_get_dn3(cert, &raw_subject, 0);
+-	if (!res) {
+-		subject = raw_subject.to_string_view();
+-	}
+-	else if (res != GNUTLS_E_REQUESTED_DATA_NOT_AVAILABLE) {
++	std::string const issuer = info.Issuer;
++	if (issuer.empty()) {
+ 		if (logger) {
+-			logger->log(logmsg::debug_warning, "gnutls_x509_crt_get_dn3 failed with %d", res);
+-			logger->log(logmsg::error, fztranslate("Could not get distinguished name of certificate subject, gnutls_x509_get_dn failed"));
++			logger->log(logmsg::error, fztranslate("Could not get distinguished name of certificate issuer"));
+ 		}
+ 		return false;
+ 	}
+ 
+-	std::vector<x509_certificate::subject_name> alt_subject_names = get_cert_subject_alt_names(cert);
+-
+-	datum_holder raw_issuer;
+-	res = gnutls_x509_crt_get_issuer_dn3(cert, &raw_issuer, 0);
+-	if (!res) {
+-		issuer = raw_issuer.to_string_view();
+-	}
+-	else {
+-		if (logger) {
+-			logger->log(logmsg::debug_warning, "gnutls_x509_crt_get_issuer_dn3 failed with %d", res);
++	std::vector<x509_certificate::subject_name> alt_subject_names;
++	char san[1024];
++	for (LONG i = 0; i < info.AltNameCount; ++i) {
++		LONG const kind = OT_CertAltName(der.data(), static_cast<LONG>(der.size()), i, reinterpret_cast<STRPTR>(san), sizeof(san));
++		if (kind <= 0) {
++			break;
+ 		}
+-	}
+-	if (issuer.empty() ) {
+-		if (logger) {
+-			logger->log(logmsg::error, fztranslate("Could not get distinguished name of certificate issuer, gnutls_x509_get_issuer_dn failed"));
++		if ((kind == OT_ALT_DNS || kind == OT_ALT_EMAIL || kind == OT_ALT_IP) && *san) {
++			alt_subject_names.emplace_back(x509_certificate::subject_name{std::string(san), kind == OT_ALT_DNS});
+ 		}
+-		return false;
+-	}
+-
+-	std::string fingerprint_sha256;
+-	std::string fingerprint_sha1;
+-
+-	unsigned char digest[100];
+-	size = sizeof(digest) - 1;
+-	if (!gnutls_x509_crt_get_fingerprint(cert, GNUTLS_DIG_SHA256, digest, &size)) {
+-		digest[size] = 0;
+-		fingerprint_sha256 = bin2hex(digest, size);
+-	}
+-	size = sizeof(digest) - 1;
+-	if (!gnutls_x509_crt_get_fingerprint(cert, GNUTLS_DIG_SHA1, digest, &size)) {
+-		digest[size] = 0;
+-		fingerprint_sha1 = bin2hex(digest, size);
+ 	}
+ 
+-	datum_holder der;
+-	if (gnutls_x509_crt_export2(cert, GNUTLS_X509_FMT_DER, &der) != GNUTLS_E_SUCCESS || !der.data || !der.size) {
+-		if (logger) {
+-			logger->log(logmsg::error, L"gnutls_x509_crt_get_issuer_dn");
+-		}
+-		return false;
+-	}
+-	std::vector<uint8_t> data(der.data, der.data + der.size);
+-
+ 	out = x509_certificate(
+-		std::move(data),
++		std::vector<uint8_t>(der),
+ 		activation_time, expiration_time,
+-		serial,
+-		pk_algo_name, pk_bits,
+-		signAlgoName,
+-		fingerprint_sha256,
+-		fingerprint_sha1,
++		bin2hex(info.Serial, static_cast<size_t>(std::clamp<LONG>(info.SerialLength, 0, sizeof(info.Serial)))),
++		info.KeyAlgorithm, static_cast<unsigned int>(info.KeyBits),
++		info.SignatureAlgorithm,
++		bin2hex(info.SHA256, sizeof(info.SHA256)),
++		bin2hex(info.SHA1, sizeof(info.SHA1)),
+ 		issuer,
+-		subject,
++		info.Subject,
+ 		std::move(alt_subject_names),
+-		last ? gnutls_x509_crt_check_issuer(cert, cert) : false);
++		last ? info.SelfSigned != 0 : false);
+ 
+ 	return true;
+ }
+ 
+-
+-std::vector<x509_certificate::subject_name> tls_layer_impl::get_cert_subject_alt_names(gnutls_x509_crt_t cert)
++bool tls_layer_impl::get_peer_certificates(std::vector<std::vector<uint8_t>> & certs)
+ {
+-	std::vector<x509_certificate::subject_name> ret;
+-
+-	char san[4096];
+-	for (unsigned int i = 0; i < 10000; ++i) { // I assume this is a sane limit
+-		size_t san_size = sizeof(san) - 1;
+-		int const type_or_error = gnutls_x509_crt_get_subject_alt_name(cert, i, san, &san_size, nullptr);
+-		if (type_or_error == GNUTLS_E_SHORT_MEMORY_BUFFER) {
+-			continue;
+-		}
+-		else if (type_or_error < 0) {
+-			break;
+-		}
+-
+-		if (type_or_error == GNUTLS_SAN_DNSNAME || type_or_error == GNUTLS_SAN_RFC822NAME) {
+-			std::string dns = san;
+-			if (!dns.empty()) {
+-				ret.emplace_back(x509_certificate::subject_name{std::move(dns), type_or_error == GNUTLS_SAN_DNSNAME});
+-			}
+-		}
+-		else if (type_or_error == GNUTLS_SAN_IPADDRESS) {
+-			std::string ip = socket::address_to_string(san, static_cast<int>(san_size));
+-			if (!ip.empty()) {
+-				ret.emplace_back(x509_certificate::subject_name{std::move(ip), false});
+-			}
+-		}
++	LONG const n = OT_GetPeerChainLength(conn_);
++	if (n <= 0) {
++		logger_.log(logmsg::error, fztranslate("The server sent no certificates"));
++		return false;
+ 	}
+-	return ret;
+-}
+-
+-bool tls_layer_impl::certificate_is_blacklisted(cert_list_holder const& certs)
+-{
+-	for (size_t i = 0; i < certs.certs_size; ++i) {
+-		if (certificate_is_blacklisted(certs.certs[i])) {
+-			return true;
++	for (LONG i = 0; i < n; ++i) {
++		LONG const len = OT_GetPeerCertificateN(conn_, i, nullptr, 0);
++		if (len <= 0) {
++			logger_.log(logmsg::error, fztranslate("Could not read the server's certificate chain"));
++			return false;
+ 		}
+-	}
+-	return false;
+-}
+-
+-bool tls_layer_impl::certificate_is_blacklisted(gnutls_x509_crt_t const& cert)
+-{
+-	static std::set<std::string, std::less<>> const bad_authority_key_ids = {
+-		std::string("\xF4\x94\xBF\xDE\x50\xB6\xDB\x6B\x24\x3D\x9E\xF7\xBE\x3A\xAE\x36\xD7\xFB\x0E\x05", 20) // Nation-wide MITM in Kazakhstan
+-	};
+-
+-	char buf[256];
+-	unsigned int critical{};
+-	size_t size = sizeof(buf);
+-	int res = gnutls_x509_crt_get_authority_key_id(cert, buf, &size, &critical);
+-	if (!res) {
+-		auto it = bad_authority_key_ids.find(std::string_view(buf, size));
+-		if (it != bad_authority_key_ids.cend()) {
+-			return true;
++		std::vector<uint8_t> der(static_cast<size_t>(len));
++		if (OT_GetPeerCertificateN(conn_, i, der.data(), len) != len) {
++			logger_.log(logmsg::error, fztranslate("Could not read the server's certificate chain"));
++			return false;
+ 		}
++		certs.emplace_back(std::move(der));
+ 	}
+-
+-	return false;
++	return true;
+ }
+ 
+ int tls_layer_impl::get_algorithm_warnings() const
+ {
+ 	int algorithmWarnings{};
+-
+-	switch (gnutls_protocol_get_version(session_))
+-	{
+-		case GNUTLS_SSL3:
+-		case GNUTLS_VERSION_UNKNOWN:
++	if (conn_) {
++		LONG const v = OT_GetProtocol(conn_);
++		if (v < OT_TLS10) {
+ 			algorithmWarnings |= tls_session_info::tlsver;
+-			break;
+-		default:
+-			break;
+-	}
+-
+-	switch (gnutls_cipher_get(session_)) {
+-		case GNUTLS_CIPHER_UNKNOWN:
+-		case GNUTLS_CIPHER_NULL:
+-		case GNUTLS_CIPHER_ARCFOUR_128:
+-		case GNUTLS_CIPHER_3DES_CBC:
+-		case GNUTLS_CIPHER_ARCFOUR_40:
+-		case GNUTLS_CIPHER_RC2_40_CBC:
+-		case GNUTLS_CIPHER_DES_CBC:
+-			algorithmWarnings |= tls_session_info::cipher;
+-			break;
+-		default:
+-			break;
+-	}
+-
+-	switch (gnutls_mac_get(session_)) {
+-		case GNUTLS_MAC_UNKNOWN:
+-		case GNUTLS_MAC_NULL:
+-		case GNUTLS_MAC_MD5:
+-		case GNUTLS_MAC_MD2:
+-		case GNUTLS_MAC_UMAC_96:
+-			algorithmWarnings |= tls_session_info::mac;
+-			break;
+-		default:
+-			break;
+-	}
+-
+-	switch (gnutls_kx_get(session_)) {
+-		case GNUTLS_KX_UNKNOWN:
+-		case GNUTLS_KX_ANON_DH:
+-		case GNUTLS_KX_RSA_EXPORT:
+-		case GNUTLS_KX_ANON_ECDH:
+-			algorithmWarnings |= tls_session_info::kex;
+-			break;
+-		default:
+-			break;
++		}
+ 	}
+-
+ 	return algorithmWarnings;
+ }
+ 
+-int tls_layer_impl::load_certificates(const_tls_param_ref in, tls_data_format format, gnutls_x509_crt_t *& certs, unsigned int & certs_size, bool & sort, logger_interface *logger)
++bool tls_layer_impl::load_certificates(const_tls_param_ref in, tls_data_format format, std::vector<std::vector<uint8_t>> & out, logger_interface * logger)
+ {
+ 	if (in.pkcs11url()) {
+ 		if (logger) {
+ 			logger->log_raw(logmsg::error, fztranslate("PKCS11 URLs not supported yet for certificates"));
+ 		}
+-
+-		return {};
++		return false;
+ 	}
+ 
++	std::string blob;
+ 	if (auto certsfile = in.filepath()) {
+-		if (!certsfile) {
+-			if (logger) {
+-				logger->log_raw(logmsg::error, fztranslate("Invalid file path for certificates"));
+-			}
+-
+-			return {};
+-		}
+-
+-		auto blob = read_certificates_file(certsfile->value, logger);
+-		if (blob.empty()) {
+-			return {};
+-		}
+-
+-		return load_certificates(blob, is_pem(blob, format), certs, certs_size, sort);
+-	}
+-
+-	if (auto blob = in.blob()) {
+-		if (!blob) {
+-			if (logger) {
+-				logger->log_raw(logmsg::error, fztranslate("Invalid data blob for certificates"));
+-			}
+-
+-			return {};
+-		}
+-
+-		return load_certificates(blob->value, is_pem(blob->value, format), certs, certs_size, sort);
+-	}
+-
+-	if (logger) {
+-		logger->log_raw(logmsg::error, fztranslate("Internal error: invalid certs"));
++		blob = read_file(certsfile->value, logger);
+ 	}
+-
+-	return {};
+-}
+-
+-int tls_layer_impl::load_certificates(std::string_view const& in, bool pem, gnutls_x509_crt_t *& certs, unsigned int & certs_size, bool & sort)
+-{
+-	gnutls_datum_t dpem;
+-	dpem.data = reinterpret_cast<unsigned char*>(const_cast<char *>(in.data()));
+-	dpem.size = in.size();
+-	unsigned int flags{};
+-	if (sort) {
+-		flags |= GNUTLS_X509_CRT_LIST_FAIL_IF_UNSORTED;
+-	}
+-
+-	int res = gnutls_x509_crt_list_import2(&certs, &certs_size, &dpem, pem ? GNUTLS_X509_FMT_PEM : GNUTLS_X509_FMT_DER, flags);
+-	if (res == GNUTLS_E_CERTIFICATE_LIST_UNSORTED) {
+-		sort = false;
+-		flags |= GNUTLS_X509_CRT_LIST_SORT;
+-		res = gnutls_x509_crt_list_import2(&certs, &certs_size, &dpem, pem ? GNUTLS_X509_FMT_PEM : GNUTLS_X509_FMT_DER, flags);
+-	}
+-
+-	if (res != GNUTLS_E_SUCCESS) {
+-		certs = nullptr;
+-		certs_size = 0;
++	else if (auto b = in.blob()) {
++		blob = b->value;
+ 	}
+-	return res;
+-}
+-
+-bool tls_layer_impl::get_sorted_peer_certificates(gnutls_x509_crt_t *& certs, unsigned int & certs_size)
+-{
+-	certs = nullptr;
+-	certs_size = 0;
+-
+-	// First get unsorted list of peer certificates in DER
+-	unsigned int cert_list_size;
+-	const gnutls_datum_t* cert_list = gnutls_certificate_get_peers(session_, &cert_list_size);
+-	if (!cert_list || !cert_list_size) {
+-		logger_.log(logmsg::error, fztranslate("gnutls_certificate_get_peers returned no certificates"));
++	else {
++		if (logger) {
++			logger->log_raw(logmsg::error, fztranslate("Internal error: invalid certs"));
++		}
+ 		return false;
+ 	}
+ 
+-	// Convert them all to PEM
+-	// Avoid gnutls_pem_base64_encode2, excessive allocations.
+-	auto constexpr header = "-----BEGIN CERTIFICATE-----\r\n"sv;
+-	auto constexpr footer = "\r\n-----END CERTIFICATE-----\r\n"sv;
+-
+-	size_t cap = cert_list_size * header.size() + footer.size();
+-	for (unsigned i = 0; i < cert_list_size; ++i) {
+-		cap += ((cert_list[i].size + 2) / 3) * 4;
+-	}
+-
+-	std::string pem;
+-	pem.reserve(cap);
+-
+-	for (unsigned i = 0; i < cert_list_size; ++i) {
+-		pem += header;
+-		base64_encode_append(pem, to_view(cert_list[i]), base64_type::standard, true);
+-		pem += footer;
+-	}
+-
+-	// And now import the certificates
+-	bool sort = true;
+-	int res = load_certificates(pem, true, certs, certs_size, sort);
+-	if (res == GNUTLS_E_CERTIFICATE_LIST_UNSORTED) {
+-		logger_.log(logmsg::error, fztranslate("Could not sort peer certificates"));
+-	}
+-	else if (!sort) {
+-		logger_.log(logmsg::error, fztranslate("Server sent unsorted certificate chain in violation of the TLS specifications"));
+-	}
+-
+-	return res == GNUTLS_E_SUCCESS;
+-}
+-
+-void tls_layer_impl::log_verification_error(int status)
+-{
+-	gnutls_datum_t buffer{};
+-	gnutls_certificate_verification_status_print(status, GNUTLS_CRT_X509, &buffer, 0);
+-	if (buffer.data) {
+-		logger_.log(logmsg::debug_warning, L"Gnutls Verification status: %s", buffer.data);
+-		gnutls_free(buffer.data);
+-	}
+-
+-	if (status & GNUTLS_CERT_REVOKED) {
+-		logger_.log(logmsg::error, fztranslate("Beware! Certificate has been revoked"));
+-
+-		// The remaining errors are no longer of interest
+-		return;
++	if (blob.empty()) {
++		return false;
+ 	}
+-	if (status & GNUTLS_CERT_SIGNATURE_FAILURE) {
+-		logger_.log(logmsg::error, fztranslate("Certificate signature verification failed"));
+-		status &= ~GNUTLS_CERT_SIGNATURE_FAILURE;
+-	}
+-	if (status & GNUTLS_CERT_INSECURE_ALGORITHM) {
+-		logger_.log(logmsg::error, fztranslate("A certificate in the chain was signed using an insecure algorithm"));
+-		status &= ~GNUTLS_CERT_INSECURE_ALGORITHM;
+-	}
+-	if (status & GNUTLS_CERT_SIGNER_NOT_CA) {
+-		logger_.log(logmsg::error, fztranslate("An issuer in the certificate chain is not a certificate authority"));
+-		status &= ~GNUTLS_CERT_SIGNER_NOT_CA;
+-	}
+-	if (status & GNUTLS_CERT_UNEXPECTED_OWNER) {
+-		logger_.log(logmsg::error, fztranslate("The server's hostname does not match the certificate's hostname"));
+-		status &= ~GNUTLS_CERT_UNEXPECTED_OWNER;
+-	}
+-	if (status & GNUTLS_CERT_MISSING_OCSP_STATUS) {
+-		logger_.log(logmsg::error, fztranslate("The certificate requires the server to include an OCSP status in its response, but the OCSP status is missing."));
+-		status &= ~GNUTLS_CERT_MISSING_OCSP_STATUS;
+-	}
+-	if (status & GNUTLS_CERT_INVALID_OCSP_STATUS) {
+-		logger_.log(logmsg::error, fztranslate("The received OCSP status is invalid."));
+-		status &= ~GNUTLS_CERT_INVALID_OCSP_STATUS;
+-	}
+-	if (status) {
+-		if (status == GNUTLS_CERT_INVALID) {
+-			logger_.log(logmsg::error, fztranslate("Received certificate chain could not be verified."));
+-		}
+-		else {
+-			logger_.log(logmsg::error, fztranslate("Received certificate chain could not be verified. Verification status is %d."), status);
++	if (!split_certificates(blob, is_pem(blob, format), out)) {
++		if (logger) {
++			logger->log_raw(logmsg::error, fztranslate("Could not read the certificates"));
+ 		}
++		return false;
+ 	}
++	return true;
+ }
+ 
+ int tls_layer_impl::verify_certificate()
+@@ -1991,35 +995,33 @@
+ 		return ENOTCONN;
+ 	}
+ 
+-	if (gnutls_certificate_type_get(session_) != GNUTLS_CRT_X509) {
+-		logger_.log(logmsg::error, fztranslate("Unsupported certificate type"));
+-		failure(0, true);
+-		return EOPNOTSUPP;
++	if (resumed_session()) {
++		// The session came from a connection whose certificate was trusted,
++		// and GFOpenTLS keeps no chain for a resumed one
++		logger_.log(logmsg::debug_info, L"Resumed session: certificate as trusted before");
++		set_verification_result(true);
++		if (state_ != socket_state::connected && state_ != socket_state::shutting_down && state_ != socket_state::shut_down) {
++			return ECONNABORTED;
++		}
++		return 0;
+ 	}
+ 
+-	cert_list_holder certs;
+-	if (!get_sorted_peer_certificates(certs.certs, certs.certs_size)) {
++	std::vector<std::vector<uint8_t>> certs;
++	if (!get_peer_certificates(certs)) {
+ 		failure(0, true);
+ 		return EINVAL;
+ 	}
+ 
+-	if (certificate_is_blacklisted(certs)) {
+-		logger_.log(logmsg::error, fztranslate("Man-in-the-Middle attack detected, aborting connection."));
+-		failure(0, true);
+-		return EINVAL;
++	for (auto const& c : certs) {
++		if (certificate_is_blacklisted(c)) {
++			logger_.log(logmsg::error, fztranslate("Man-in-the-Middle attack detected, aborting connection."));
++			failure(0, true);
++			return EINVAL;
++		}
+ 	}
+ 
+ 	if (!required_certificate_.empty()) {
+-		datum_holder cert_der{};
+-		int res = gnutls_x509_crt_export2(certs.certs[0], GNUTLS_X509_FMT_DER, &cert_der);
+-		if (res != GNUTLS_E_SUCCESS) {
+-			failure(res, true, L"gnutls_x509_crt_export2"sv);
+-			return ECONNABORTED;
+-		}
+-
+-		if (required_certificate_.size() != cert_der.size ||
+-			memcmp(required_certificate_.data(), cert_der.data, cert_der.size))
+-		{
++		if (required_certificate_ != certs[0]) {
+ 			logger_.log(logmsg::error, fztranslate("Certificate of connection does not match expected certificate."));
+ 			failure(0, true);
+ 			return EINVAL;
+@@ -2035,101 +1037,33 @@
+ 
+ 	bool const uses_hostname = !hostname_.empty() && get_address_type(hostname_) == address_type::unknown;
+ 
+-	bool const can_use_trust_store = uses_hostname && system_trust_store_;
+-	bool systemTrust = false;
+-	bool hostnameMismatch = false;
+-
+-	// Our trust-model is user-guided TOFU on the host's certificate.
+-	//
+-	// First we verify it against the system trust store.
+-	//
+-	// If that fails, we validate the certificate chain sent by the server
+-	// allowing three impairments:
+-	// - Hostname mismatch
+-	// - Out of validity
+-	// - Signer not found
+-	//
+-	// In any case, actual trust decision is done later by the user.
+-
+-	std::vector<x509_certificate> system_trust_chain;
+-
+-	// First, check system trust
+-	if (can_use_trust_store) {
+-		auto lease = system_trust_store_->impl_->lease();
+-		auto cred = std::get<0>(lease);
+-		if (cred) {
+-			bool trust_path_ok{true};
+-			std::vector<x509_certificate> trust_path;
+-			tls_layerCallbacks::verify_output_cb_ = [this, &trust_path_ok, &trust_path](gnutls_x509_crt_t cert, gnutls_x509_crt_t issuer, gnutls_x509_crl_t crl, unsigned int verification_output) {
+-				if (!trust_path_ok) {
+-					return;
+-				}
+-				if (cert && !issuer && crl && !verification_output) {
+-					// Verified against a CRL that the cert isn't expired
+-					return;
+-				}
+-				if (verification_output != 0) {
+-					trust_path.clear();
+-					return;
+-				}
+-				if (!issuer || !cert) {
+-					trust_path_ok = false;
+-					return;
+-				}
++	// What the system trust store says: the chain ends at a trusted CA, the
++	// dates hold and the certificate names the host
++	LONG const verdict = OT_GetVerifyResult(conn_);
++	logger_.log(logmsg::debug_verbose, L"System trust store decision: %s", OT_ErrorString(verdict));
+ 
+-				x509_certificate info;
+-				if (!extract_cert(issuer, info, true, &logger_)) {
+-					trust_path_ok = false;
+-					return;
+-				}
+-				if (trust_path.empty() || info.get_fingerprint_sha256() != trust_path.back().get_fingerprint_sha256()) {
+-					trust_path.emplace_back(std::move(info));
+-				}
+-			};
+-
+-			gnutls_session_set_verify_output_function(session_, c_verify_output_cb);
+-			gnutls_credentials_set(session_, GNUTLS_CRD_CERTIFICATE, cred);
+-			unsigned int status = 0;
+-			int verifyResult = gnutls_certificate_verify_peers3(session_, to_utf8(hostname_).c_str(), &status);
+-			gnutls_credentials_set(session_, GNUTLS_CRD_CERTIFICATE, cert_context_.credentials);
+-			std::get<1>(lease).unlock();
+-
+-			gnutls_session_set_verify_output_function(session_, nullptr);
+-			tls_layerCallbacks::verify_output_cb_ = nullptr;
+-
+-			if (verifyResult < 0) {
+-				logger_.log(logmsg::debug_warning, L"gnutls_certificate_verify_peers2 returned %d with status %u", verifyResult, status);
+-				logger_.log(logmsg::error, fztranslate("Failed to verify peer certificate"));
+-				failure(0, true);
+-				return EINVAL;
+-			}
++	if (verdict == OTERR_BADCERT) {
++		logger_.log(logmsg::error, fztranslate("The server's certificate chain is broken: %s"), OT_ErrorString(verdict));
++		failure(0, true);
++		return EINVAL;
++	}
+ 
+-			if (!status) {
+-				if (!trust_path_ok || trust_path.empty()) {
+-					logger_.log(logmsg::error, fztranslate("Failed to extract certificate trust path"));
+-					failure(0, true);
+-					return EINVAL;
+-				}
++	bool const systemTrust = uses_hostname && system_trust_store_ && verdict == OTERR_OK;
+ 
+-				// Reverse chain so that it starts at server certificate and add the server cert
+-				system_trust_chain.reserve(trust_path.size() + 1);
+-				x509_certificate cert;
+-				if (!extract_cert(certs.certs[0], cert, false, &logger_)) {
+-					failure(0, true);
+-					return ECONNABORTED;
+-				}
+-				system_trust_chain.emplace_back(std::move(cert));
+-				for (auto it = trust_path.rbegin(); it != trust_path.rend(); ++it) {
+-					system_trust_chain.emplace_back(std::move(*it));
+-				}
+-				systemTrust = true;
+-			}
+-			logger_.log(logmsg::debug_verbose, L"System trust store decision: %s", systemTrust ? "true"sv : "false"sv);
+-		}
+-		else {
+-			std::get<1>(lease).unlock();
+-			logger_.log(logmsg::debug_warning, L"System trust store could not be loaded");
++	std::vector<x509_certificate> certificates;
++	certificates.reserve(certs.size());
++	for (size_t i = 0; i < certs.size(); ++i) {
++		x509_certificate cert;
++		if (!extract_cert(certs[i], cert, i + 1 == certs.size(), &logger_)) {
++			failure(0, true);
++			return ECONNABORTED;
+ 		}
++		certificates.emplace_back(std::move(cert));
++	}
++
++	std::vector<x509_certificate> system_trust_chain;
++	if (systemTrust) {
++		system_trust_chain = certificates;
+ 	}
+ 
+ 	if (!verification_handler_) {
+@@ -2139,326 +1073,139 @@
+ 		set_verification_result(systemTrust);
+ 		return systemTrust ? 0 : ECONNABORTED;
+ 	}
+-	else {
+-		if (!systemTrust) {
+-			// System trust store cannot verify this certificate. Allow three impairments:
+-			//
+-			// 1. For now, add the highest certificate from the chain to trust list. Otherwise
+-			// gnutls_certificate_verify_peers2 always stops with GNUTLS_CERT_SIGNER_NOT_FOUND
+-			// at the highest certificate in the chain.
+-			gnutls_x509_crt_t root{};
+-			clone_cert(certs.certs[certs.certs_size - 1], root);
+-			if (!root) {
+-				logger_.log(logmsg::error, fztranslate("Could not copy certificate"));
+-				failure(0, true);
+-				return ECONNABORTED;
+-			}
+-
+-			gnutls_x509_trust_list_t tlist;
+-			gnutls_certificate_get_trust_list(cert_context_.credentials, &tlist);
+-			if (gnutls_x509_trust_list_add_cas(tlist, &root, 1, 0) != 1) {
+-				logger_.log(logmsg::error, fztranslate("Could not add certificate to temporary trust list"));
+-				failure(0, true);
+-				return ECONNABORTED;
+-			}
+-
+-			// 2. Also disable time checks. We allow expired/not yet valid certificates, though only
+-			// after explicit user confirmation.
+-			gnutls_certificate_set_verify_flags(cert_context_.credentials, gnutls_certificate_get_verify_flags(cert_context_.credentials) | GNUTLS_VERIFY_DISABLE_TIME_CHECKS | GNUTLS_VERIFY_DISABLE_TRUSTED_TIME_CHECKS);
+-
+-			unsigned int status = 0;
+-			int verifyResult = gnutls_certificate_verify_peers2(session_, &status);
+-
+-			if (verifyResult < 0) {
+-				logger_.log(logmsg::debug_warning, L"gnutls_certificate_verify_peers2 returned %d with status %u", verifyResult, status);
+-				logger_.log(logmsg::error, fztranslate("Failed to verify peer certificate"));
+-				failure(0, true);
+-				return EINVAL;
+-			}
+-
+-			if (status != 0) {
+-				log_verification_error(status);
+-
+-				failure(0, true);
+-				return EINVAL;
+-			}
+-
+-			// 3. Hostname mismatch
+-			if (uses_hostname) {
+-				if (!gnutls_x509_crt_check_hostname(certs.certs[0], to_utf8(hostname_).c_str())) {
+-					hostnameMismatch = true;
+-					logger_.log(logmsg::debug_warning, L"Hostname does not match certificate SANs");
+-				}
+-			}
+-		}
+ 
+-		std::vector<x509_certificate> certificates;
+-		certificates.reserve(certs.certs_size);
+-		for (unsigned int i = 0; i < certs.certs_size; ++i) {
+-			x509_certificate cert;
+-			if (extract_cert(certs.certs[i], cert, i + 1 == certs.certs_size, &logger_)) {
+-				certificates.emplace_back(std::move(cert));
+-			}
+-			else {
+-				failure(0, true);
+-				return ECONNABORTED;
+-			}
++	bool hostnameMismatch = false;
++	if (!systemTrust && uses_hostname) {
++		if (verdict == OTERR_HOSTNAME) {
++			hostnameMismatch = true;
+ 		}
+-
+-		// Lengthen incomplete chains to the root using the trust store.
+-		if (!certificates.empty() && !certificates.back().self_signed() && system_trust_store_) {
+-			auto lease = system_trust_store_->impl_->lease();
+-			auto cred = std::get<0>(lease);
+-			if (cred) {
+-				gnutls_x509_crt_t cert = certs.certs[certs.certs_size - 1];
+-				while (!certificates.back().self_signed()) {
+-					gnutls_x509_crt_t issuer{};
+-					if (gnutls_certificate_get_issuer(cred, cert, &issuer, 0) || !issuer) {
+-						break;
+-					}
+-
+-					// Why is this cert even in the trust store? Antivirus MITM?
+-					if (certificate_is_blacklisted(issuer)) {
+-						logger_.log(logmsg::error, fztranslate("Man-in-the-Middle attack detected, aborting connection."));
+-						failure(0, true);
+-						return EINVAL;
+-					}
+-
+-					x509_certificate out;
+-					if (!extract_cert(issuer, out, true, &logger_)) {
+-						failure(0, true);
+-						return ECONNABORTED;
+-					}
+-					certificates.push_back(out);
+-					cert = issuer;
++		else {
++			auto const host = to_utf8(hostname_);
++			hostnameMismatch = true;
++			for (auto const& n : certificates[0].get_alt_subject_names()) {
++				if (n.is_dns && dns_name_matches(n.name, host)) {
++					hostnameMismatch = false;
++					break;
+ 				}
+ 			}
+ 		}
+-
+-		int const algorithmWarnings = get_algorithm_warnings();
+-
+-		int error;
+-		auto port = tls_layer_.peer_port(error);
+-		if (port == -1) {
+-			socket_error_ = error;
+-			failure(0, true);
+-			return ECONNABORTED;
++		if (hostnameMismatch) {
++			logger_.log(logmsg::debug_warning, L"Hostname does not match certificate SANs");
+ 		}
++	}
+ 
+-		tls_session_info session_info(
+-			to_utf8(to_wstring(hostname_)),
+-			port,
+-			get_protocol(),
+-			get_key_exchange(),
+-			get_cipher(),
+-			get_mac(),
+-			algorithmWarnings,
+-			std::move(certificates),
+-			std::move(system_trust_chain),
+-			hostnameMismatch
+-		);
++	int error;
++	auto port = tls_layer_.peer_port(error);
++	if (port == -1) {
++		socket_error_ = error;
++		failure(0, true);
++		return ECONNABORTED;
++	}
+ 
+-		logger_.log(logmsg::debug_verbose, L"Sending certificate_verification_event");
+-		verification_handler_->send_event<certificate_verification_event>(&tls_layer_, std::move(session_info));
++	tls_session_info session_info(
++		to_utf8(to_wstring(hostname_)),
++		port,
++		get_protocol(),
++		get_key_exchange(),
++		get_cipher(),
++		get_mac(),
++		get_algorithm_warnings(),
++		std::move(certificates),
++		std::move(system_trust_chain),
++		hostnameMismatch
++	);
+ 
+-		return EAGAIN;
+-	}
++	logger_.log(logmsg::debug_verbose, L"Sending certificate_verification_event");
++	verification_handler_->send_event<certificate_verification_event>(&tls_layer_, std::move(session_info));
++
++	return EAGAIN;
+ }
+ 
+ std::string tls_layer_impl::get_protocol() const
+ {
+-	std::string ret;
+-
+-	char const* s = gnutls_protocol_get_name(gnutls_protocol_get_version(session_));
+-	if (s && *s) {
+-		ret = s;
+-	}
+-
+-	if (ret.empty()) {
+-		ret = to_utf8(fztranslate("unknown"));
++	if (conn_) {
++		switch (OT_GetProtocol(conn_)) {
++		case OT_TLS10: return "TLS1.0";
++		case OT_TLS11: return "TLS1.1";
++		case OT_TLS12: return "TLS1.2";
++		case OT_TLS13: return "TLS1.3";
++		default: break;
++		}
+ 	}
+-
+-	return ret;
++	return to_utf8(fztranslate("unknown"));
+ }
+ 
+ std::string tls_layer_impl::get_key_exchange() const
+ {
+ 	std::string ret;
+-
+-	char const* s{};
+-	gnutls_kx_algorithm_t alg = gnutls_kx_get(session_);
+-	bool const dh = (alg == GNUTLS_KX_DHE_RSA || alg == GNUTLS_KX_DHE_DSS);
+-	bool const ecdh = (alg == GNUTLS_KX_ECDHE_RSA || alg == GNUTLS_KX_ECDHE_ECDSA);
+-	if (dh || ecdh) {
+-		char const* const signature_name = gnutls_sign_get_name(static_cast<gnutls_sign_algorithm_t>(gnutls_sign_algorithm_get(session_)));
+-		ret = (ecdh ? "ECDHE" : "DHE");
+-		s = gnutls_group_get_name(gnutls_group_get(session_));
+-		if (s && *s) {
+-			ret += "-";
+-			ret += s;
+-		}
+-		if (signature_name && *signature_name) {
+-			ret += "-";
+-			ret += signature_name;
+-		}
+-	}
+-	else {
+-		s = gnutls_kx_get_name(alg);
++	if (conn_) {
++		char const* s = OT_GetKeyExchange(conn_);
+ 		if (s && *s) {
+ 			ret = s;
++			if (ret != "RSA") {
++				ret = "ECDHE-" + str_toupper_ascii(ret);
++			}
+ 		}
+ 	}
+-
+-
+ 	if (ret.empty()) {
+ 		ret = to_utf8(fztranslate("unknown"));
+ 	}
+-
+ 	return ret;
+ }
+ 
+ std::string tls_layer_impl::get_cipher() const
+ {
+ 	std::string ret;
+-
+-	char const* cipher = gnutls_cipher_get_name(gnutls_cipher_get(session_));
+-	if (cipher && *cipher) {
+-		ret = cipher;
++	if (conn_) {
++		char const* s = OT_GetCipher(conn_);
++		if (s && *s) {
++			ret = s;
++		}
+ 	}
+-
+ 	if (ret.empty()) {
+ 		ret = to_utf8(fztranslate("unknown"));
+ 	}
+-
+ 	return ret;
+ }
+ 
+ std::string tls_layer_impl::get_mac() const
+ {
+ 	std::string ret;
+-
+-	char const* mac = gnutls_mac_get_name(gnutls_mac_get(session_));
+-	if (mac && *mac) {
+-		ret = mac;
++	if (conn_) {
++		char const* s = OT_GetMAC(conn_);
++		if (s && *s) {
++			ret = s;
++		}
+ 	}
+-
+ 	if (ret.empty()) {
+ 		ret = to_utf8(fztranslate("unknown"));
+ 	}
+-
+ 	return ret;
+ }
+ 
+-std::string tls_layer_impl::list_tls_ciphers(std::string const& priority)
+-{
+-	auto list = sprintf("Ciphers for %s:\n", priority.empty() ? ciphers : priority);
+-
+-	gnutls_priority_t pcache;
+-	char const* err = nullptr;
+-	int ret = gnutls_priority_init(&pcache, priority.empty() ? ciphers : priority.c_str(), &err);
+-	if (ret < 0) {
+-		list += sprintf("gnutls_priority_init failed with code %d: %s", ret, err ? err : "Unknown error");
+-		return list;
+-	}
+-	else {
+-		for (unsigned int i = 0; ; ++i) {
+-			unsigned int idx;
+-			ret = gnutls_priority_get_cipher_suite_index(pcache, i, &idx);
+-			if (ret == GNUTLS_E_REQUESTED_DATA_NOT_AVAILABLE) {
+-				break;
+-			}
+-			if (ret == GNUTLS_E_UNKNOWN_CIPHER_SUITE) {
+-				continue;
+-			}
+-
+-			gnutls_protocol_t version;
+-			unsigned char id[2];
+-			char const* name = gnutls_cipher_suite_info(idx, id, nullptr, nullptr, nullptr, &version);
+-
+-			if (name != nullptr) {
+-				list += sprintf(
+-					"%-50s    0x%02x, 0x%02x    %s\n",
+-					name,
+-					(unsigned char)id[0],
+-					(unsigned char)id[1],
+-					gnutls_protocol_get_name(version));
+-			}
+-		}
+-	}
+-
+-	return list;
+-}
+-
+-int tls_layer_impl::do_call_gnutls_record_recv(void* data, size_t len)
++std::string tls_layer_impl::list_tls_ciphers(std::string const&)
+ {
+-	ssize_t res = gnutls_record_recv(session_, data, len);
+-	while ((res == GNUTLS_E_AGAIN || res == GNUTLS_E_INTERRUPTED) && can_read_from_socket_ && !gnutls_record_get_direction(session_)) {
+-		// Spurious EAGAIN. Can happen if GnuTLS gets a partial
+-		// record and the socket got closed.
+-		// The unexpected close is being ignored in this case, unless
+-		// gnutls_record_recv is being called again.
+-		// Manually call gnutls_record_recv as in case of eof on the socket,
+-		// we are not getting another receive event.
+-		logger_.log(logmsg::debug_verbose, L"gnutls_record_recv returned spurious EAGAIN");
+-		res = gnutls_record_recv(session_, data, len);
+-	}
+-
+-	if ((res == GNUTLS_E_AGAIN || res == GNUTLS_E_INTERRUPTED) && socket_error_) {
+-		res = GNUTLS_E_PULL_ERROR;
+-	}
+-
+-	return static_cast<int>(res);
++	return "Ciphers for GFOpenTLS:\n"
++		"TLS_AES_128_GCM_SHA256                                TLS1.3\n"
++		"TLS_AES_256_GCM_SHA384                                TLS1.3\n"
++		"TLS_CHACHA20_POLY1305_SHA256                          TLS1.3\n"
++		"ECDHE-ECDSA and ECDHE-RSA with AES-GCM, ChaCha20-Poly1305 and AES-CBC   TLS1.2\n";
+ }
+ 
+ std::string tls_layer_impl::get_gnutls_version()
+ {
+-	char const* v = gnutls_check_version(nullptr);
+-	if (!v || !*v) {
+-		return "unknown";
+-	}
+-
+-	return v;
++	ULONG const v = OT_Version();
++	return fz::sprintf("GFOpenTLS %u.%u", v >> 16, v & 0xffff);
+ }
+ 
+ void tls_layer_impl::set_hostname(native_string const& host)
+ {
+ 	hostname_ = host;
+-	if (session_ && !hostname_.empty() && get_address_type(hostname_) == address_type::unknown) {
+-		auto const utf8 = to_utf8(hostname_);
+-		if (!utf8.empty()) {
+-			int res = gnutls_server_name_set(session_, GNUTLS_NAME_DNS, utf8.c_str(), utf8.size());
+-			if (res) {
+-				log_error(res, L"gnutls_server_name_set"sv, logmsg::debug_warning);
+-			}
+-		}
+-	}
+ }
+ 
+ native_string tls_layer_impl::get_hostname() const
+ {
+-	if (!session_) {
+-		return {};
+-	}
+-
+-	size_t len{};
+-	unsigned int type{};
+-	unsigned int i{};
+-	int ret;
+-	do {
+-		ret = gnutls_server_name_get(session_, nullptr, &len, &type, i++);
+-	}
+-	while (ret == GNUTLS_E_SHORT_MEMORY_BUFFER && type != GNUTLS_NAME_DNS);
+-
+-	if (ret == GNUTLS_E_SHORT_MEMORY_BUFFER) {
+-		std::string name;
+-		name.resize(len - 1);
+-		ret = gnutls_server_name_get(session_, name.data(), &len, &type, --i);
+-		if (!ret) {
+-			return fz::to_native(name);
+-		}
+-	}
+-
+-	return {};
++	return hostname_;
+ }
+ 
+ int tls_layer_impl::connect(native_string const& host, unsigned int port, address_type family)
+@@ -2470,712 +1217,79 @@
+ 	return tls_layer_.next_layer_.connect(host, port, family);
+ }
+ 
+-namespace {
+-void append_with_size(uint8_t * &p, std::vector<uint8_t> const& d)
+-{
+-	size_t s = d.size();
+-	memcpy(p, &s, sizeof(s));
+-	p += sizeof(s);
+-	if (s) {
+-		memcpy(p, d.data(), s);
+-		p += s;
+-	}
+-}
+-}
+-
+ std::vector<uint8_t> tls_layer_impl::get_session_parameters() const
+ {
+-	std::vector<uint8_t> ret;
+-
+-	if (!server_) {
+-		datum_holder d;
+-		int res = gnutls_session_get_data2(session_, &d);
+-		if (res) {
+-			logger_.log(logmsg::debug_warning, L"gnutls_session_get_data2 failed: %d", res);
+-		}
+-		else {
+-			ret.assign(d.data, d.data + d.size);
+-		}
+-	}
+-	else {
+-		ret.resize(sizeof(size_t) * 3 + ticket_key_.size() + session_db_key_.size() + session_db_data_.size());
+-		auto* p = ret.data();
+-		append_with_size(p, ticket_key_);
+-		append_with_size(p, session_db_key_);
+-		append_with_size(p, session_db_data_);
+-	}
+-
+-	return ret;
+-}
+-
+-std::vector<uint8_t> tls_layer_impl::get_raw_certificate() const
+-{
+-	std::vector<uint8_t> ret;
+-
+-	// Implicitly trust certificate of primary socket
+-	unsigned int cert_list_size;
+-	gnutls_datum_t const* const cert_list = gnutls_certificate_get_peers(session_, &cert_list_size);
+-	if (cert_list && cert_list_size) {
+-		ret.assign(cert_list[0].data, cert_list[0].data + cert_list[0].size);
+-	}
+-
+-	return ret;
+-}
+-
+-namespace {
+-bool get_purposes(gnutls_x509_crt_t & crt, std::set<std::string> & purposes)
+-{
+-	for (unsigned int i = 0; ; ++i) {
+-		char buf[512];
+-		size_t s = 512;
+-		unsigned int critical{};
+-		int res = gnutls_x509_crt_get_key_purpose_oid(crt, i, &buf, &s, &critical);
+-		if (res) {
+-			return res == GNUTLS_E_REQUESTED_DATA_NOT_AVAILABLE;
+-		}
+-		if (!purposes.emplace(buf).second) {
+-			return false;
+-		}
+-	}
+-
+-	return false;
+-}
+-
+-bool get_purposes(gnutls_x509_crq_t & crq, std::set<std::string> & purposes)
+-{
+-	for (unsigned int i = 0; ; ++i) {
+-		char buf[512];
+-		size_t s = 512;
+-		unsigned int critical{};
+-		int res = gnutls_x509_crq_get_key_purpose_oid(crq, i, &buf, &s, &critical);
+-		if (res) {
+-			return res == GNUTLS_E_REQUESTED_DATA_NOT_AVAILABLE;
+-		}
+-		if (!purposes.emplace(buf).second) {
+-			return false;
+-		}
+-	}
+-
+-	return false;
+-}
+-
+-bool verify_purposes(std::set<std::string> & purposes, tls_layer::cert_type t)
+-{
+-	for (auto const& p : purposes) {
+-		if (p == GNUTLS_KP_TLS_WWW_CLIENT) {
+-			if (t != tls_layer::cert_type::any && t != tls_layer::cert_type::client) {
+-				return {};
+-			}
+-		}
+-		else if (p == GNUTLS_KP_TLS_WWW_SERVER) {
+-			if (t != tls_layer::cert_type::any && t != tls_layer::cert_type::server) {
+-				return {};
+-			}
+-		}
+-		else if (p == GNUTLS_KP_CODE_SIGNING) {
+-			if (t != tls_layer::cert_type::any && t != tls_layer::cert_type::codesign) {
+-				return {};
+-			}
+-		}
+-		else {
+-			return {};
+-		}
+-	}
+-
+-	return true;
+-}
+-
+-bool set_purposes_from_type(tls_layer_impl::cert_context &ctx, gnutls_x509_crt_t & crt, tls_layer::cert_type t)
+-{
+-	std::set<std::string> purposes;
+-	if (!get_purposes(crt, purposes)) {
+-		ctx.logger.log_raw(logmsg::error, fztranslate("Could not get certificate purposes."));
+-		return {};
+-	}
+-	if (!verify_purposes(purposes, t)) {
+-		ctx.logger.log_raw(logmsg::error, fztranslate("Certificate purposes do not match with its intended type."));
+-		return {};
+-	}
+-	char const* oid{};
+-	switch (t) {
+-	case tls_layer::cert_type::client:
+-		oid = GNUTLS_KP_TLS_WWW_CLIENT;
+-		break;
+-	case tls_layer::cert_type::server:
+-		oid = GNUTLS_KP_TLS_WWW_SERVER;
+-		break;
+-	case tls_layer::cert_type::codesign:
+-		oid = GNUTLS_KP_CODE_SIGNING;
+-		break;
+-	default:
+-		break;
+-	}
+-	if (oid) {
+-		if (purposes.find(oid) == purposes.end()) {
+-			int res = gnutls_x509_crt_set_key_purpose_oid(crt, oid, 1);
+-			if (res) {
+-				ctx.log_gnutls_error(res, L"gnutls_x509_crt_set_key_purpose_oid");
+-				return {};
+-			}
+-		}
+-	}
+-
+-	return true;
+-}
+-
+-static bool set_cert_params(tls_layer_impl::cert_context &ctx, gnutls_x509_crt_t & crt, tls_layer::cert_type t, std::string const& distinguished_name, std::vector<std::string> const& hostnames, duration lifetime)
+-{
+-	int res = gnutls_x509_crt_set_serial(crt, random_bytes(20).data(), 20);
+-	if (res) {
+-		ctx.log_gnutls_error(res, L"gnutls_x509_crt_set_serial");
+-		return {};
+-	}
+-
+-	if (!distinguished_name.empty()) {
+-		char const* out{};
+-		int res = gnutls_x509_crt_set_dn(crt, distinguished_name.c_str(), &out);
+-		if (res) {
+-			ctx.log_gnutls_error(res, L"gnutls_x509_crt_set_dn");
+-			return {};
+-		}
+-	}
+-
+-	if (!hostnames.empty()) {
+-		for (size_t i = 0; i < hostnames.size(); ++i) {
+-			res = gnutls_x509_crt_set_subject_alt_name(crt, GNUTLS_SAN_DNSNAME, hostnames[i].c_str(), hostnames[i].size(), i ? GNUTLS_FSAN_APPEND : GNUTLS_FSAN_SET);
+-			if (res) {
+-				ctx.log_gnutls_error(res, L"gnutls_x509_crt_set_subject_alt_name");
+-				return {};
+-			}
+-		}
+-	}
+-
+-	auto const now = datetime::now();
+-
+-	if (lifetime <= duration()) {
+-		lifetime = duration::from_days(366);
+-	}
+-
+-	res = gnutls_x509_crt_set_activation_time(crt, (now - duration::from_minutes(5)).get_time_t());
+-	if (res) {
+-		ctx.log_gnutls_error(res, L"gnutls_x509_crt_set_activation_time");
+-		return {};
+-	}
+-	res = gnutls_x509_crt_set_expiration_time(crt, (now + lifetime).get_time_t());
+-	if (res) {
+-		ctx.log_gnutls_error(res, L"gnutls_x509_crt_set_expiration_time");
+-		return {};
+-	}
+-
+-	int usage{};
+-	if (t == tls_layer::cert_type::ca) {
+-		usage = GNUTLS_KEY_KEY_CERT_SIGN | GNUTLS_KEY_CRL_SIGN;
+-	}
+-	else if (t == tls_layer::cert_type::codesign) {
+-		usage = GNUTLS_KEY_DIGITAL_SIGNATURE;
+-	}
+-	else {
+-		usage = GNUTLS_KEY_DIGITAL_SIGNATURE | GNUTLS_KEY_KEY_ENCIPHERMENT;
+-	}
+-
+-	res = gnutls_x509_crt_set_key_usage(crt, usage);
+-	if (res) {
+-		ctx.log_gnutls_error(res, L"gnutls_x509_crt_set_key_usage");
+-		return {};
+-	}
+-
+-
+-	res = gnutls_x509_crt_set_basic_constraints(crt, (t == tls_layer::cert_type::ca) ? 1 : 0, -1);
+-	if (res) {
+-		ctx.log_gnutls_error(res, L"gnutls_x509_crt_set_basic_constraints");
++	if (server_ || !conn_) {
+ 		return {};
+ 	}
+-
+-	if (!set_purposes_from_type(ctx, crt, t)) {
++	struct OTSession * s = OT_GetSession(conn_);
++	if (!s) {
++		logger_.log(logmsg::debug_warning, L"OT_GetSession gave no session");
+ 		return {};
+ 	}
+-
+-	return true;
+-}
+-}
+-
+-std::string tls_layer_impl::generate_selfsigned_certificate(cert_context &ctx, unique_gnutls_privkey priv, std::string const& distinguished_name, std::vector<std::string> const& hostnames, duration const& lifetime, tls_layer::cert_type type)
+-{
+-	gnutls_x509_crt_t crt;
+-	int res = gnutls_x509_crt_init(&crt);
+-	if (res) {
+-		ctx.log_gnutls_error(res, L"gnutls_x509_crt_init");
+-		return {};
+-	}
+-
+-	auto ret = [&]() -> std::string {
+-		res = gnutls_x509_crt_set_version(crt, 3);
+-		if (res) {
+-			ctx.log_gnutls_error(res, L"gnutls_x509_crt_set_version");
+-			return {};
+-		}
+-
+-		{
+-			gnutls_pubkey_t pub;
+-			res = gnutls_pubkey_init(&pub);
+-			if (res) {
+-				ctx.log_gnutls_error(res, L"gnutls_pubkey_init");
+-			}
+-			else {
+-				unsigned int key_usage = (type == tls_layer::cert_type::ca) ? (GNUTLS_KEY_KEY_CERT_SIGN | GNUTLS_KEY_CRL_SIGN) : (GNUTLS_KEY_DIGITAL_SIGNATURE | GNUTLS_KEY_KEY_ENCIPHERMENT);
+-
+-				res = gnutls_pubkey_import_privkey(pub, priv.get(), key_usage, 0);
+-				if (res) {
+-					ctx.log_gnutls_error(res, L"gnutls_pubkey_import_privkey");
+-				}
+-				else {
+-					res = gnutls_x509_crt_set_pubkey(crt, pub);
+-					if (res) {
+-						ctx.log_gnutls_error(res, L"gnutls_x509_crt_set_pubkey");
+-					}
+-				}
+-				gnutls_pubkey_deinit(pub);
+-			}
+-		}
+-
+-		if (res) {
+-			return {};
+-		}
+-
+-		if (!set_cert_params(ctx, crt, type, distinguished_name, hostnames, lifetime)) {
+-			return {};
+-		}
+-
+-		res = gnutls_x509_crt_privkey_sign(crt, crt, priv.get(), GNUTLS_DIG_SHA256, 0);
+-		if (res) {
+-			ctx.log_gnutls_error(res, L"gnutls_x509_crt_privkey_sign");
+-			return {};
+-		}
+-
+-		datum_holder ch;
+-		res = gnutls_x509_crt_export2(crt, GNUTLS_X509_FMT_PEM, &ch);
+-		if (res) {
+-			ctx.log_gnutls_error(res, L"gnutls_x509_crt_export2");
+-			return {};
+-		}
+-
+-		return ch.to_string();
+-	}();
+-
+-	gnutls_x509_crt_deinit(crt);
+-
+-	return ret;
++	return keep_session(s);
+ }
+ 
+-static std::pair<unique_gnutls_privkey, std::string> generate_priv_key_for_cert(tls_layer_impl::cert_context &ctx, native_string const& password, tls_layer::cert_type type, bool ecdsa)
++std::vector<uint8_t> tls_layer_impl::get_raw_certificate() const
+ {
+-	gnutls_x509_privkey_t priv;
+-	int res = gnutls_x509_privkey_init(&priv);
+-	if (res) {
+-		ctx.log_gnutls_error(res, L"gnutls_x509_privkey_init");
+-		return {};
+-	}
+-
+-	auto ret = [&]() -> std::pair<unique_gnutls_privkey, std::string> {
+-
+-		auto fmt = ecdsa ? GNUTLS_PK_ECDSA : GNUTLS_PK_RSA;
+-		unsigned int bits = gnutls_sec_param_to_pk_bits(fmt, GNUTLS_SEC_PARAM_HIGH);
+-		if (fmt == GNUTLS_PK_RSA) {
+-			unsigned int const min_rsa_bits = type == tls_layer::cert_type::ca ? 4096 : 2048;
+-			if (bits < min_rsa_bits) {
+-				bits = min_rsa_bits;
+-			}
+-		}
+-
+-		res = gnutls_x509_privkey_generate(priv, fmt, bits, 0);
+-		if (res) {
+-			ctx.log_gnutls_error(res, L"gnutls_x509_privkey_generate");
+-			return {};
+-		}
+-
+-		datum_holder kh;
+-
+-		if (password.empty()) {
+-			res = gnutls_x509_privkey_export2(priv, GNUTLS_X509_FMT_PEM, &kh);
+-			if (res) {
+-				ctx.log_gnutls_error(res, L"gnutls_x509_privkey_export2");
+-				return {};
+-			}
+-		}
+-		else {
+-			res = gnutls_x509_privkey_export2_pkcs8(priv, GNUTLS_X509_FMT_PEM, to_utf8(password).c_str(), 0, &kh);
+-			if (res) {
+-				ctx.log_gnutls_error(res, L"gnutls_x509_privkey_export2_pkcs8");
+-				return {};
++	std::vector<uint8_t> ret;
++	if (conn_) {
++		LONG const len = OT_GetPeerCertificateN(conn_, 0, nullptr, 0);
++		if (len > 0) {
++			ret.resize(static_cast<size_t>(len));
++			if (OT_GetPeerCertificateN(conn_, 0, ret.data(), len) != len) {
++				ret.clear();
+ 			}
+ 		}
+-
+-		gnutls_privkey_t abstract_priv;
+-		res = gnutls_privkey_init(&abstract_priv);
+-		if (res) {
+-			ctx.log_gnutls_error(res, L"gnutls_privkey_init");
+-			return {};
+-		}
+-
+-		res = gnutls_privkey_import_x509(abstract_priv, priv, GNUTLS_PRIVKEY_IMPORT_AUTO_RELEASE);
+-		if (res) {
+-			ctx.log_gnutls_error(res, L"gnutls_privkey_import_x509");
+-			gnutls_privkey_deinit(abstract_priv);
+-			return {};
+-		}
+-
+-		priv = nullptr;
+-
+-		return {unique_gnutls_privkey(abstract_priv), kh.to_string()};
+-	}();
+-
+-	if (priv) {
+-		gnutls_x509_privkey_deinit(priv);
+ 	}
+-
+ 	return ret;
+ }
+ 
+-std::pair<std::string, std::string> tls_layer_impl::generate_selfsigned_certificate(native_string const& password, std::string const& distinguished_name, std::vector<std::string> const& hostnames, duration const& lifetime, tls_layer::cert_type type, bool ecdsa, logger_interface &logger)
++bool tls_layer_impl::set_key_and_certs(const_tls_param_ref, const_tls_param_ref, native_string const&, tls_data_format)
+ {
+-	cert_context ctx(logger);
+-
+-	auto [priv, key] = generate_priv_key_for_cert(ctx, password, type, ecdsa);
+-	if (!priv) {
+-		return {};
+-	}
+-
+-	auto cert = generate_selfsigned_certificate(ctx, std::move(priv), distinguished_name, hostnames, lifetime, type);
+-	if (cert.empty()) {
+-		return {};
+-	}
+-
+-	return {std::move(key), std::move(cert)};
++	logger_.log(logmsg::error, fztranslate("Client certificates are not supported."));
++	return false;
+ }
+ 
+-std::string tls_layer_impl::generate_selfsigned_certificate(const_tls_param_ref key, native_string const& password, std::string const& distinguished_name, std::vector<std::string> const& hostnames, duration const& lifetime, tls_layer::cert_type type, logger_interface &logger)
++std::pair<std::string, std::string> tls_layer_impl::generate_selfsigned_certificate(native_string const&, std::string const&, std::vector<std::string> const&, duration const&, tls_layer::cert_type, bool, logger_interface &logger)
+ {
+-	cert_context ctx(logger);
+-
+-	auto priv = import_private_key(ctx, key, password, tls_data_format::autodetect);
+-	if (!priv) {
+-		return {};
+-	}
+-
+-	auto cert = generate_selfsigned_certificate(ctx, std::move(priv), distinguished_name, hostnames, lifetime, type);
+-	if (cert.empty()) {
+-		return {};
+-	}
+-
+-	return cert;
++	logger.log(logmsg::error, fztranslate("Making certificates is not supported."));
++	return {};
+ }
+ 
+-std::string tls_layer_impl::generate_cert_from_csr(std::pair<std::string, std::string> const& issuer, native_string const& password, std::string const& csr, std::string const& distinguished_name, std::vector<std::string> const& hostnames, duration const& lifetime, tls_layer::tls_layer::cert_type type, logger_interface &logger)
++std::string tls_layer_impl::generate_selfsigned_certificate(const_tls_param_ref, native_string const&, std::string const&, std::vector<std::string> const&, duration const&, tls_layer::cert_type, logger_interface &logger)
+ {
+-	cert_context ctx(logger);
+-
+-	gnutls_x509_privkey_t priv;
+-	int res = gnutls_x509_privkey_init(&priv);
+-	if (res) {
+-		ctx.log_gnutls_error(res, L"gnutls_x509_privkey_init");
+-		return {};
+-	}
+-	gnutls_x509_crt_t icrt;
+-	res = gnutls_x509_crt_init(&icrt);
+-	if (res) {
+-		ctx.log_gnutls_error(res, L"gnutls_x509_crt_init");
+-		gnutls_x509_privkey_deinit(priv);
+-		return {};
+-	}
+-	gnutls_x509_crq_t crq;
+-	res = gnutls_x509_crq_init(&crq);
+-	if (res) {
+-		ctx.log_gnutls_error(res, L"gnutls_x509_crq_init");
+-		gnutls_x509_crt_deinit(icrt);
+-		gnutls_x509_privkey_deinit(priv);
+-		return {};
+-	}
+-	gnutls_x509_crt_t crt;
+-	res = gnutls_x509_crt_init(&crt);
+-	if (res) {
+-		ctx.log_gnutls_error(res, L"gnutls_x509_crt_init");
+-		gnutls_x509_crq_deinit(crq);
+-		gnutls_x509_crt_deinit(icrt);
+-		gnutls_x509_privkey_deinit(priv);
+-		return {};
+-	}
+-
+-	std::string cert = [&]() -> std::string {
+-
+-		gnutls_datum_t kd;
+-		kd.data = const_cast<unsigned char*>(reinterpret_cast<unsigned char const*>(issuer.first.data()));
+-		kd.size = issuer.first.size();
+-		res = gnutls_x509_privkey_import2(priv, &kd, GNUTLS_X509_FMT_PEM, to_utf8(password).c_str(), 0);
+-		if (res) {
+-			ctx.log_gnutls_error(res, L"gnutls_x509_privkey_import2");
+-			return {};
+-		}
+-
+-		gnutls_datum_t icrtd;
+-		icrtd.data = const_cast<unsigned char*>(reinterpret_cast<unsigned char const*>(issuer.second.data()));
+-		icrtd.size = issuer.second.size();
+-		res = gnutls_x509_crt_import(icrt, &icrtd, GNUTLS_X509_FMT_PEM);
+-		if (res) {
+-			ctx.log_gnutls_error(res, L"gnutls_x509_crt_import");
+-			return {};
+-		}
+-
+-		gnutls_datum_t csrd;
+-		csrd.data = const_cast<unsigned char*>(reinterpret_cast<unsigned char const*>(csr.data()));
+-		csrd.size = csr.size();
+-		res = gnutls_x509_crq_import(crq, &csrd, GNUTLS_X509_FMT_PEM);
+-		if (res) {
+-			ctx.log_gnutls_error(res, L"gnutls_x509_crq_import");
+-			return {};
+-		}
+-
+-		res = gnutls_x509_crq_verify(crq, 0);
+-		if (res) {
+-			ctx.log_gnutls_error(res, L"gnutls_x509_crq_verify");
+-			return {};
+-		}
+-
+-		// Verify key purpose oids
+-		std::set<std::string> purposes;
+-		if (!get_purposes(crq, purposes)) {
+-			ctx.logger.log_raw(logmsg::error, fztranslate("Could not get certificate request purposes."));
+-			return {};
+-		}
+-		if (!verify_purposes(purposes, type)) {
+-			ctx.logger.log_raw(logmsg::error, fztranslate("Certificate request purposes do not match with its type."));
+-			return {};
+-		}
+-
+-		// Verify key usage
+-		unsigned int usage{};
+-		unsigned int critical{};
+-		if ((res = gnutls_x509_crq_get_key_usage(crq, &usage, &critical)) && res != GNUTLS_E_REQUESTED_DATA_NOT_AVAILABLE) {
+-			ctx.log_gnutls_error(res, L"gnutls_x509_crq_get_key_usage");
+-			return {};
+-		}
+-
+-		if (type == tls_layer::cert_type::ca) {
+-			if (usage & ~(GNUTLS_KEY_KEY_CERT_SIGN | GNUTLS_KEY_CRL_SIGN)) {
+-				ctx.logger.log_raw(logmsg::error, fztranslate("Certificate request has wrong key usage types set."));
+-				return {};
+-			}
+-		}
+-		else {
+-			if (usage & ~(GNUTLS_KEY_DIGITAL_SIGNATURE | GNUTLS_KEY_KEY_ENCIPHERMENT)) {
+-				ctx.logger.log_raw(logmsg::error, fztranslate("Certificate request has wrong key usage types set."));
+-				return {};
+-			}
+-		}
+-
+-		res = gnutls_x509_crt_set_version(crt, 3);
+-		if (res) {
+-			ctx.log_gnutls_error(res, L"gnutls_x509_crt_set_version");
+-			return {};
+-		}
+-
+-		res = gnutls_x509_crt_set_crq(crt, crq);
+-		if (res) {
+-			ctx.log_gnutls_error(res, L"gnutls_x509_crt_set_crq");
+-			return {};
+-		}
+-
+-		res = gnutls_x509_crt_set_crq_extensions(crt, crq);
+-		if (res) {
+-			ctx.log_gnutls_error(res, L"gnutls_x509_crt_set_crq_extensions");
+-			return {};
+-		}
+-
+-		if (!set_cert_params(ctx, crt, type, distinguished_name, hostnames, lifetime)) {
+-			return {};
+-		}
+-
+-		res = gnutls_x509_crt_sign(crt, icrt, priv);
+-		if (res) {
+-			ctx.log_gnutls_error(res, L"gnutls_x509_crt_sign");
+-			return {};
+-		}
+-
+-		datum_holder ch;
+-		res = gnutls_x509_crt_export2(crt, GNUTLS_X509_FMT_PEM, &ch);
+-		if (res) {
+-			ctx.log_gnutls_error(res, L"gnutls_x509_crt_export2");
+-			return {};
+-		}
+-
+-		return ch.to_string();
+-	}();
+-
+-	gnutls_x509_crt_deinit(crt);
+-	gnutls_x509_crq_deinit(crq);
+-	gnutls_x509_crt_deinit(icrt);
+-	gnutls_x509_privkey_deinit(priv);
+-
+-	return cert;
++	logger.log(logmsg::error, fztranslate("Making certificates is not supported."));
++	return {};
+ }
+ 
+-std::string tls_layer_impl::generate_csr(cert_context &ctx, unique_gnutls_privkey priv, std::string const& distinguished_name, std::vector<std::string> const& hostnames, bool csr_as_pem, tls_layer::cert_type type)
++std::string tls_layer_impl::generate_cert_from_csr(std::pair<std::string, std::string> const&, native_string const&, std::string const&, std::string const&, std::vector<std::string> const&, duration const&, tls_layer::cert_type, logger_interface &logger)
+ {
+-	gnutls_x509_crq_t crq;
+-	int res = gnutls_x509_crq_init(&crq);
+-	if (res) {
+-		ctx.log_gnutls_error(res, L"gnutls_x509_crq_init");
+-		return {};
+-	}
+-
+-	auto ret = [&]() -> std::string {
+-		res = gnutls_x509_crq_set_version(crq, 3);
+-		if (res) {
+-			ctx.log_gnutls_error(res, L"gnutls_x509_crq_set_version");
+-			return {};
+-		}
+-
+-		unsigned int key_usage = (type == tls_layer::cert_type::ca) ? (GNUTLS_KEY_KEY_CERT_SIGN | GNUTLS_KEY_CRL_SIGN) : (GNUTLS_KEY_DIGITAL_SIGNATURE | GNUTLS_KEY_KEY_ENCIPHERMENT);
+-
+-		{
+-			gnutls_pubkey_t pub;
+-			res = gnutls_pubkey_init(&pub);
+-			if (res) {
+-				ctx.log_gnutls_error(res, L"gnutls_pubkey_init");
+-			}
+-			else {
+-				res = gnutls_pubkey_import_privkey(pub, priv.get(), key_usage, 0);
+-				if (res) {
+-					ctx.log_gnutls_error(res, L"gnutls_pubkey_import_privkey");
+-				}
+-				else {
+-					res = gnutls_x509_crq_set_pubkey(crq, pub);
+-					if (res) {
+-						ctx.log_gnutls_error(res, L"gnutls_x509_crq_set_pubkey");
+-					}
+-				}
+-				gnutls_pubkey_deinit(pub);
+-			}
+-		}
+-
+-
+-		if (res) {
+-			return {};
+-		}
+-
+-		char const* out{};
+-		res = gnutls_x509_crq_set_dn(crq, distinguished_name.c_str(), &out);
+-		if (res) {
+-			ctx.log_gnutls_error(res, L"gnutls_x509_crq_set_dn");
+-			return {};
+-		}
+-
+-		for (auto const& hostname : hostnames) {
+-			res = gnutls_x509_crq_set_subject_alt_name(crq, GNUTLS_SAN_DNSNAME, hostname.c_str(), hostname.size(), GNUTLS_FSAN_APPEND);
+-			if (res) {
+-				ctx.log_gnutls_error(res, L"gnutls_x509_crq_set_subject_alt_name");
+-				return {};
+-			}
+-		}
+-
+-		res = gnutls_x509_crq_set_key_usage(crq, key_usage);
+-		if (res) {
+-			ctx.log_gnutls_error(res, L"gnutls_x509_crq_set_key_usage");
+-			return {};
+-		}
+-
+-		if (type == tls_layer::cert_type::client || type == tls_layer::cert_type::server) {
+-			res = gnutls_x509_crq_set_key_purpose_oid(crq, (type == tls_layer::cert_type::server) ? GNUTLS_KP_TLS_WWW_SERVER : GNUTLS_KP_TLS_WWW_CLIENT, 1);
+-			if (res) {
+-				ctx.log_gnutls_error(res, L"gnutls_x509_crq_set_key_purpose_oid");
+-				return {};
+-			}
+-		}
+-
+-		res = gnutls_x509_crq_set_basic_constraints(crq, (type == tls_layer::cert_type::ca) ? 1 : 0, -1);
+-		if (res) {
+-			ctx.log_gnutls_error(res, L"gnutls_x509_crq_set_basic_constraints");
+-			return {};
+-		}
+-
+-		res = gnutls_x509_crq_privkey_sign(crq, priv.get(), GNUTLS_DIG_SHA256, 0);
+-		if (res) {
+-			ctx.log_gnutls_error(res, L"gnutls_x509_crq_privkey_sign");
+-			return {};
+-		}
+-
+-		datum_holder ch;
+-		res = gnutls_x509_crq_export2(crq, csr_as_pem ? GNUTLS_X509_FMT_PEM : GNUTLS_X509_FMT_DER, &ch);
+-		if (res) {
+-			ctx.log_gnutls_error(res, L"gnutls_x509_crq_export2");
+-			return {};
+-		}
+-
+-		return ch.to_string();
+-	}();
+-
+-	gnutls_x509_crq_deinit(crq);
+-
+-	return ret;
++	logger.log(logmsg::error, fztranslate("Making certificates is not supported."));
++	return {};
+ }
+ 
+-std::string tls_layer_impl::generate_csr(const_tls_param_ref key, native_string const& password, std::string const& distinguished_name, std::vector<std::string> const& hostnames, bool csr_as_pem, tls_layer::cert_type type, logger_interface &logger)
++std::pair<std::string, std::string> tls_layer_impl::generate_csr(native_string const&, std::string const&, std::vector<std::string> const&, bool, tls_layer::cert_type, bool, logger_interface &logger)
+ {
+-	cert_context ctx(logger);
+-
+-	auto priv = import_private_key(ctx, key, password, tls_data_format::autodetect);
+-	if (!priv) {
+-		return {};
+-	}
+-
+-	return generate_csr(ctx, std::move(priv), distinguished_name, hostnames, csr_as_pem, type);
++	logger.log(logmsg::error, fztranslate("Making certificate requests is not supported."));
++	return {};
+ }
+ 
+-std::pair<std::string, std::string> tls_layer_impl::generate_csr(native_string const& password, std::string const& distinguished_name, std::vector<std::string> const& hostnames, bool csr_as_pem, tls_layer::cert_type type, bool ecdsa, logger_interface &logger)
++std::string tls_layer_impl::generate_csr(const_tls_param_ref, native_string const&, std::string const&, std::vector<std::string> const&, bool, tls_layer::cert_type, logger_interface &logger)
+ {
+-	cert_context ctx(logger);
+-
+-	auto [priv, key] = generate_priv_key_for_cert(ctx, password, type, ecdsa);
+-	if (!priv) {
+-		return {};
+-	}
+-
+-	auto cert = generate_csr(ctx, std::move(priv), distinguished_name, hostnames, csr_as_pem, type);
+-	if (cert.empty()) {
+-		return {};
+-	}
+-
+-	return {std::move(key), std::move(cert)};
++	logger.log(logmsg::error, fztranslate("Making certificate requests is not supported."));
++	return {};
+ }
+ 
+-bool tls_layer_impl::add_pkcs11_provider(const native_string_view &path, logger_interface &logger)
++bool tls_layer_impl::add_pkcs11_provider(native_string_view const&, logger_interface &logger)
+ {
+-	static auto const pgnutls_pkcs11_init = dynamic_gnutls_func(gnutls_pkcs11_init);
+-	static auto const pgnutls_pkcs11_add_provider = dynamic_gnutls_func(gnutls_pkcs11_add_provider);
+-
+-	if (!pgnutls_pkcs11_init || !pgnutls_pkcs11_add_provider) {
+-		logger.log(logmsg::error, fztranslate("GnuTLS has been compiled without PKCS#11 support"));
+-		return {};
+-	}
+-
+-	int res = pgnutls_pkcs11_init(GNUTLS_PKCS11_FLAG_MANUAL, nullptr);
+-	if (res) {
+-		log_gnutls_error(logger, res, L"gnutls_pkcs11_init");
+-		return {};
+-	}
+-
+-	res = pgnutls_pkcs11_add_provider(to_string(path).c_str(), nullptr);
+-	if (res) {
+-		log_gnutls_error(logger, res, L"gnutls_pkcs11_add_provider");
+-		return {};
+-	}
+-
+-	return true;
++	logger.log(logmsg::error, fztranslate("PKCS#11 is not supported."));
++	return false;
+ }
+ 
+ bool tls_layer::supports_pkcs11()
+ {
+-	static bool const supported = dynamic_gnutls_func(gnutls_pkcs11_init) != nullptr;
+-	return supported;
++	return false;
+ }
+ 
+ int tls_layer_impl::shutdown_read()
+@@ -3197,9 +1311,6 @@
+ 
+ 	if (error == EAGAIN) {
+ 		can_read_from_socket_ = false;
+-#if DEBUG_SOCKETEVENTS
+-		debug_can_read_ = false;
+-#endif
+ 	}
+ 
+ 	return error;
+@@ -3215,52 +1326,21 @@
+ 	if (pEvtHandler) {
+ 		if (can_write_to_socket_ && (state_ == socket_state::connected || state_ == socket_state::shutting_down) && !(pending & (socket_event_flag::write | socket_event_flag::connection)) && !(retrigger_block & socket_event_flag::write)) {
+ 			pEvtHandler->send_event<socket_event>(&tls_layer_, socket_event_flag::write, 0);
+-#if DEBUG_SOCKETEVENTS
+-			assert(debug_can_write_);
+-#endif
+ 		}
+-		if (can_read_from_socket_ && (state_ == socket_state::connected || state_ == socket_state::shutting_down || state_ == socket_state::shut_down)) {
++		if ((can_read_from_socket_ || (conn_ && OT_Pending(conn_) > 0)) && (state_ == socket_state::connected || state_ == socket_state::shutting_down || state_ == socket_state::shut_down)) {
+ 			if (!(pending & socket_event_flag::read) && !(retrigger_block & socket_event_flag::read)) {
+ 				pEvtHandler->send_event<socket_event>(&tls_layer_, socket_event_flag::read, 0);
+-#if DEBUG_SOCKETEVENTS
+-				assert(debug_can_read_);
+-#endif
+ 			}
+ 		}
+ 	}
+-
+-}
+-
+-bool tls_layer_impl::do_set_alpn()
+-{
+-	if (alpn_.empty()) {
+-		return true;
+-	}
+-
+-	gnutls_datum_t * data = new gnutls_datum_t[alpn_.size()];
+-	for (size_t i = 0; i < alpn_.size(); ++i) {
+-		data[i].data = reinterpret_cast<unsigned char *>(const_cast<char*>(alpn_[i].c_str()));
+-		data[i].size = alpn_[i].size();
+-	}
+-	int flags = GNUTLS_ALPN_MANDATORY;
+-	if (alpn_server_priority_ && server_) {
+-		flags |= GNUTLS_ALPN_SERVER_PRECEDENCE;
+-	}
+-	int res = gnutls_alpn_set_protocols(session_, data, alpn_.size(), flags);
+-	delete [] data;
+-
+-	if (res) {
+-		log_error(res, L"gnutls_alpn_set_protocols"sv);
+-	}
+-	return res == 0;
+ }
+ 
+ std::string tls_layer_impl::get_alpn() const
+ {
+-	if (session_) {
+-		gnutls_datum_t protocol;
+-		if (!gnutls_alpn_get_selected_protocol(session_, &protocol)) {
+-			return to_string(protocol);
++	if (conn_) {
++		char const* s = OT_GetALPN(conn_);
++		if (s) {
++			return s;
+ 		}
+ 	}
+ 	return {};
+@@ -3278,46 +1358,7 @@
+ 
+ int tls_layer_impl::new_session_ticket()
+ {
+-	if (state_ == socket_state::shutting_down || state_ == socket_state::shut_down) {
+-		return ESHUTDOWN;
+-	}
+-	else if (state_ != socket_state::connected) {
+-		return ENOTCONN;
+-	}
+-
+-	if (!server_) {
+-		return EINVAL;
+-	}
+-
+-	if (gnutls_protocol_get_version(session_) != GNUTLS_TLS1_3) {
+-		return 0;
+-	}
+-
+-#if DEBUG_SOCKETEVENTS
+-	assert(debug_can_write_);
+-	assert(!has_pending_event(tls_layer_.event_handler_, &tls_layer_, socket_event_flag::write));
+-#endif
+-
+-	if (!send_buffer_.empty()|| send_new_ticket_) {
+-		send_new_ticket_ = true;
+-		return 0;
+-	}
+-
+-	int res = GNUTLS_E_AGAIN;
+-	while ((res == GNUTLS_E_INTERRUPTED || res == GNUTLS_E_AGAIN) && can_write_to_socket_) {
+-		res = gnutls_session_ticket_send(session_, 1, 0);
+-	}
+-
+-	if (res == GNUTLS_E_SUCCESS) {
+-		return 0;
+-	}
+-	else if (res == GNUTLS_E_AGAIN) {
+-		send_new_ticket_ = true;
+-		return 0;
+-	}
+-
+-	failure(res, false, L"gnutls_session_ticket_send"sv);
+-	return socket_error_ ? socket_error_ : ECONNABORTED;
++	return server_ ? 0 : EINVAL;
+ }
+ 
+ void tls_layer_impl::set_unexpected_eof_cb(std::function<bool()> && cb)
+diff -ruN a/lib/tls_layer_impl.hpp b/lib/tls_layer_impl.hpp
+--- a/lib/tls_layer_impl.hpp	2026-11-06 22:54:30.475882942 +0000
++++ b/lib/tls_layer_impl.hpp	2026-11-06 22:54:30.477511333 +0000
+@@ -1,13 +1,11 @@
+ #ifndef LIBFILEZILLA_TLS_LAYER_IMPL_HEADER
+ #define LIBFILEZILLA_TLS_LAYER_IMPL_HEADER
+ 
+-#if defined(_MSC_VER)
+-typedef std::make_signed_t<size_t> ssize_t;
+-#endif
+-
+-#include <gnutls/gnutls.h>
+-#include <gnutls/x509.h>
+-#include <gnutls/abstract.h>
++/* libfilezilla's TLS layer on GFOpenTLS (gfopentls.library 1.5 on the Amiga,
++ * libopentls on the host) in place of GnuTLS. A client only: FileZilla's FTPS.
++ * The records go through an I/O hook to the next socket layer, so the layer
++ * keeps libfilezilla's non-blocking event semantics.
++ * Copyright (c) 2026 AmiCradle Team */
+ 
+ #include "libfilezilla/buffer.hpp"
+ #include "libfilezilla/logger.hpp"
+@@ -18,81 +16,22 @@
+ #include <optional>
+ #include <string_view>
+ 
++#ifdef __AMIGA__
++#include <proto/gfopentls.h>
++#else
++extern "C" {
++#include <clib/gfopentls_protos.h>
++}
++#endif
++
+ namespace fz {
+ class tls_system_trust_store;
+ class logger_interface;
+ 
+-struct cert_list_holder final
+-{
+-	cert_list_holder() = default;
+-	~cert_list_holder() {
+-		for (unsigned int i = 0; i < certs_size; ++i) {
+-			gnutls_x509_crt_deinit(certs[i]);
+-		}
+-		gnutls_free(certs);
+-	}
+-
+-	cert_list_holder(cert_list_holder const&) = delete;
+-	cert_list_holder& operator=(cert_list_holder const&) = delete;
+-
+-	gnutls_x509_crt_t * certs{};
+-	unsigned int certs_size{};
+-};
+-
+-
+-struct gnutls_privkey_deinitializer
+-{
+-	using pointer = gnutls_privkey_t;
+-	void operator()(gnutls_privkey_t key)
+-	{
+-		if (key) {
+-			gnutls_privkey_deinit(key);
+-		}
+-	}
+-};
+-
+-using unique_gnutls_privkey = std::unique_ptr<gnutls_privkey_t, gnutls_privkey_deinitializer>;
+-
+ class tls_layer;
+ class tls_layer_impl final
+ {
+ public:
+-	struct cert_context final
+-	{
+-		cert_context(logger_interface &logger, bool ignore_function_when_logging = false, bool do_init = false)
+-			: logger(logger)
+-			, ignore_function_when_logging(ignore_function_when_logging)
+-		{
+-			if (do_init) {
+-				init();
+-			}
+-		}
+-		~cert_context()
+-		{
+-			deinit();
+-		}
+-
+-		explicit operator bool() const
+-		{
+-			return credentials != nullptr;
+-		}
+-
+-		void log_gnutls_error(int code, std::wstring_view const& function = {}, logmsg::type logLevel = logmsg::error)
+-		{
+-			tls_layer_impl::log_gnutls_error(logger, code, ignore_function_when_logging ? std::wstring_view{} : function, logLevel);
+-		}
+-
+-		bool init();
+-		void deinit();
+-
+-		logger_interface &logger;
+-		gnutls_certificate_credentials_t credentials{};
+-		std::string pin;
+-
+-	private:
+-		bool ignore_function_when_logging{};
+-	};
+-
+ 	tls_layer_impl(tls_layer& layer, tls_system_trust_store * systemTrustStore, logger_interface & logger);
+ 	~tls_layer_impl();
+ 
+@@ -130,9 +69,6 @@
+ 
+ 	static std::string get_gnutls_version();
+ 
+-	ssize_t push_function(void const* data, size_t len);
+-	ssize_t pull_function(void* data, size_t len);
+-
+ 	static std::pair<std::string, std::string> generate_selfsigned_certificate(native_string const& password, std::string const& distinguished_name, std::vector<std::string> const& hostnames, duration const& lifetime, tls_layer::cert_type type, bool ecdsa, logger_interface &logger = get_null_logger());
+ 	static std::string generate_selfsigned_certificate(const_tls_param_ref key, native_string const& password, std::string const& distinguished_name, std::vector<std::string> const& hostnames, duration const& lifetime, tls_layer::cert_type type, logger_interface &logger = get_null_logger());
+ 	static std::pair<std::string, std::string> generate_csr(native_string const& password, std::string const& distinguished_name, std::vector<std::string> const& hostnames, bool csr_as_pem, tls_layer::cert_type type, bool ecdsa, logger_interface &logger = get_null_logger());
+@@ -147,40 +83,35 @@
+ 	std::string get_alpn() const;
+ 	native_string get_hostname() const;
+ 
+-	static int load_certificates(const_tls_param_ref in, tls_data_format format, gnutls_x509_crt_t *& certs, unsigned int & certs_size, bool & sort, logger_interface * logger);
+-	static int load_certificates(std::string_view const& in, bool pem, gnutls_x509_crt_t *& certs, unsigned int & certs_size, bool & sort);
+-	static bool extract_cert(gnutls_x509_crt_t const& cert, x509_certificate& out, bool last, logger_interface * logger);
+-	static void log_gnutls_error(logger_interface &logger, int code, std::wstring_view const& function = {}, logmsg::type logLevel = logmsg::error);
+-
+-	static bool set_key_and_certs(cert_context &ctx, const_tls_param_ref keyfile, const_tls_param_ref certsfile, native_string const& password, tls_data_format format);
++	// DER certificates from PEM or DER data, a file or a blob
++	static bool load_certificates(const_tls_param_ref in, tls_data_format format, std::vector<std::vector<uint8_t>> & out, logger_interface * logger);
++	static bool extract_cert(std::vector<uint8_t> const& der, x509_certificate& out, bool last, logger_interface * logger);
+ 
+ 	void set_min_tls_ver(tls_ver ver);
+ 	void set_max_tls_ver(tls_ver ver);
+ 
+ 	void set_unexpected_eof_cb(std::function<bool()> && cb);
+ 
++	int new_session_ticket();
++
++	// The I/O hook: GFOpenTLS reading and writing records
++	LONG io(struct OTIOMessage * msg);
++
+ private:
+-	bool init();
++	bool init_connection();
+ 	void deinit();
+ 
+-	bool init_session(bool client, int extra_flags = 0);
+-	void deinit_session();
+-
+ 	int continue_write();
+ 	int continue_handshake();
+ 	int continue_shutdown();
+ 
+ 	int verify_certificate();
+-	bool certificate_is_blacklisted(cert_list_holder const& certificates);
+-	bool certificate_is_blacklisted(gnutls_x509_crt_t const& cert);
++	bool get_peer_certificates(std::vector<std::vector<uint8_t>> & certs);
+ 
+-	void log_error(int code, std::wstring_view const& function, logmsg::type logLevel = logmsg::error);
+-	void log_alert(logmsg::type logLevel);
++	void log_error(LONG code, std::wstring_view const& function, logmsg::type logLevel = logmsg::error);
+ 
+-	// Failure logs the error, uninits the session and sends a close event
+-	void failure(int code, bool send_close, std::wstring_view const& function = {});
+-
+-	int do_call_gnutls_record_recv(void* data, size_t len);
++	// Failure logs the error, frees the connection and sends a close event
++	void failure(LONG code, bool send_close, std::wstring_view const& function = {});
+ 
+ 	void operator()(event_base const& ev);
+ 	void on_socket_event(socket_event_source* source, socket_event_flag t, int error);
+@@ -189,36 +120,18 @@
+ 	void on_read();
+ 	void on_send();
+ 
+-	bool get_sorted_peer_certificates(gnutls_x509_crt_t *& certs, unsigned int & certs_size);
+-
+-	static std::vector<x509_certificate::subject_name> get_cert_subject_alt_names(gnutls_x509_crt_t cert);
+-
+-	void log_verification_error(int status);
+-
+ 	void set_hostname(native_string const& host);
+ 
+-	bool do_set_alpn();
+-
+-	int new_session_ticket();
+-
+-	static std::vector<gnutls_pcert_st> import_certs(cert_context &ctx, const_tls_param_ref certs, tls_data_format format);
+-	static unique_gnutls_privkey import_private_key(cert_context &ctx, const_tls_param_ref key, native_string const& password, tls_data_format format);
+-	static std::string generate_csr(cert_context &ctx, unique_gnutls_privkey priv, std::string const& distinguished_name, std::vector<std::string> const& hostnames, bool csr_as_pem, tls_layer::cert_type type);
+-	static std::string generate_selfsigned_certificate(cert_context &ctx, unique_gnutls_privkey priv, std::string const& distinguished_name, std::vector<std::string> const& hostnames, duration const& lifetime, tls_layer::cert_type type);
+-
+ 	tls_layer& tls_layer_;
+ 
+ 	logger_interface & logger_;
+ 
+ 	std::function<bool()> unexpected_eof_cb_;
+ 
+-	gnutls_session_t session_{};
+-
+-	std::vector<uint8_t> ticket_key_;
+-	std::vector<uint8_t> session_db_key_;
+-	std::vector<uint8_t> session_db_data_;
++	struct OTConnection * conn_{};
++	struct Hook hook_{};
+ 
+-	cert_context cert_context_ { logger_ };
++	std::vector<uint8_t> session_to_resume_;
+ 
+ 	std::vector<std::string> alpn_;
+ 	bool alpn_server_priority_{};
+@@ -233,20 +146,12 @@
+ 
+ 	bool shutdown_silence_read_errors_{true};
+ 
+-	// gnutls_record_send has strange semantics, it needs to be called again
+-	// with either 0 data and 0 length after GNUTLS_E_AGAIN, to actually send
+-	// previously queued data. We unfortunately do not know how much data has
+-	// been queued and thus need to make a copy of the input up to
+-	// gnutls_record_get_max_size()
+-	buffer send_buffer_;
+-
+-	// Sent out just before the handshake itself
+-	buffer preamble_;
++	// GFOpenTLS has taken data whose records have not all gone out yet
++	bool out_pending_{};
+ 
+ 	std::vector<uint8_t> required_certificate_;
+ 
+ 	friend class tls_layer;
+-	friend class tls_layerCallbacks;
+ 
+ 	native_string hostname_;
+ 
+@@ -257,20 +162,12 @@
+ 	tls_ver min_tls_ver_{tls_ver::v1_0};
+ 	std::optional<tls_ver> max_tls_ver_;
+ 
+-	int socket_error_{}; // Set in the push and pull functions if reading/writing fails fatally
++	int socket_error_{}; // Set in the I/O hook if reading/writing fails fatally
+ 	bool socket_eof_{};
+ 
+-	bool initialized_{};
+ 	bool server_{};
+ 
+ 	bool write_blocked_by_send_buffer_{};
+-
+-	bool send_new_ticket_{};
+-
+-#if DEBUG_SOCKETEVENTS
+-	bool debug_can_read_{};
+-	bool debug_can_write_{};
+-#endif
+ };
+ 
+ }
+diff -ruN a/lib/tls_system_trust_store.cpp b/lib/tls_system_trust_store.cpp
+--- a/lib/tls_system_trust_store.cpp	2026-11-06 22:54:30.482582732 +0000
++++ b/lib/tls_system_trust_store.cpp	2026-11-06 22:54:30.484044613 +0000
+@@ -3,45 +3,6 @@
+ 
+ namespace fz {
+ 
+-tls_system_trust_store_impl::tls_system_trust_store_impl(thread_pool& pool)
+-{
+-	task_ = pool.spawn([this]() {
+-		gnutls_certificate_credentials_t cred{};
+-
+-		if (gnutls_certificate_allocate_credentials(&cred) >= 0) {
+-			if (gnutls_certificate_set_x509_system_trust(cred) < 0) {
+-				gnutls_certificate_free_credentials(cred);
+-				cred = nullptr;
+-			}
+-		}
+-
+-		scoped_lock l(mtx_);
+-		credentials_ = cred;
+-		cond_.signal(l);
+-	});
+-}
+-
+-tls_system_trust_store_impl::~tls_system_trust_store_impl()
+-{
+-	task_.join();
+-
+-	if (credentials_) {
+-		gnutls_certificate_free_credentials(credentials_);
+-	}
+-}
+-
+-std::tuple<gnutls_certificate_credentials_t, scoped_lock> tls_system_trust_store_impl::lease()
+-{
+-	scoped_lock l(mtx_);
+-	if (task_) {
+-		cond_.wait(l);
+-		task_.join();
+-	}
+-
+-	return std::make_tuple(credentials_, std::move(l));
+-}
+-
+-
+ tls_system_trust_store::tls_system_trust_store(thread_pool& pool)
+ 	: impl_(std::make_unique<tls_system_trust_store_impl>(pool))
+ {
+diff -ruN a/lib/tls_system_trust_store_impl.hpp b/lib/tls_system_trust_store_impl.hpp
+--- a/lib/tls_system_trust_store_impl.hpp	2026-11-06 22:54:30.485946607 +0000
++++ b/lib/tls_system_trust_store_impl.hpp	2026-11-06 22:54:30.487698070 +0000
+@@ -1,35 +1,19 @@
+ #ifndef LIBFILEZILLA_TLS_SYSTEM_TRUST_STORE_IMPL_HEADER
+ #define LIBFILEZILLA_TLS_SYSTEM_TRUST_STORE_IMPL_HEADER
+ 
+-#include "libfilezilla/tls_system_trust_store.hpp"
+-
+-#if defined(_MSC_VER)
+-typedef std::make_signed_t<size_t> ssize_t;
+-#endif
+-
+-#include <gnutls/gnutls.h>
++/* GFOpenTLS reads the system trust store itself (once, in the shared
++ * context), so this only says that FileZilla asked for it.
++ * Copyright (c) 2026 AmiCradle Team */
+ 
++#include "libfilezilla/tls_system_trust_store.hpp"
+ #include "libfilezilla/thread_pool.hpp"
+ 
+-#include <tuple>
+-
+ namespace fz {
+ 
+ class tls_system_trust_store_impl final
+ {
+ public:
+-	tls_system_trust_store_impl(thread_pool& pool);
+-	~tls_system_trust_store_impl();
+-
+-	std::tuple<gnutls_certificate_credentials_t, scoped_lock> lease();
+-
+-private:
+-	mutex mtx_{false};
+-	condition cond_;
+-
+-	gnutls_certificate_credentials_t credentials_{};
+-
+-	async_task task_;
++	tls_system_trust_store_impl(thread_pool&) {}
+ };
+ 
+ }
+diff -ruN a/lib/util.cpp b/lib/util.cpp
+--- a/lib/util.cpp	2026-11-06 22:54:30.501616807 +0000
++++ b/lib/util.cpp	2026-11-06 22:54:30.503647503 +0000
+@@ -8,7 +8,7 @@
+ #include <time.h>
+ #include <string.h>
+ 
+-#include <nettle/memops.h>
++#include <gfopencrypto/gfopencrypto.h>
+ 
+ #if FZ_WINDOWS
+ 	#include "libfilezilla/glue/windows.hpp"
+@@ -231,7 +231,7 @@
+ 		return true;
+ 	}
+ 
+-	return nettle_memeql_sec(lhs.data(), rhs.data(), lhs.size()) != 0;
++	return oc_ct_equal(lhs.data(), rhs.data(), lhs.size()) != 0;
+ }
+ 
+ void wipe(void* p, size_t n)

@@ -21,9 +21,21 @@
     (help @copyfiles-help)
     (source "")
     (dest #drawer)
-    (pattern "~(Install-FileZilla#?|FileZilla-drawer.info)")
+    (pattern "~(Install-FileZilla#?|FileZilla-drawer.info|Libs)")
     (infos))
 (copyfiles (source "resources") (dest (tackon #drawer "resources")) (all))
+
+; GFOpenTLS and GFOpenCrypto: FileZilla's FTPS and SFTP; into LIBS: when
+; the ones there are missing or older
+(procedure P_LIB #lib
+    (if (< (getversion (tackon "LIBS:" #lib)) (getversion (tackon "Libs" #lib)))
+        (copyfiles
+            (prompt (cat "Installing " #lib))
+            (help @copyfiles-help)
+            (source (tackon "Libs" #lib))
+            (dest "LIBS:"))))
+(P_LIB "gfopencrypto.library")
+(P_LIB "gfopentls.library")
 
 (set #missing "")
 (if (not (exists "LIBS:z.library"))

@@ -122,8 +122,8 @@ __stdargs int futimens(int fd, const struct timespec *t)
 }
 
 /* SQLite's unix VFS: AmigaDOS has no owners, and the mode goes through the
- * file's name. */
-int fchmod(int fd, mode_t mode)
+ * file's name. Weak: GFOpenSQLite's libsqlite3.a brings its own. */
+__attribute__((weak)) int fchmod(int fd, mode_t mode)
 {
     char path[1024];
     StdFileDes *sfd = _lx_fhfromfd(fd);
@@ -132,7 +132,7 @@ int fchmod(int fd, mode_t mode)
     return chmod(path, mode);
 }
 
-int fchown(int fd, uid_t owner, gid_t group)
+__attribute__((weak)) int fchown(int fd, uid_t owner, gid_t group)
 {
     (void)owner; (void)group;
     if (!_lx_fhfromfd(fd)) { errno = EBADF; return -1; }

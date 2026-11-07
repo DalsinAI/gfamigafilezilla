@@ -66,14 +66,25 @@ for p in "$HERE"/patches/filezilla-*.patch; do
     # a patch to configure itself means configuring again
     grep -q '^+++ b/configure' "$p" && rm -f "$SRC/config.status"
 done
-# Boost.Regex, headers only
-BR="$WORK/boost-regex"
-if [ "$(cat "$BR/.commit" 2>/dev/null)" != "$BREGEX_COMMIT" ]; then
-    rm -rf "$BR"; mkdir -p "$BR"; git -C "$BR" init -q
-    git -C "$BR" fetch -q --depth 1 "$BREGEX_GIT" "$BREGEX_COMMIT"
-    git -C "$BR" checkout -q FETCH_HEAD -- include
-    echo "$BREGEX_COMMIT" > "$BR/.commit"
+# Boost's headers from our shared Boost SDK (Boost.Regex is used header-only)
+BR="$WORK/gfopenboost"
+if [ "$(cat "$BR/.sha" 2>/dev/null)" != "$GFBOOST_SHA256" ]; then
+    fetch "$GFBOOST_URL" "$GFBOOST_SHA256" gfopenboost-sdk.tar.xz
+    rm -rf "$BR"; mkdir -p "$BR"
+    tar xJf "$D/gfopenboost-sdk.tar.xz" -C "$BR" --strip-components=1 --wildcards '*/include/*'
+    echo "$GFBOOST_SHA256" > "$BR/.sha"
+    rm -f "$SRC/config.status"
 fi
+# the libraries libfilezilla and fzssh link with (GnuTLS then, GFOpenTLS
+# now): configure wrote them into the Makefiles, so a change means
+# configuring again
+LIBSET=$(pkg-config --static --libs libfilezilla libfzssh-client 2>/dev/null | sha256sum | cut -c1-16)
+# (the tree's own libtool archives carry the old list too: they go, the
+# objects stay)
+[ "$(cat "$SRC/.libset2" 2>/dev/null)" = "$LIBSET" ] || {
+    rm -f "$SRC/config.status" "$SRC/src/interface/filezilla"
+    find "$SRC" \( -name "*.la" -o -name "*.a" \) -delete
+    echo "$LIBSET" > "$SRC/.libset2"; }
 cd "$SRC"
 if [ ! -f config.status ]; then
     CC="m68k-amigaos-gcc $SPECS" CXX="m68k-amigaos-g++ $SPECS" \

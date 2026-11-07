@@ -1,6 +1,6 @@
 #!/bin/sh
-# libfilezilla, Argon2 and fzssh for AmigaOS 3 (68040), static, into the
-# sysroot build-crypto.sh made. Each again only when its tarball or its
+# libfilezilla and fzssh for AmigaOS 3 (68040), static, on GFOpenTLS and
+# GFOpenCrypto, into the sysroot build-crypto.sh made. Each again only when its tarball or its
 # patches change.
 #   TC=.../prefix WORK=build SYS=build/sysroot scripts/build-fz.sh
 # Copyright (c) 2026 AmiCradle Team
@@ -41,6 +41,9 @@ if [ ! -f "$SYS/lib/libfilezilla.a" ] || [ ! -f "$SYS/lib/libfilezilla.la" ] || 
         CFLAGS="$OPT -include fzamiga.h -I$SYS/include" CXXFLAGS="$OPT -include fzamiga.h -I$SYS/include" \
         LDFLAGS="-L$SYS/lib" LIBS="-lfzamiga -lsocket -lpthread -latomic" PKG_CONFIG="pkg-config --static" \
         ac_cv_func_timegm=yes \
+        GMP_CFLAGS=-DFZ_NO_GMP GMP_LIBS=-lm NETTLE_CFLAGS="-I$SYS/include" NETTLE_LIBS="-lgfopencrypto" \
+        HOGWEED_CFLAGS="-I$SYS/include" HOGWEED_LIBS=-lm GNUTLS_CFLAGS="-I$SYS/include" \
+        GNUTLS_LIBS="-lgfopentls -lgfopencrypto" \
         ./configure --host=m68k-amigaos --build="$HOSTB" --prefix="$SYS" --disable-shared --enable-static \
         --disable-locales --disable-doxygen-doc --disable-dependency-tracking > configure.log 2>&1 \
         || fail libfilezilla-configure configure.log
@@ -53,9 +56,8 @@ if [ ! -f "$SYS/lib/libfilezilla.a" ] || [ ! -f "$SYS/lib/libfilezilla.la" ] || 
     echo "libfilezilla $LFZ_VERSION: $(ls -l "$SYS/lib/libfilezilla.a" | awk '{print $5}') bytes"
 fi
 
-# ---- Argon2 and fzssh, with our make file
-if [ ! -f "$SYS/lib/libfzssh.a" ] || [ "$(cat "$WORK/.fzssh" 2>/dev/null)" != "$FZSSH_SHA256$ARGON2_SHA256$(stamp fzssh)$(sha256sum < "$HERE/scripts/Makefile.fzssh" | cut -c1-16)" ]; then
-    fetch "$ARGON2_URL" "$ARGON2_SHA256" argon2.tar.xz; unpack argon2.tar.xz argon2
+# ---- fzssh, with our make file
+if [ ! -f "$SYS/lib/libfzssh.a" ] || [ "$(cat "$WORK/.fzssh" 2>/dev/null)" != "$FZSSH_SHA256$(stamp fzssh)$(sha256sum < "$HERE/scripts/Makefile.fzssh" | cut -c1-16)" ]; then
     fetch "$FZSSH_URL" "$FZSSH_SHA256" fzssh.tar.xz; unpack fzssh.tar.xz fzssh
     O="$WORK/obj/fzssh"; rm -rf "$O"; mkdir -p "$O/include/fzssh"
     V=$FZSSH_VERSION; MA=${V%%.*}; R=${V#*.}; MI=${R%%.*}; MC=${R#*.}
@@ -73,39 +75,31 @@ if [ ! -f "$SYS/lib/libfzssh.a" ] || [ "$(cat "$WORK/.fzssh" 2>/dev/null)" != "$
 #define PACKAGE_VERSION_SUFFIX
 #define PACKAGE_VERSION_SUFFIX_S ""
 CFG
-    nice -n 19 make -k -j"$JOBS" -f "$HERE/scripts/Makefile.fzssh" SRC="$WORK/fzssh" A2="$WORK/argon2" OBJ="$O" \
+    nice -n 19 make -k -j"$JOBS" -f "$HERE/scripts/Makefile.fzssh" SRC="$WORK/fzssh" OBJ="$O" \
         SYS="$SYS" TC="$TC" > "$WORK/fzssh.log" 2>&1 || { grep -E 'error|Error' "$WORK/fzssh.log" | cut -c1-300 | head -60; exit 1; }
-    echo "$FZSSH_SHA256$ARGON2_SHA256$(stamp fzssh)$(sha256sum < "$HERE/scripts/Makefile.fzssh" | cut -c1-16)" > "$WORK/.fzssh"
+    echo "$FZSSH_SHA256$(stamp fzssh)$(sha256sum < "$HERE/scripts/Makefile.fzssh" | cut -c1-16)" > "$WORK/.fzssh"
     # one library for fzssh's three (crypt, core, client), under the name
     # FileZilla's configure asks pkg-config for
-    printf 'prefix=%s\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n\nName: libfzssh-client\nDescription: fzssh client\nVersion: %s\nRequires: libfilezilla nettle hogweed\nLibs: -L${libdir} -lfzssh -largon2\nCflags: -I${includedir}\n' "$SYS" "$FZSSH_VERSION" > "$SYS/lib/pkgconfig/libfzssh-client.pc"
+    printf 'prefix=%s\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n\nName: libfzssh-client\nDescription: fzssh client\nVersion: %s\nRequires: libfilezilla gfopencrypto\nLibs: -L${libdir} -lfzssh\nCflags: -I${includedir}\n' "$SYS" "$FZSSH_VERSION" > "$SYS/lib/pkgconfig/libfzssh-client.pc"
     echo "fzssh $FZSSH_VERSION: $(ls -l "$SYS/lib/libfzssh.a" | awk '{print $5}') bytes"
 fi
 
-# ---- SQLite (FileZilla's queue and settings), with our file system layer
-if [ ! -f "$SYS/lib/libsqlite3.a" ] || [ "$(cat "$WORK/.sqlite" 2>/dev/null)" != "$SQLITE_COMMIT$(stamp sqlite)$(sha256sum < "$HERE/deps/amiga/sqlite_amiga.c" | cut -c1-16)" ]; then
-    Q="$WORK/sqlite-src"
-    if [ "$(cat "$Q/.commit" 2>/dev/null)" != "$SQLITE_COMMIT" ]; then
-        rm -rf "$Q"; mkdir -p "$Q"; git -C "$Q" init -q
-        git -C "$Q" fetch -q --depth 1 --filter=blob:none "$SQLITE_GIT" "$SQLITE_COMMIT"
-        git -C "$Q" checkout -q FETCH_HEAD -- lib-src/sqlite
-        echo "$SQLITE_COMMIT" > "$Q/.commit"
+# ---- SQLite (FileZilla's queue and settings) from our shared SQLite
+if [ ! -f "$SYS/lib/libsqlite3.a" ] || [ "$(cat "$WORK/.sqlite" 2>/dev/null)" != "$GFSQLITE_COMMIT$SQLITE_SHA256" ]; then
+    Q="$WORK/gfopensqlite"
+    if [ "$(cat "$Q/.commit" 2>/dev/null)" != "$GFSQLITE_COMMIT" ]; then
+        rm -rf "$Q"; git clone -q "$GFSQLITE_REPO" "$Q" && git -C "$Q" checkout -q "$GFSQLITE_COMMIT"
+        echo "$GFSQLITE_COMMIT" > "$Q/.commit"
     fi
-    rm -rf "$WORK/sqlite"; cp -R "$Q/lib-src/sqlite" "$WORK/sqlite"
-    for p in "$HERE"/patches/sqlite-*.patch; do
-        patch -s -d "$WORK/sqlite" -p1 < "$p" || { echo "patch failed: $p"; exit 1; }
-    done
-    O="$WORK/obj/sqlite"; rm -rf "$O"; mkdir -p "$O"
-    # no mmap (no shared-memory WAL index: a rollback journal), temporary
-    # tables in memory (no /tmp), our layer made the default at start
-    QF="$OPT -DSQLITE_OMIT_WAL -DSQLITE_MAX_MMAP_SIZE=0 -DSQLITE_TEMP_STORE=3 -DSQLITE_THREADSAFE=1 \
-        -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_DEFAULT_FOREIGN_KEYS=1 -DSQLITE_EXTRA_INIT=fz_amiga_sqlite_init"
-    m68k-amigaos-gcc $QF -include "$HERE/deps/amiga/include/sqlite_pre.h" -c "$WORK/sqlite/sqlite3.c" -o "$O/sqlite3.o" > "$WORK/sqlite.log" 2>&1 || fail sqlite "$WORK/sqlite.log"
-    m68k-amigaos-gcc $OPT -I"$WORK/sqlite" -c "$HERE/deps/amiga/sqlite_amiga.c" -o "$O/sqlite_amiga.o" >> "$WORK/sqlite.log" 2>&1 || fail sqlite "$WORK/sqlite.log"
-    rm -f "$SYS/lib/libsqlite3.a"; m68k-amigaos-ar rcs "$SYS/lib/libsqlite3.a" "$O"/*.o
-    cp "$WORK/sqlite/sqlite3.h" "$WORK/sqlite/sqlite3ext.h" "$SYS/include/" 2>/dev/null || cp "$WORK/sqlite/sqlite3.h" "$SYS/include/"
-    SV=$(sed -n 's/^#define SQLITE_VERSION *"\(.*\)"/\1/p' "$WORK/sqlite/sqlite3.h")
+    mkdir -p "$Q/tarballs"; fetch "$SQLITE_URL" "$SQLITE_SHA256" sqlite-amalgamation-3530400.zip
+    cp "$D/sqlite-amalgamation-3530400.zip" "$Q/tarballs/"
+    rm -rf "$Q/out-soft"
+    (cd "$Q" && OS32_GCC16="$(dirname "$TC")" FLOAT=soft ./build.sh) > "$WORK/sqlite.log" 2>&1 || fail sqlite "$WORK/sqlite.log"
+    grep "FPU check" "$WORK/sqlite.log" || :
+    rm -f "$SYS/lib/libsqlite3.a"; cp "$Q/out-soft/lib/libsqlite3.a" "$SYS/lib/"
+    cp "$Q/out-soft/include/sqlite3.h" "$Q/out-soft/include/sqlite3ext.h" "$SYS/include/"
+    SV=$(sed -n 's/^#define SQLITE_VERSION *"\(.*\)"/\1/p' "$SYS/include/sqlite3.h")
     printf 'prefix=%s\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n\nName: SQLite\nDescription: SQL database engine\nVersion: %s\nLibs: -L${libdir} -lsqlite3\nCflags: -I${includedir}\n' "$SYS" "$SV" > "$SYS/lib/pkgconfig/sqlite3.pc"
-    echo "$SQLITE_COMMIT$(stamp sqlite)$(sha256sum < "$HERE/deps/amiga/sqlite_amiga.c" | cut -c1-16)" > "$WORK/.sqlite"
-    echo "sqlite $SV: $(ls -l "$SYS/lib/libsqlite3.a" | awk '{print $5}') bytes"
+    echo "$GFSQLITE_COMMIT$SQLITE_SHA256" > "$WORK/.sqlite"
+    echo "sqlite $SV (gfopensqlite $GFSQLITE_COMMIT): $(ls -l "$SYS/lib/libsqlite3.a" | awk '{print $5}') bytes"
 fi

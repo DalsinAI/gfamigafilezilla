@@ -14,22 +14,12 @@ LFZ_SHA256=3a61251357ad7522e73b8d7348356e87092a1cd7c33d36f045fbea4730b8ff0b
 FZSSH_VERSION=1.4.0
 FZSSH_URL=$U/universe/f/fzssh/fzssh_1.4.0.orig.tar.xz
 FZSSH_SHA256=0c53178298364404e1fe4ce3d50267cf1238e52b414a6a53356bc43b37811338
-# GnuTLS 3.8.13 (LGPL v2.1 or later)
-GNUTLS_VERSION=3.8.13
-GNUTLS_URL=$U/main/g/gnutls28/gnutls28_3.8.13.orig.tar.xz
-GNUTLS_SHA256=ffed8ec1bf09c2426d4f14aae377de4753b53e537d685e604e99a8b16ca9c97e
-# Nettle 3.10.2 (LGPL v3 or GPL v2 or later)
-NETTLE_VERSION=3.10.2
-NETTLE_URL=$U/main/n/nettle/nettle_3.10.2.orig.tar.gz
-NETTLE_SHA256=fe9ff51cb1f2abb5e65a6b8c10a92da0ab5ab6eaf26e7fc2b675c45f1fb519b5
-# GMP 6.3.0 (LGPL v3 or GPL v2 or later)
-GMP_VERSION=6.3.0
-GMP_URL=$U/main/g/gmp/gmp_6.3.0+dfsg.orig.tar.xz
-GMP_SHA256=bd2966e6d277f79328e894a5a9f3ba3fbf2ed2be81def5f48623e30c23fb1572
-# Argon2 20190702 (CC0 or Apache 2.0): fzssh reads PuTTY's v3 key files with it
-ARGON2_VERSION=20190702
-ARGON2_URL=$U/main/a/argon2/argon2_0~20190702+dfsg.orig.tar.xz
-ARGON2_SHA256=815f1017b5b0033204778c2e32443257274bc5d9dd16d355c4f7db8189e23dcc
+# GFOpenTLS and GFOpenCrypto (DalsinAI/gfopentls) in place of GnuTLS,
+# Nettle, GMP and Argon2: the link stubs libgfopentls.a and libgfopencrypto.a
+# (calls into gfopentls.library 1.5 and gfopencrypto.library 2.4, opened
+# before main()), from the stubs branch (gfopentls PR #28) until it merges
+GFOPENTLS_REPO=https://github.com/DalsinAI/gfopentls
+GFOPENTLS_COMMIT=279460a8f26cbe993b6445daf64ffc9670615bbc
 # GFOpenWX Toolkit (wxWidgets on GFOpenLayout): main 243629a (#5-#9 and
 # the frame toolbar fix #11 merged), its SDK as Cradle job
 # j20261106T212844-09449f built it (the toolkit's RC2 build).
@@ -41,10 +31,16 @@ WXT_SDK_SHA256=8e338fa5bcc118592aed2afb3d8484c5152e29e48c9d8cea0ad17de6afc42469
 # fpuauto (amicradle-guest common/fpuauto): the FPU when there is one
 FPUAUTO_REPO=https://github.com/DalsinAI/amicradle-guest
 FPUAUTO_COMMIT=462f3a3ccb4cea314e1bb7f7cfaebda266073233
-# SQLite (public domain): the amalgamation Audacity 3.7.9 keeps in lib-src/sqlite
-SQLITE_GIT=https://github.com/audacity/audacity.git
-SQLITE_COMMIT=86d74c770974b25188ca2f23bcce47c1181bd08a
-# Boost.Regex in its header-only standalone mode, for FileZilla's filters
-# (libstdc++'s std::regex recurses per character: GCC bug 86164). Boost 1.89.0.
-BREGEX_GIT=https://github.com/boostorg/regex.git
-BREGEX_COMMIT=f439e22ae41fa647bd7de16c2d92deb232593985
+# SQLite from our shared SQLite (DalsinAI/gfopensqlite, built FLOAT=soft for
+# fpuauto): SQLite 3.53.4 with Amiga paths, dotfile locks and seeks past the end
+GFSQLITE_REPO=https://github.com/DalsinAI/gfopensqlite
+GFSQLITE_COMMIT=fa780b9dc44de40050ce381e0fd6dd84c174ee1a
+SQLITE_URL=https://www.sqlite.org/2026/sqlite-amalgamation-3530400.zip
+SQLITE_SHA256=1e71ddf93849c6a6ecf58b827c0692073d2dd7ee40196158068f7b29f422e87d
+# Boost from our shared Boost (DalsinAI/gfopenboost, one Amiga config):
+# FileZilla's filters use Boost.Regex in its header-only standalone mode
+# (libstdc++'s std::regex recurses per character: GCC bug 86164), so only
+# the SDK's headers are taken.
+GFBOOST_VERSION=1.89.0-rc1
+GFBOOST_URL=https://github.com/DalsinAI/gfopenboost/releases/download/v1.89.0-rc1/gfopenboost-1.89.0-sdk.tar.xz
+GFBOOST_SHA256=a6cad796bc9f7ac84e81704bef6553f63588255eb7012512d0359654507be52a
