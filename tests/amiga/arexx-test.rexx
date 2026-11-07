@@ -29,9 +29,14 @@ t0 = TIME('E')
 'CD' dir;   CALL Step 'CD', RESULT
 'LIST';     CALL Step 'LIST', TRANSLATE(LEFT(RESULT, 70), ' ', '0a'x)
 'GET' file 'TO RAM:'; CALL Step 'GET' file
+'GET' file 'TO RAM:'
+IF RC = 10 & RC2 = 1012 THEN SAY 'ok   GET again: RC 10 RC2 1012 (there already)'
+ELSE DO; SAY 'FAIL GET again: RC' RC 'RC2' RC2; fails = fails + 1; END
+'GET' file 'TO RAM: OVERWRITE'; CALL Step 'GET OVERWRITE'
 IF ~EXISTS('RAM:' || file) THEN DO; SAY 'FAIL no RAM:' || file; fails = fails + 1; END
 'PUT RAM:' || file
-IF RC ~= 0 THEN SAY 'note PUT (read-only server): RC' RC 'RC2' RC2
+IF RC = 10 & RC2 = 1012 THEN SAY 'ok   PUT onto a file there: RC 10 RC2 1012'
+ELSE DO; SAY 'FAIL PUT onto a file there: RC' RC 'RC2' RC2; fails = fails + 1; END
 'DISCONNECT'; CALL Step 'DISCONNECT'
 'STATUS';   CALL Step 'STATUS', RESULT
 SAY 'time' TIME('E') - t0 's'

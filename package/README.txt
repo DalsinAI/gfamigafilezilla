@@ -18,12 +18,16 @@ AmigaOS 3.2). Commands, with their templates:
   DISCONNECT
   CD PATH/A,TIMEOUT/K/N              RESULT: the new directory
   LIST LONG/S,TIMEOUT/K/N            RESULT: one entry a line, directories end in /
-  GET FILE/A,TO/K,NOWAIT/S,TIMEOUT/K/N   into TO, else the local directory
-  PUT FILE/A,NOWAIT/S,TIMEOUT/K/N    into the remote directory
+  GET FILE/A,TO/K,OVERWRITE/S,NOWAIT/S,TIMEOUT/K/N   into TO, else the
+                                     local directory
+  PUT FILE/A,OVERWRITE/S,NOWAIT/S,TIMEOUT/K/N   into the remote directory
   STATUS                             RESULT: CONNECTED IDLE url directory
   QUIT FORCE/S, ACTIVATE, DEACTIVATE, VERSION, HELP COMMAND, FAULT CODE/N/A
 Commands that talk to the server wait 60 seconds at most (TIMEOUT changes
-it); transfers wait until they end. RC is 0 when it worked, 5 a warning,
+it); transfers wait until they end. GET and PUT refuse a target that is
+there already unless OVERWRITE is given. A server FileZilla does not know
+yet asks in its window whether to trust its key, and CONNECT waits for
+that answer. RC is 0 when it worked, 5 a warning,
 10 an error with its number in RC2 (FAULT gives the number's text), 20
 when FileZilla is closing. RESULT only when the script sets OPTIONS
 RESULTS. Rexx/FZ-Get.rexx is an example.

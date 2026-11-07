@@ -55,8 +55,8 @@ diff -ruN a2/src/interface/Mainfrm.cpp b/src/interface/Mainfrm.cpp
 +#endif
 diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
 --- a/src/interface/amiga_arexx.cpp	1970-01-01 00:00:00.000000000 +0000
-+++ b/src/interface/amiga_arexx.cpp	2026-11-07 10:48:44.182221797 +0000
-@@ -0,0 +1,429 @@
++++ b/src/interface/amiga_arexx.cpp	2026-11-07 10:54:23.915226404 +0000
+@@ -0,0 +1,466 @@
 +// amiga_arexx.cpp - FileZilla's ARexx port FILEZILLA.1 (AmigaOS), on the
 +// toolkit's wxARexxPort (arexx.class; QUIT, ACTIVATE, DEACTIVATE, VERSION
 +// and HELP come with it). FileZilla's own commands:
@@ -65,8 +65,8 @@ diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
 +//   DISCONNECT
 +//   CD PATH/A,TIMEOUT/K/N                       RESULT: the new directory
 +//   LIST LONG/S,TIMEOUT/K/N                     RESULT: one entry a line
-+//   GET FILE/A,TO/K,NOWAIT/S,TIMEOUT/K/N        into TO or the local directory
-+//   PUT FILE/A,NOWAIT/S,TIMEOUT/K/N             into the remote directory
++//   GET FILE/A,TO/K,OVERWRITE/S,NOWAIT/S,TIMEOUT/K/N   into TO or the local directory
++//   PUT FILE/A,OVERWRITE/S,NOWAIT/S,TIMEOUT/K/N        into the remote directory
 +//   STATUS                                      RESULT: state, server, directory
 +//   FAULT CODE/N/A                              FileZilla's error numbers too
 +//
@@ -102,6 +102,7 @@ diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
 +	E_TRANSFER,
 +	E_LOCALPATH,
 +	E_BUSY,
++	E_EXISTS,
 +};
 +
 +struct
@@ -120,6 +121,7 @@ diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
 +	{E_TRANSFER, "The transfer failed"},
 +	{E_LOCALPATH, "Not a local path"},
 +	{E_BUSY, "FileZilla is busy with another remote operation"},
++	{E_EXISTS, "The target file is there already (OVERWRITE replaces it)"},
 +};
 +
 +CMainFrame* rexx_frame{};      // NULL once FileZilla is closing
@@ -190,9 +192,8 @@ diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
 +
 +std::wstring rexx_url(CState* s)
 +{
-+	Site const& site = s->GetSite();
-+	std::wstring const prefix = site.server.GetPrefixFromProtocol(site.server.GetProtocol());
-+	return (prefix.empty() ? std::wstring() : prefix + L"://") + site.Format(ServerFormat::with_user_and_optional_port);
++	// Format gives the protocol's prefix itself (sftp://)
++	return s->GetSite().Format(ServerFormat::with_user_and_optional_port);
 +}
 +
 +// a file in the current remote listing: its size, -1 when not there, -2 a directory
@@ -227,6 +228,27 @@ diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
 +}
 +
 +long const rexx_server_timeout = 60;
++
++// A script cannot answer "The target file already exists": OVERWRITE says
++// what to do, for as long as the command runs (the queue asks the default
++// when the file is there).
++class rexx_overwrite final
++{
++public:
++	rexx_overwrite(bool download, bool overwrite)
++		: download_(download), old_(CDefaultFileExistsDlg::GetDefault(download))
++	{
++		CDefaultFileExistsDlg::SetDefault(download, overwrite ? CFileExistsNotification::overwrite : CFileExistsNotification::skip);
++	}
++	~rexx_overwrite()
++	{
++		CDefaultFileExistsDlg::SetDefault(download_, old_);
++	}
++
++private:
++	bool const download_;
++	CFileExistsNotification::OverwriteAction const old_;
++};
 +
 +void rexx_add_commands(wxARexxPort& p)
 +{
@@ -296,8 +318,10 @@ diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
 +			c.SetError(10, E_NOTCONNECTED);
 +			return;
 +		}
++		// the paths' text: the listing's path carries the server's type
++		// (Unix, VMS ...), which the one made here does not yet
 +		CServerPath const now = s->GetRemotePath();
-+		if (now != want) {
++		if (now.GetPath() != want.GetPath()) {
 +			// refused, or the server put us elsewhere (a link)
 +			c.SetError(now.empty() ? 10 : 5, E_DIRECTORY);
 +		}
@@ -337,9 +361,10 @@ diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
 +		c.SetResult(out);
 +	});
 +
-+	p.Add("GET", "FILE/A,TO/K,NOWAIT/S,TIMEOUT/K/N", [](wxARexxCommand& c) {
++	p.Add("GET", "FILE/A,TO/K,OVERWRITE/S,NOWAIT/S,TIMEOUT/K/N", [](wxARexxCommand& c) {
 +		std::wstring const name = c.Str(0).ToStdWstring();
 +		std::wstring const to = c.Str(1).ToStdWstring();
++		bool const overwrite = c.Switch(2);
 +		CState* s = rexx_ready_state(c);
 +		if (!s) {
 +			return;
@@ -359,16 +384,22 @@ diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
 +			return;
 +		}
 +		std::wstring const target = local.GetPath() + name;
++		if (!overwrite && fz::local_filesys::get_file_type(fz::to_native(target)) != fz::local_filesys::unknown) {
++			c.SetError(10, E_EXISTS);
++			return;
++		}
++		rexx_overwrite const policy(true, overwrite);
 +		CQueueView* q = rexx_frame->GetQueue();
 +		if (!q || !q->QueueFile(false, true, name, name, local, s->GetRemotePath(), s->GetSite(), size)) {
 +			c.SetError(10, E_TRANSFER);
 +			return;
 +		}
 +		q->QueueFile_Finish(true);
-+		if (c.Switch(2)) {
++		if (c.Switch(3)) {
++			// NOWAIT: the queue asks the default when it gets there
 +			return;
 +		}
-+		if (!rexx_waited(c, rexx_transfers_done, c.Number(3, 0))) {
++		if (!rexx_waited(c, rexx_transfers_done, c.Number(4, 0))) {
 +			return;
 +		}
 +		if (fz::local_filesys::get_size(fz::to_native(target)) != size) {
@@ -376,8 +407,9 @@ diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
 +		}
 +	});
 +
-+	p.Add("PUT", "FILE/A,NOWAIT/S,TIMEOUT/K/N", [](wxARexxCommand& c) {
++	p.Add("PUT", "FILE/A,OVERWRITE/S,NOWAIT/S,TIMEOUT/K/N", [](wxARexxCommand& c) {
 +		std::wstring const file = c.Str(0).ToStdWstring();
++		bool const overwrite = c.Switch(1);
 +		CState* s = rexx_ready_state(c);
 +		if (!s) {
 +			return;
@@ -395,16 +427,21 @@ diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
 +			c.SetError(10, E_NOFILE);
 +			return;
 +		}
++		if (!overwrite && rexx_remote_size(s, name) != -1) {
++			c.SetError(10, E_EXISTS);
++			return;
++		}
++		rexx_overwrite const policy(false, overwrite);
 +		CQueueView* q = rexx_frame->GetQueue();
 +		if (!q || !q->QueueFile(false, false, name, name, local, s->GetRemotePath(), s->GetSite(), size)) {
 +			c.SetError(10, E_TRANSFER);
 +			return;
 +		}
 +		q->QueueFile_Finish(true);
-+		if (c.Switch(1)) {
++		if (c.Switch(2)) {
 +			return;
 +		}
-+		long const timeout = c.Number(2, 0);
++		long const timeout = c.Number(3, 0);
 +		if (!rexx_waited(c, rexx_transfers_done, timeout)) {
 +			return;
 +		}
