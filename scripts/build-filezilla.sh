@@ -79,7 +79,12 @@ fi
 # now): configure wrote them into the Makefiles, so a change means
 # configuring again
 LIBSET=$(pkg-config --static --libs libfilezilla libfzssh-client 2>/dev/null | sha256sum | cut -c1-16)
-[ "$(cat "$SRC/.libset" 2>/dev/null)" = "$LIBSET" ] || { rm -f "$SRC/config.status" "$SRC/src/interface/filezilla"; echo "$LIBSET" > "$SRC/.libset"; }
+# (the tree's own libtool archives carry the old list too: they go, the
+# objects stay)
+[ "$(cat "$SRC/.libset2" 2>/dev/null)" = "$LIBSET" ] || {
+    rm -f "$SRC/config.status" "$SRC/src/interface/filezilla"
+    find "$SRC" \( -name "*.la" -o -name "*.a" \) -delete
+    echo "$LIBSET" > "$SRC/.libset2"; }
 cd "$SRC"
 if [ ! -f config.status ]; then
     CC="m68k-amigaos-gcc $SPECS" CXX="m68k-amigaos-g++ $SPECS" \
