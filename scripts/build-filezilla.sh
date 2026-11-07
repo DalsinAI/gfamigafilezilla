@@ -75,6 +75,11 @@ if [ "$(cat "$BR/.sha" 2>/dev/null)" != "$GFBOOST_SHA256" ]; then
     echo "$GFBOOST_SHA256" > "$BR/.sha"
     rm -f "$SRC/config.status"
 fi
+# the libraries libfilezilla and fzssh link with (GnuTLS then, GFOpenTLS
+# now): configure wrote them into the Makefiles, so a change means
+# configuring again
+LIBSET=$(pkg-config --static --libs libfilezilla libfzssh-client 2>/dev/null | sha256sum | cut -c1-16)
+[ "$(cat "$SRC/.libset" 2>/dev/null)" = "$LIBSET" ] || { rm -f "$SRC/config.status" "$SRC/src/interface/filezilla"; echo "$LIBSET" > "$SRC/.libset"; }
 cd "$SRC"
 if [ ! -f config.status ]; then
     CC="m68k-amigaos-gcc $SPECS" CXX="m68k-amigaos-g++ $SPECS" \
