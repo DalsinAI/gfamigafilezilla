@@ -26,6 +26,10 @@
 #include <string>
 #include <cctype>
 #include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
 
 using namespace std::literals;
 
@@ -297,8 +301,37 @@ private:
 	bool data_done_{}, reply226_{};
 };
 
+// nbtest: does fcntl(O_NONBLOCK), as libfilezilla sets it, make a socket
+// non-blocking here? Then the same with ioctl(FIONBIO). A recv on an idle
+// non-blocking socket must come back at once with EAGAIN.
+static int nbtest()
+{
+	for (int way = 0; way < 2; ++way) {
+		int sv[2];
+		if (socketpair(AF_INET, SOCK_STREAM, 0, sv)) { say("socketpair failed %s", std::to_string(errno)); return 10; }
+		int r;
+		if (!way) {
+			int fl = fcntl(sv[0], F_GETFL);
+			r = fcntl(sv[0], F_SETFL, fl | O_NONBLOCK);
+			say("fcntl: F_GETFL was %s", std::to_string(fl) + ", F_SETFL gave " + std::to_string(r) + ", F_GETFL now " + std::to_string(fcntl(sv[0], F_GETFL)));
+		}
+		else {
+			int one = 1;
+			r = ioctl(sv[0], FIONBIO, &one);
+			say("ioctl FIONBIO gave %s", std::to_string(r));
+		}
+		char c;
+		say("recv on an idle socket (%s)...", way ? "ioctl"s : "fcntl"s);
+		r = recv(sv[0], &c, 1, 0);
+		say("recv came back: %s", std::to_string(r) + " errno " + std::to_string(errno) + (errno == EAGAIN ? " (EAGAIN)" : ""));
+		close(sv[0]); close(sv[1]);
+	}
+	return 0;
+}
+
 int main(int argc, char** argv)
 {
+	if (argc == 2 && std::string(argv[1]) == "nbtest") { g_start = fz::monotonic_clock::now(); return nbtest(); }
 	if (argc != 7) { fprintf(stderr, "fzprobe sftp|ftps|ftp HOST PORT USER PASSWORD FILE\n"); return 20; }
 	g_start = fz::monotonic_clock::now();
 	timed_logger log;
