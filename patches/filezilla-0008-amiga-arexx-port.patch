@@ -1,0 +1,698 @@
+AmigaOS: the ARexx port FILEZILLA.1 on arexx.class (amiga_arexx.cpp, taken
+into Mainfrm.cpp): CONNECT, DISCONNECT, CD, LIST, GET, PUT, STATUS and the
+common QUIT, ACTIVATE, DEACTIVATE, VERSION, HELP and FAULT.
+
+diff -ruN a2/src/interface/Mainfrm.cpp b/src/interface/Mainfrm.cpp
+--- a/src/interface/Mainfrm.cpp	2026-11-07 10:18:59.538422894 +0000
++++ b/src/interface/Mainfrm.cpp	2026-11-07 10:18:59.549996879 +0000
+@@ -57,6 +57,10 @@
+ 
+ #if FZ_MANUALUPDATECHECK
+ #include "overlay.h"
++#ifdef __AMIGA__
++void fz_arexx_open(CMainFrame* frame);
++void fz_arexx_close();
++#endif
+ #include <wx/hyperlink.h>
+ #include <wx/mstream.h>
+ #endif
+@@ -527,10 +531,17 @@
+ 	// Delay call to PostInitialize, otherwise macOS gets really confused about the right mouse button...
+ 	startupTimer_.SetOwner(this);
+ 	startupTimer_.Start(1, true);
++#ifdef __AMIGA__
++	// the ARexx port FILEZILLA.1 (amiga_arexx.cpp)
++	fz_arexx_open(this);
++#endif
+ }
+ 
+ CMainFrame::~CMainFrame()
+ {
++#ifdef __AMIGA__
++	fz_arexx_close();
++#endif
+ 	options_.unwatch_all(this);
+ 
+ 	CPowerManagement::Destroy();
+@@ -1422,6 +1433,10 @@
+ 		m_pContextControl->SaveTabs();
+ 	}
+ 
++#ifdef __AMIGA__
++	// no more ARexx commands once the engines go
++	fz_arexx_close();
++#endif
+ 	for (std::vector<CState*>::const_iterator iter = pStates->begin(); iter != pStates->end(); ++iter) {
+ 		CState *pState = *iter;
+ 		if (!pState) {
+@@ -2977,3 +2992,7 @@
+ 		}
+ 	}
+ }
++
++#ifdef __AMIGA__
++#include "amiga_arexx.cpp"
++#endif
+diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
+--- a/src/interface/amiga_arexx.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/src/interface/amiga_arexx.cpp	2026-11-07 10:18:59.554096336 +0000
+@@ -0,0 +1,639 @@
++// amiga_arexx.cpp - FileZilla's ARexx port FILEZILLA.1 (AmigaOS).
++//
++// wxARexxPort is the shared part, kept in this one file so it can move
++// into openwxtoolkit.library as it is: a table of name, ReadArgs template
++// and handler, the common commands (QUIT [FORCE], ACTIVATE, DEACTIVATE,
++// VERSION, HELP [command], FAULT code) and RC 0/5/10/20, with RESULT only
++// when the script asks. The port is arexx.class's (deps/amiga/arexxhost.c),
++// in a task of its own; a handler runs there and does its wx work on the
++// main thread through OnMain(), so a command never races the GUI.
++//
++// FileZilla's own commands:
++//   CONNECT URL/A,PORT/K/N,USER/K,PASSWORD/K   (waits until logged in)
++//   DISCONNECT
++//   CD PATH/A                                  (RESULT: the new directory)
++//   LIST LONG/S                                (RESULT: one entry a line)
++//   GET FILE/A,TO/K,NOWAIT/S                   (into TO or the local directory)
++//   PUT FILE/A,NOWAIT/S                        (into the remote directory)
++//   STATUS                                     (RESULT: state, server, directory)
++//
++// Taken into Mainfrm.cpp (#include at its end) so the build needs no new
++// Makefile entries.
++// Copyright (c) 2026 AmiCradle Team
++
++#include <libfilezilla/local_filesys.hpp>
++#include <libfilezilla/mutex.hpp>
++#include <libfilezilla/time.hpp>
++#include <functional>
++#include <memory>
++#include <string>
++#include <vector>
++#include <strings.h>
++#include <unistd.h>
++#include "fzarexx.h"
++
++namespace {
++
++// ---- text: ARexx speaks ISO-8859-1 -------------------------------------------------
++
++std::wstring rexx_w(char const* s)
++{
++	std::wstring ret;
++	for (; s && *s; ++s) {
++		ret += static_cast<wchar_t>(static_cast<unsigned char>(*s));
++	}
++	return ret;
++}
++
++std::string rexx_a(std::wstring const& s)
++{
++	std::string ret;
++	ret.reserve(s.size());
++	for (wchar_t c : s) {
++		ret += (c > 0 && c < 256) ? static_cast<char>(c) : '?';
++	}
++	return ret;
++}
++
++// ---- wxARexxPort -------------------------------------------------------------------
++
++class wxARexxPort final
++{
++public:
++	enum { RC_OK = 0, RC_WARN = 5, RC_ERROR = 10, RC_FATAL = 20 };
++
++	struct Reply
++	{
++		long rc{RC_OK};
++		long rc2{};
++		std::string result;
++	};
++
++	// args: ReadArgs' answers (strings as char *, /N as long *, /S as 0 or not)
++	using Handler = std::function<Reply(wxARexxPort& port, long* args)>;
++
++	struct Command
++	{
++		char const* name;
++		char const* tmpl;
++		Handler run;
++	};
++
++	// errors this program numbers itself (FAULT gives their text); below
++	// 1000 FAULT gives dos.library's
++	struct Error
++	{
++		long code;
++		char const* text;
++	};
++
++	wxARexxPort(wxTopLevelWindow* top, std::string const& host, std::string const& version,
++		std::vector<Command> commands, std::vector<Error> errors)
++		: top_(top), host_(host), version_(version), errors_(std::move(errors))
++		, state_(std::make_shared<shared>())
++	{
++		commands_.push_back({"QUIT", "FORCE/S", [](wxARexxPort& p, long* a) {
++			bool const force = a[0] != 0;
++			p.OnMain([&p, force] { if (p.top_) { p.top_->Close(force); } });
++			return Reply{};
++		}});
++		commands_.push_back({"ACTIVATE", "", [](wxARexxPort& p, long*) {
++			p.OnMain([&p] { if (p.top_) { p.top_->Iconize(false); p.top_->Show(); p.top_->Raise(); } });
++			return Reply{};
++		}});
++		commands_.push_back({"DEACTIVATE", "", [](wxARexxPort& p, long*) {
++			p.OnMain([&p] { if (p.top_) { p.top_->Iconize(true); } });
++			return Reply{};
++		}});
++		commands_.push_back({"VERSION", "", [](wxARexxPort& p, long*) {
++			return Reply{RC_OK, 0, p.version_};
++		}});
++		commands_.push_back({"HELP", "COMMAND", [](wxARexxPort& p, long* a) {
++			Reply r;
++			char const* want = reinterpret_cast<char const*>(a[0]);
++			for (auto const& c : p.commands_) {
++				if (!want) {
++					if (!r.result.empty()) {
++						r.result += ' ';
++					}
++					r.result += c.name;
++				}
++				else if (!strcasecmp(want, c.name)) {
++					r.result = std::string(c.name) + (*c.tmpl ? " " : "") + c.tmpl;
++					return r;
++				}
++			}
++			if (want) {
++				r.rc = RC_WARN;
++			}
++			return r;
++		}});
++		commands_.push_back({"FAULT", "CODE/A/N", [](wxARexxPort& p, long* a) {
++			long const code = *reinterpret_cast<long*>(a[0]);
++			for (auto const& e : p.errors_) {
++				if (e.code == code) {
++					return Reply{RC_OK, 0, e.text};
++				}
++			}
++			char buf[128];
++			fz_rexx_fault(code, buf, sizeof buf);
++			return Reply{RC_OK, 0, buf};
++		}});
++		for (auto& c : commands) {
++			commands_.push_back(std::move(c));
++		}
++	}
++
++	~wxARexxPort()
++	{
++		Stop();
++	}
++
++	// the port's name (FILEZILLA.1), empty when there is no port
++	std::string const& Name() const { return name_; }
++
++	bool Start()
++	{
++		std::vector<fz_rexx_cmd> table;
++		for (auto const& c : commands_) {
++			table.push_back({c.name, c.tmpl});
++		}
++		char name[40]{};
++		if (fz_rexx_start(host_.c_str(), table.data(), static_cast<int>(table.size()), &Dispatch, this, name, sizeof name) != 0) {
++			return false;
++		}
++		name_ = name;
++		running_ = true;
++		return true;
++	}
++
++	// on the main thread: commands still waiting are answered RC 20
++	void Stop()
++	{
++		if (!running_) {
++			return;
++		}
++		{
++			fz::scoped_lock l(state_->mutex);
++			state_->stopping = true;
++			state_->cond.signal(l);
++		}
++		top_ = nullptr;
++		fz_rexx_stop();
++		running_ = false;
++	}
++
++	// In a handler: runs f on the main thread and waits for it. False when
++	// the program is going (f may then not have run).
++	bool OnMain(std::function<void()> f)
++	{
++		auto st = state_;
++		auto done = std::make_shared<bool>(false);
++		{
++			fz::scoped_lock l(st->mutex);
++			if (st->stopping) {
++				return false;
++			}
++		}
++		wxTheApp->CallAfter([st, done, f]() {
++			bool stopping;
++			{
++				fz::scoped_lock l(st->mutex);
++				stopping = st->stopping;
++			}
++			if (!stopping) {
++				f();
++			}
++			fz::scoped_lock l(st->mutex);
++			*done = true;
++			st->cond.signal(l);
++		});
++		fz::scoped_lock l(st->mutex);
++		while (!*done && !st->stopping) {
++			st->cond.wait(l, fz::duration::from_milliseconds(250));
++		}
++		return *done;
++	}
++
++	// In a handler: asks ready() on the main thread every 50 ms until it
++	// says yes. False when the program is going or after timeout.
++	bool WaitFor(std::function<bool()> ready, fz::duration timeout = fz::duration())
++	{
++		fz::monotonic_clock const start = fz::monotonic_clock::now();
++		for (;;) {
++			bool yes = false;
++			if (!OnMain([&] { yes = ready(); })) {
++				return false;
++			}
++			if (yes) {
++				return true;
++			}
++			if (timeout && fz::monotonic_clock::now() - start > timeout) {
++				return false;
++			}
++			usleep(50000);
++		}
++	}
++
++private:
++	static long Dispatch(void* user, int id, long* args, long* rc2, char** result)
++	{
++		auto& self = *static_cast<wxARexxPort*>(user);
++		if (id < 0 || static_cast<size_t>(id) >= self.commands_.size()) {
++			return RC_ERROR;
++		}
++		static long none[32];
++		self.reply_ = self.commands_[id].run(self, args ? args : none);
++		*rc2 = self.reply_.rc2;
++		*result = self.reply_.rc == RC_OK && !self.reply_.result.empty()
++			? const_cast<char*>(self.reply_.result.c_str()) : nullptr;
++		return self.reply_.rc;
++	}
++
++	struct shared
++	{
++		fz::mutex mutex;
++		fz::condition cond;
++		bool stopping{};
++	};
++
++	wxTopLevelWindow* top_;
++	std::string host_;
++	std::string version_;
++	std::vector<Command> commands_;
++	std::vector<Error> errors_;
++	std::shared_ptr<shared> state_;
++	std::string name_;
++	Reply reply_;
++	bool running_{};
++};
++
++// ---- FileZilla's commands ----------------------------------------------------------
++
++enum : long
++{
++	E_NOTCONNECTED = 1001,
++	E_ADDRESS,
++	E_PASSWORD,
++	E_LOGIN,
++	E_BUSY,
++	E_DIRECTORY,
++	E_NOFILE,
++	E_ISDIR,
++	E_TRANSFER,
++	E_LOCALPATH,
++};
++
++using Reply = wxARexxPort::Reply;
++
++Reply rexx_error(long code)
++{
++	return Reply{wxARexxPort::RC_ERROR, code, {}};
++}
++
++CState* rexx_state()
++{
++	return CContextManager::Get()->GetCurrentContext();
++}
++
++// the main thread's answer to "is it done?" for the remote side
++bool rexx_idle()
++{
++	CState* s = rexx_state();
++	return !s || s->IsRemoteIdle();
++}
++
++bool rexx_connected()
++{
++	CState* s = rexx_state();
++	return s && s->IsRemoteConnected();
++}
++
++std::wstring rexx_url(CState* s)
++{
++	Site const& site = s->GetSite();
++	std::wstring const prefix = site.server.GetPrefixFromProtocol(site.server.GetProtocol());
++	return (prefix.empty() ? std::wstring() : prefix + L"://") + site.Format(ServerFormat::with_user_and_optional_port);
++}
++
++// a remote file in the current listing: its size, -1 when not there, -2 a directory
++int64_t rexx_remote_size(CState* s, std::wstring const& name)
++{
++	auto listing = s->GetRemoteDir();
++	if (!listing) {
++		return -1;
++	}
++	for (size_t i = 0; i < listing->size(); ++i) {
++		CDirentry const& e = (*listing)[i];
++		if (e.name == name) {
++			return e.is_dir() ? -2 : e.size;
++		}
++	}
++	return -1;
++}
++
++fz::duration const rexx_net_timeout = fz::duration::from_seconds(600);
++
++std::vector<wxARexxPort::Command> filezilla_commands(CMainFrame* frame)
++{
++	std::vector<wxARexxPort::Command> c;
++
++	c.push_back({"CONNECT", "URL/A,PORT/K/N,USER/K,PASSWORD/K", [](wxARexxPort& p, long* a) {
++		std::wstring const host = rexx_w(reinterpret_cast<char const*>(a[0]));
++		unsigned int const port = a[1] ? static_cast<unsigned int>(*reinterpret_cast<long*>(a[1])) : 0;
++		std::wstring const user = rexx_w(reinterpret_cast<char const*>(a[2]));
++		std::wstring const pass = rexx_w(reinterpret_cast<char const*>(a[3]));
++		long err = 0;
++		p.OnMain([&] {
++			CState* s = rexx_state();
++			if (!s || !s->engine_) {
++				err = E_NOTCONNECTED;
++				return;
++			}
++			Site site;
++			std::wstring error;
++			CServerPath path;
++			if (!site.ParseUrl(host, port, user, pass, error, path)) {
++				err = E_ADDRESS;
++				return;
++			}
++			ServerProtocol const proto = site.server.GetProtocol();
++			if (proto == HTTP || proto == HTTPS || proto == S3) {
++				err = E_ADDRESS;
++				return;
++			}
++			if (site.credentials.logonType_ == LogonType::ask || site.credentials.logonType_ == LogonType::interactive) {
++				err = E_PASSWORD;
++				return;
++			}
++			if (!s->Connect(site, path)) {
++				err = E_LOGIN;
++			}
++		});
++		if (err) {
++			return rexx_error(err);
++		}
++		if (!p.WaitFor(rexx_idle, rexx_net_timeout)) {
++			return rexx_error(E_BUSY);
++		}
++		bool ok = false;
++		p.OnMain([&] { ok = rexx_connected(); });
++		return ok ? Reply{} : rexx_error(E_LOGIN);
++	}});
++
++	c.push_back({"DISCONNECT", "", [](wxARexxPort& p, long*) {
++		bool was = false;
++		p.OnMain([&] {
++			CState* s = rexx_state();
++			was = s && s->IsRemoteConnected();
++			if (s) {
++				s->Disconnect();
++			}
++		});
++		if (!was) {
++			return Reply{wxARexxPort::RC_WARN, E_NOTCONNECTED, {}};
++		}
++		p.WaitFor(rexx_idle, rexx_net_timeout);
++		return Reply{};
++	}});
++
++	c.push_back({"CD", "PATH/A", [](wxARexxPort& p, long* a) {
++		std::wstring const dir = rexx_w(reinterpret_cast<char const*>(a[0]));
++		long err = 0;
++		p.OnMain([&] {
++			CState* s = rexx_state();
++			if (!s || !s->IsRemoteConnected()) {
++				err = E_NOTCONNECTED;
++			}
++			else if (!s->IsRemoteIdle()) {
++				err = E_BUSY;
++			}
++			else if (!s->ChangeRemoteDir(s->GetRemotePath(), dir)) {
++				err = E_DIRECTORY;
++			}
++		});
++		if (err) {
++			return rexx_error(err);
++		}
++		if (!p.WaitFor(rexx_idle, rexx_net_timeout)) {
++			return rexx_error(E_BUSY);
++		}
++		Reply r;
++		p.OnMain([&] {
++			CState* s = rexx_state();
++			if (!s || !s->IsRemoteConnected()) {
++				r = rexx_error(E_NOTCONNECTED);
++				return;
++			}
++			CServerPath want = s->GetRemotePath();
++			std::wstring const now = want.GetPath();
++			if (!want.ChangePath(dir) || want.GetPath() != now) {
++				// the server went elsewhere (a link) or refused: say where we are
++				if (!want.empty() && want.GetPath() != now) {
++					r.rc = wxARexxPort::RC_WARN;
++					r.rc2 = E_DIRECTORY;
++				}
++			}
++			r.result = rexx_a(now);
++		});
++		return r;
++	}});
++
++	c.push_back({"LIST", "LONG/S", [](wxARexxPort& p, long* a) {
++		bool const lng = a[0] != 0;
++		if (!p.WaitFor(rexx_idle, rexx_net_timeout)) {
++			return rexx_error(E_BUSY);
++		}
++		Reply r;
++		p.OnMain([&] {
++			CState* s = rexx_state();
++			if (!s || !s->IsRemoteConnected()) {
++				r = rexx_error(E_NOTCONNECTED);
++				return;
++			}
++			auto listing = s->GetRemoteDir();
++			if (!listing) {
++				r = rexx_error(E_DIRECTORY);
++				return;
++			}
++			for (size_t i = 0; i < listing->size(); ++i) {
++				CDirentry const& e = (*listing)[i];
++				if (!r.result.empty()) {
++					r.result += '\n';
++				}
++				if (lng) {
++					r.result += e.is_dir() ? std::string("DIR") : std::to_string(e.size);
++					r.result += ' ';
++				}
++				r.result += rexx_a(e.name);
++				if (e.is_dir()) {
++					r.result += '/';
++				}
++			}
++		});
++		return r;
++	}});
++
++	c.push_back({"GET", "FILE/A,TO/K,NOWAIT/S", [frame](wxARexxPort& p, long* a) {
++		std::wstring const name = rexx_w(reinterpret_cast<char const*>(a[0]));
++		std::wstring const to = rexx_w(reinterpret_cast<char const*>(a[1]));
++		bool const nowait = a[2] != 0;
++		if (!p.WaitFor(rexx_idle, rexx_net_timeout)) {
++			return rexx_error(E_BUSY);
++		}
++		long err = 0;
++		int64_t size = -1;
++		std::wstring target;
++		p.OnMain([&] {
++			CState* s = rexx_state();
++			if (!s || !s->IsRemoteConnected()) {
++				err = E_NOTCONNECTED;
++				return;
++			}
++			size = rexx_remote_size(s, name);
++			if (size == -2) {
++				err = E_ISDIR;
++				return;
++			}
++			if (size == -1 && !s->GetRemoteDir()) {
++				err = E_NOFILE;
++				return;
++			}
++			CLocalPath local = s->GetLocalDir();
++			if (!to.empty() && !local.SetPath(to)) {
++				err = E_LOCALPATH;
++				return;
++			}
++			target = local.GetPath() + name;
++			CQueueView* q = frame->GetQueue();
++			if (!q || !q->QueueFile(false, true, name, name, local, s->GetRemotePath(), s->GetSite(), size)) {
++				err = E_TRANSFER;
++				return;
++			}
++			q->QueueFile_Finish(true);
++		});
++		if (err) {
++			return rexx_error(err);
++		}
++		if (nowait) {
++			return Reply{};
++		}
++		if (!p.WaitFor([frame] { CQueueView* q = frame->GetQueue(); return !q || q->empty(); })) {
++			return rexx_error(E_TRANSFER);
++		}
++		int64_t const got = fz::local_filesys::get_size(fz::to_native(target));
++		if (got < 0 || (size >= 0 && got != size)) {
++			return rexx_error(E_TRANSFER);
++		}
++		return Reply{};
++	}});
++
++	c.push_back({"PUT", "FILE/A,NOWAIT/S", [frame](wxARexxPort& p, long* a) {
++		std::wstring const file = rexx_w(reinterpret_cast<char const*>(a[0]));
++		bool const nowait = a[1] != 0;
++		if (!p.WaitFor(rexx_idle, rexx_net_timeout)) {
++			return rexx_error(E_BUSY);
++		}
++		long err = 0;
++		int64_t size = -1;
++		std::wstring name;
++		p.OnMain([&] {
++			CState* s = rexx_state();
++			if (!s || !s->IsRemoteConnected()) {
++				err = E_NOTCONNECTED;
++				return;
++			}
++			// a name without a volume is in FileZilla's local directory
++			std::wstring const full = file.find(':') == std::wstring::npos ? s->GetLocalDir().GetPath() + file : file;
++			CLocalPath local;
++			if (!local.SetPath(full, &name) || name.empty()) {
++				err = E_LOCALPATH;
++				return;
++			}
++			size = fz::local_filesys::get_size(fz::to_native(full));
++			if (size < 0) {
++				err = E_NOFILE;
++				return;
++			}
++			CQueueView* q = frame->GetQueue();
++			if (!q || !q->QueueFile(false, false, name, name, local, s->GetRemotePath(), s->GetSite(), size)) {
++				err = E_TRANSFER;
++				return;
++			}
++			q->QueueFile_Finish(true);
++		});
++		if (err) {
++			return rexx_error(err);
++		}
++		if (nowait) {
++			return Reply{};
++		}
++		if (!p.WaitFor([frame] { CQueueView* q = frame->GetQueue(); return !q || q->empty(); })) {
++			return rexx_error(E_TRANSFER);
++		}
++		// the server's own listing says whether it all arrived
++		p.OnMain([] { CState* s = rexx_state(); if (s) { s->RefreshRemote(); } });
++		if (!p.WaitFor(rexx_idle, rexx_net_timeout)) {
++			return rexx_error(E_BUSY);
++		}
++		int64_t got = -1;
++		p.OnMain([&] { CState* s = rexx_state(); if (s) { got = rexx_remote_size(s, name); } });
++		return got == size ? Reply{} : rexx_error(E_TRANSFER);
++	}});
++
++	c.push_back({"STATUS", "", [frame](wxARexxPort& p, long*) {
++		Reply r;
++		p.OnMain([&] {
++			CState* s = rexx_state();
++			if (!s || !s->GetSite()) {
++				r.result = "DISCONNECTED";
++				return;
++			}
++			CQueueView* q = frame->GetQueue();
++			bool const transferring = q && !q->empty();
++			bool const connected = s->IsRemoteConnected();
++			r.result = connected ? "CONNECTED" : "CONNECTING";
++			r.result += transferring ? " TRANSFERRING" : (s->IsRemoteIdle() ? " IDLE" : " BUSY");
++			r.result += ' ' + rexx_a(rexx_url(s));
++			if (connected) {
++				r.result += ' ' + rexx_a(s->GetRemotePath().GetPath());
++			}
++		});
++		return r;
++	}});
++
++	return c;
++}
++
++std::unique_ptr<wxARexxPort> rexx_port;
++
++} // namespace
++
++// at the end of CMainFrame's constructor and the start of its destructor
++void fz_arexx_open(CMainFrame* frame)
++{
++	if (rexx_port) {
++		return;
++	}
++	auto port = std::make_unique<wxARexxPort>(frame, "FILEZILLA", rexx_a(L"FileZilla " + GetFileZillaEngineVersion()),
++		filezilla_commands(frame), std::vector<wxARexxPort::Error>{
++			{E_NOTCONNECTED, "Not connected to a server"},
++			{E_ADDRESS, "The server address could not be read"},
++			{E_PASSWORD, "This server needs a PASSWORD"},
++			{E_LOGIN, "Could not connect or log in"},
++			{E_BUSY, "The server did not answer in time"},
++			{E_DIRECTORY, "Could not change to that directory"},
++			{E_NOFILE, "No such file"},
++			{E_ISDIR, "That is a directory"},
++			{E_TRANSFER, "The transfer failed"},
++			{E_LOCALPATH, "Not a local path"},
++		});
++	if (port->Start()) {
++		rexx_port = std::move(port);
++	}
++}
++
++void fz_arexx_close()
++{
++	rexx_port.reset();
++}
