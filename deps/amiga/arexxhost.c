@@ -76,12 +76,22 @@ static void fz_rexx_func(register struct fz_ARexxCmd *cmd __asm("a0"),
     }
 }
 
+/* arexx.class's AREXX_GetClass() (LVO -30): NewObject takes the class
+ * pointer, as the autodoc's own example does, not a public class name */
+static struct IClass *fz_arexx_getclass(struct Library *base)
+{
+    register struct IClass *res __asm("d0");
+    register struct Library *a6 __asm("a6") = base;
+    __asm__ volatile("jsr -30(%%a6)" : "=r"(res) : "r"(a6) : "d1", "a0", "a1", "cc", "memory");
+    return res;
+}
+
 static void *fz_rexx_task(void *unused)
 {
     ULONG mask = 0;
     (void)unused;
     rx.task = FindTask(NULL);
-    rx.obj = NewObject(NULL, (STRPTR)"arexx.class",
+    rx.obj = NewObject(fz_arexx_getclass(rx.base), NULL,
                        FZ_AREXX_HostName, (ULONG)rx.host,
                        FZ_AREXX_Commands, (ULONG)rx.table,
                        FZ_AREXX_ErrorCode, (ULONG)&rx.error,
