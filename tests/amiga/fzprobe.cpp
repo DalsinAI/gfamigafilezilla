@@ -310,7 +310,7 @@ static int nbtest()
 		int sv[2];
 		if (socketpair(AF_INET, SOCK_STREAM, 0, sv)) { say("socketpair failed %s", std::to_string(errno)); return 10; }
 		int r;
-		if (!way) {
+		if (way) {
 			int fl = fcntl(sv[0], F_GETFL);
 			r = fcntl(sv[0], F_SETFL, fl | O_NONBLOCK);
 			say("fcntl: F_GETFL was %s", std::to_string(fl) + ", F_SETFL gave " + std::to_string(r) + ", F_GETFL now " + std::to_string(fcntl(sv[0], F_GETFL)));
@@ -321,7 +321,7 @@ static int nbtest()
 			say("ioctl FIONBIO gave %s", std::to_string(r));
 		}
 		char c;
-		say("recv on an idle socket (%s)...", way ? "ioctl"s : "fcntl"s);
+		say("recv on an idle socket (%s)...", way ? "fcntl"s : "ioctl"s);
 		r = recv(sv[0], &c, 1, 0);
 		say("recv came back: %s", std::to_string(r) + " errno " + std::to_string(errno) + (errno == EAGAIN ? " (EAGAIN)" : ""));
 		close(sv[0]); close(sv[1]);
