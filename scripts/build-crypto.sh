@@ -42,12 +42,12 @@ fail() { # what, log: the log's end and, from configure, its checks that failed
 
 # ---- our getentropy() and the rest libnix lacks
 A="$WORK/fzamiga"; mkdir -p "$A"
-for c in getentropy netcompat libccompat iconv dircompat dosrun idna wordexp volumes hook; do
+for c in getentropy netcompat libccompat iconv dircompat dosrun idna wordexp volumes hook arexxhost; do
     "$TC/bin/m68k-amigaos-gcc" $CF -Wall -I"$HERE/deps/amiga/include" -c "$HERE/deps/amiga/$c.c" -o "$A/$c.o" \
         || { echo "deps/amiga/$c.c failed"; exit 1; }
 done
 rm -f "$SYS/lib/libfzamiga.a"; "$TC/bin/m68k-amigaos-ar" rcs "$SYS/lib/libfzamiga.a" "$A"/*.o
-cp "$HERE/deps/amiga/include/fzamiga.h" "$HERE/deps/amiga/include/fzdecl.h" "$HERE/deps/amiga/include/iconv.h" "$HERE/deps/amiga/include/idna.h" "$HERE/deps/amiga/include/idn-free.h" "$SYS/include/"
+cp "$HERE/deps/amiga/include/fzamiga.h" "$HERE/deps/amiga/include/fzdecl.h" "$HERE/deps/amiga/include/iconv.h" "$HERE/deps/amiga/include/idna.h" "$HERE/deps/amiga/include/idn-free.h" "$HERE/deps/amiga/include/fzarexx.h" "$SYS/include/"
 
 # ---- what an older sysroot still holds from GnuTLS, Nettle, GMP and Argon2:
 # gone, so nothing can link them by mistake

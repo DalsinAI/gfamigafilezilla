@@ -20,14 +20,13 @@ FZSSH_SHA256=0c53178298364404e1fe4ce3d50267cf1238e52b414a6a53356bc43b37811338
 # before main()), from gfopentls main a8c6c0e (stubs PR #28 merged)
 GFOPENTLS_REPO=https://github.com/DalsinAI/gfopentls
 GFOPENTLS_COMMIT=a8c6c0e0b4cda1b5de66d64727e0b74d9779f9ab
-# GFOpenWX Toolkit (wxWidgets on GFOpenLayout): main 243629a (#5-#9 and
-# the frame toolbar fix #11 merged), its SDK as Cradle job
-# j20261106T212844-09449f built it (the toolkit's RC2 build).
+# GFOpenWX Toolkit (wxWidgets on GFOpenLayout): main 1c4e5dd, with the
+# shared ARexx port wxARexxPort (#15 merged); its SDK built here.
 WXT_REPO=https://github.com/DalsinAI/gfopenwxtoolkit
-WXT_COMMIT=243629a8ae2272eb3810d6899366bb1e29491bdf
-# that toolkit's SDK as a Cradle job built it (empty: build it here)
-WXT_SDK_JOB=j20261106T212844-09449f
-WXT_SDK_SHA256=8e338fa5bcc118592aed2afb3d8484c5152e29e48c9d8cea0ad17de6afc42469
+WXT_COMMIT=1c4e5dd981a8d3fb7ccb417bd91dd201bd18307d
+# a toolkit SDK a Cradle job built (empty: build it here)
+WXT_SDK_JOB=
+WXT_SDK_SHA256=
 # fpuauto (amicradle-guest common/fpuauto): the FPU when there is one
 FPUAUTO_REPO=https://github.com/DalsinAI/amicradle-guest
 FPUAUTO_COMMIT=462f3a3ccb4cea314e1bb7f7cfaebda266073233
