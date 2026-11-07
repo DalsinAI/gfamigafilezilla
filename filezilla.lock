@@ -20,11 +20,10 @@ FZSSH_SHA256=0c53178298364404e1fe4ce3d50267cf1238e52b414a6a53356bc43b37811338
 # before main()), from the stubs branch (gfopentls PR #28) until it merges
 GFOPENTLS_REPO=https://github.com/DalsinAI/gfopentls
 GFOPENTLS_COMMIT=279460a8f26cbe993b6445daf64ffc9670615bbc
-# GFOpenWX Toolkit (wxWidgets on GFOpenLayout): the ARexx branch (PR #15,
-# wxARexxPort, team3/arexx-port-20261107) on main 9207f7f, until it merges;
-# its SDK built here.
+# GFOpenWX Toolkit (wxWidgets on GFOpenLayout): main 1c4e5dd, with the
+# shared ARexx port wxARexxPort (#15 merged); its SDK built here.
 WXT_REPO=https://github.com/DalsinAI/gfopenwxtoolkit
-WXT_COMMIT=81dd825f66fd7918e8d6bfed5a81c489877484bd
+WXT_COMMIT=1c4e5dd981a8d3fb7ccb417bd91dd201bd18307d
 # a toolkit SDK a Cradle job built (empty: build it here)
 WXT_SDK_JOB=
 WXT_SDK_SHA256=
