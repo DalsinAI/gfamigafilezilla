@@ -24,6 +24,8 @@
 #include <cstdlib>
 #include <memory>
 #include <string>
+#include <cctype>
+#include <unistd.h>
 
 using namespace std::literals;
 
@@ -50,6 +52,7 @@ public:
 		if (getenv("KEX")) params_.kex_ = getenv("KEX");
 		if (getenv("CIPHER")) params_.cipher_ = getenv("CIPHER");
 		params_.single_channel_ = true;
+		say("offering ciphers %s", params_.cipher_);
 		s_ = std::make_unique<fz::socket>(pool_, this);
 		say("connect %s", std::string(a[2]) + ":" + a[3]);
 		if (s_->connect(fz::to_native(std::string(a[2])), std::atoi(a[3]))) fail("connect");
@@ -58,7 +61,7 @@ public:
 	int result{1};
 
 private:
-	void fail(char const* w) { say("FAIL %s", w); result = 2; event_loop_.stop(); }
+	void fail(char const* w) { say("FAIL %s", w); fflush(stdout); _exit(10); }
 	void operator()(fz::event_base const& ev) override {
 		fz::dispatch<fz::socket_event, fz::ssh::auth_done_event, fz::ssh::session_done_event, fz::ssh::hostkey_verification_event,
 			fz::ssh::auth_requested_event, fz::ssh::sftp::sftp_client::ready_event, fz::ssh::sftp::sftp_client::done_event>(ev, this,
@@ -151,7 +154,7 @@ public:
 
 private:
 	fz::socket_interface& ctl() { return ctl_ ? static_cast<fz::socket_interface&>(*ctl_) : *cs_; }
-	void fail(char const* w) { say("FAIL %s", w); result = 2; event_loop_.stop(); }
+	void fail(char const* w) { say("FAIL %s", w); fflush(stdout); _exit(10); }
 	void send(std::string const& s) {
 		say("> %s", s.rfind("PASS", 0) == 0 ? "PASS ****"s : s);
 		std::string l = s + "\r\n"; int e;
@@ -159,7 +162,16 @@ private:
 	}
 	void on_line(std::string const& l) {
 		say("< %s", l);
-		if (l.size() < 4 || l[3] == '-') return;
+		// a reply of several lines runs from "ddd-" to "ddd "
+		bool coded = l.size() >= 4 && isdigit((unsigned char)l[0]) && isdigit((unsigned char)l[1]) && isdigit((unsigned char)l[2]);
+		if (multi_.empty()) {
+			if (!coded) return;
+			if (l[3] == '-') { multi_ = l.substr(0, 3); return; }
+		}
+		else {
+			if (!coded || l.compare(0, 3, multi_) || l[3] != ' ') return;
+			multi_.clear();
+		}
 		int code = std::atoi(l.substr(0, 3).c_str());
 		switch (step_) {
 		case 0:
@@ -272,7 +284,7 @@ private:
 	fz::thread_pool& pool_;
 	fz::tls_system_trust_store& ts_;
 	bool tls_;
-	std::string host_, user_, pass_, file_, in_, info_;
+	std::string host_, user_, pass_, file_, in_, info_, multi_;
 	std::unique_ptr<fz::socket> cs_, ds_;
 	std::unique_ptr<fz::tls_layer> ctl_, dtl_;
 	int step_{};
