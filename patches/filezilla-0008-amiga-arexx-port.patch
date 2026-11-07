@@ -55,8 +55,8 @@ diff -ruN a2/src/interface/Mainfrm.cpp b/src/interface/Mainfrm.cpp
 +#endif
 diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
 --- a/src/interface/amiga_arexx.cpp	1970-01-01 00:00:00.000000000 +0000
-+++ b/src/interface/amiga_arexx.cpp	2026-11-07 10:54:23.915226404 +0000
-@@ -0,0 +1,466 @@
++++ b/src/interface/amiga_arexx.cpp	2026-11-07 11:18:27.552530783 +0000
+@@ -0,0 +1,472 @@
 +// amiga_arexx.cpp - FileZilla's ARexx port FILEZILLA.1 (AmigaOS), on the
 +// toolkit's wxARexxPort (arexx.class; QUIT, ACTIVATE, DEACTIVATE, VERSION
 +// and HELP come with it). FileZilla's own commands:
@@ -170,6 +170,12 @@ diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
 +		if (!loop || loop->DispatchTimeout(50) < 0) {
 +			*closing = true;
 +			return false;
++		}
++		// the engine's notifications are queued events, which the main
++		// loop only handles between dispatches: the connection, listing or
++		// transfer moves on only through these
++		if (wxTheApp) {
++			wxTheApp->ProcessPendingEvents();
 +		}
 +	}
 +}
