@@ -1,0 +1,503 @@
+AmigaOS: the ARexx port FILEZILLA.1 on the toolkit's wxARexxPort (amiga_arexx.cpp,
+taken into Mainfrm.cpp): CONNECT, DISCONNECT, CD, LIST, GET, PUT, STATUS and
+FAULT with FileZilla's error numbers.
+
+diff -ruN a2/src/interface/Mainfrm.cpp b/src/interface/Mainfrm.cpp
+--- a/src/interface/Mainfrm.cpp	2026-11-07 10:18:59.538422894 +0000
++++ b/src/interface/Mainfrm.cpp	2026-11-07 10:48:27.445380147 +0000
+@@ -1,5 +1,10 @@
+ #include "filezilla.h"
+ #include "Mainfrm.h"
++#ifdef __AMIGA__
++void fz_arexx_open(CMainFrame* frame);
++void fz_arexx_closing();
++void fz_arexx_close();
++#endif
+ 
+ #include "aboutdialog.h"
+ #include "asyncrequestqueue.h"
+@@ -527,10 +532,17 @@
+ 	// Delay call to PostInitialize, otherwise macOS gets really confused about the right mouse button...
+ 	startupTimer_.SetOwner(this);
+ 	startupTimer_.Start(1, true);
++#ifdef __AMIGA__
++	// the ARexx port FILEZILLA.1 (amiga_arexx.cpp)
++	fz_arexx_open(this);
++#endif
+ }
+ 
+ CMainFrame::~CMainFrame()
+ {
++#ifdef __AMIGA__
++	fz_arexx_close();
++#endif
+ 	options_.unwatch_all(this);
+ 
+ 	CPowerManagement::Destroy();
+@@ -1422,6 +1434,10 @@
+ 		m_pContextControl->SaveTabs();
+ 	}
+ 
++#ifdef __AMIGA__
++	// no more ARexx work once the engines go
++	fz_arexx_closing();
++#endif
+ 	for (std::vector<CState*>::const_iterator iter = pStates->begin(); iter != pStates->end(); ++iter) {
+ 		CState *pState = *iter;
+ 		if (!pState) {
+@@ -2977,3 +2993,7 @@
+ 		}
+ 	}
+ }
++
++#ifdef __AMIGA__
++#include "amiga_arexx.cpp"
++#endif
+diff -ruN a2/src/interface/amiga_arexx.cpp b/src/interface/amiga_arexx.cpp
+--- a/src/interface/amiga_arexx.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/src/interface/amiga_arexx.cpp	2026-11-07 11:30:33.576891681 +0000
+@@ -0,0 +1,444 @@
++// amiga_arexx.cpp - FileZilla's ARexx port FILEZILLA.1 (AmigaOS), on the
++// toolkit's wxARexxPort (arexx.class; QUIT, ACTIVATE, DEACTIVATE, VERSION
++// and HELP come with it). FileZilla's own commands:
++//
++//   CONNECT URL/A,PORT/K/N,USER/K,PASSWORD/K,TIMEOUT/K/N   waits until logged in
++//   DISCONNECT
++//   CD PATH/A,TIMEOUT/K/N                       RESULT: the new directory
++//   LIST LONG/S,TIMEOUT/K/N                     RESULT: one entry a line
++//   GET FILE/A,TO/K,OVERWRITE/S,NOWAIT/S,TIMEOUT/K/N   into TO or the local directory
++//   PUT FILE/A,OVERWRITE/S,NOWAIT/S,TIMEOUT/K/N        into the remote directory
++//   STATUS                                      RESULT: state, server, directory
++//   FAULT CODE/N/A                              FileZilla's error numbers too
++//
++// Commands run on the main thread. The ones that wait for the server do so
++// in the port's WaitFor (the event loop runs; the port holds other
++// commands back until they answer); the window closing or TIMEOUT seconds
++// (60 for the server, none for a transfer) end the wait. RC 10 with the error number in RC2 when a
++// command fails, RC 20 when FileZilla is closing.
++//
++// Taken into Mainfrm.cpp (#include at its end) so the build needs no new
++// Makefile entries.
++// Copyright (c) 2026 AmiCradle Team
++
++#include <wx/openlayout/arexx.h>
++#include <libfilezilla/local_filesys.hpp>
++#include <memory>
++#include "fzarexx.h"
++
++namespace {
++
++enum : long
++{
++	E_NOTCONNECTED = 1001,
++	E_ADDRESS,
++	E_PASSWORD,
++	E_LOGIN,
++	E_TIMEOUT,
++	E_DIRECTORY,
++	E_NOFILE,
++	E_ISDIR,
++	E_TRANSFER,
++	E_LOCALPATH,
++	E_BUSY,
++	E_EXISTS,
++};
++
++struct
++{
++	long code;
++	char const* text;
++} const rexx_errors[] = {
++	{E_NOTCONNECTED, "Not connected to a server"},
++	{E_ADDRESS, "The server address could not be read"},
++	{E_PASSWORD, "This server needs a PASSWORD"},
++	{E_LOGIN, "Could not connect or log in"},
++	{E_TIMEOUT, "The server did not answer in time"},
++	{E_DIRECTORY, "Could not change to that directory"},
++	{E_NOFILE, "No such file"},
++	{E_ISDIR, "That is a directory"},
++	{E_TRANSFER, "The transfer failed"},
++	{E_LOCALPATH, "Not a local path"},
++	{E_BUSY, "FileZilla is busy with another remote operation"},
++	{E_EXISTS, "The target file is there already (OVERWRITE replaces it)"},
++};
++
++CMainFrame* rexx_frame{};      // NULL once FileZilla is closing
++std::unique_ptr<wxARexxPort> rexx_port;
++int rexx_waiting{};            // commands running the event loop now
++
++CState* rexx_state()
++{
++	return rexx_frame ? CContextManager::Get()->GetCurrentContext() : nullptr;
++}
++
++bool rexx_idle()
++{
++	CState* s = rexx_state();
++	return !s || s->IsRemoteIdle();
++}
++
++bool rexx_transfers_done()
++{
++	CQueueView* q = rexx_frame ? rexx_frame->GetQueue() : nullptr;
++	return !q || q->GetFileCount() == 0;
++}
++
++// The wait's end as the script sees it, through the port's WaitFor (the
++// event loop runs, queued events too; other commands wait their turn):
++// true when ready() said yes; else RC 20 when FileZilla is closing, RC 10
++// with timeout_error in RC2 after timeout_s seconds (0: no limit).
++bool rexx_waited(wxARexxCommand& c, bool (*ready)(), long timeout_s, long timeout_error = E_TIMEOUT)
++{
++	struct counted {
++		counted() { ++rexx_waiting; }
++		~counted() { --rexx_waiting; }
++	} count;
++	long const ms = timeout_s > 0 ? timeout_s * 1000 : 24L * 3600 * 1000;
++	bool const ok = rexx_port && rexx_port->WaitFor(c, [ready] { return !rexx_frame || ready(); }, ms);
++	if (!rexx_frame) {
++		c.SetError(20);
++		return false;
++	}
++	if (!ok) {
++		if (c.m_rc == 10) {
++			c.SetError(10, timeout_error);
++		}
++		return false;
++	}
++	return true;
++}
++
++std::wstring rexx_url(CState* s)
++{
++	// Format gives the protocol's prefix itself (sftp://)
++	return s->GetSite().Format(ServerFormat::with_user_and_optional_port);
++}
++
++// a file in the current remote listing: its size, -1 when not there, -2 a directory
++int64_t rexx_remote_size(CState* s, std::wstring const& name)
++{
++	auto listing = s->GetRemoteDir();
++	if (!listing) {
++		return -1;
++	}
++	for (size_t i = 0; i < listing->size(); ++i) {
++		CDirentry const& e = (*listing)[i];
++		if (e.name == name) {
++			return e.is_dir() ? -2 : e.size;
++		}
++	}
++	return -1;
++}
++
++// connected and not busy with something else, else the error set
++CState* rexx_ready_state(wxARexxCommand& c)
++{
++	CState* s = rexx_state();
++	if (!s || !s->IsRemoteConnected()) {
++		c.SetError(10, E_NOTCONNECTED);
++		return nullptr;
++	}
++	if (!s->IsRemoteIdle()) {
++		c.SetError(10, E_BUSY);
++		return nullptr;
++	}
++	return s;
++}
++
++long const rexx_server_timeout = 60;
++
++// A script cannot answer "The target file already exists": OVERWRITE says
++// what to do, for as long as the command runs (the queue asks the default
++// when the file is there).
++class rexx_overwrite final
++{
++public:
++	rexx_overwrite(bool download, bool overwrite)
++		: download_(download), old_(CDefaultFileExistsDlg::GetDefault(download))
++	{
++		CDefaultFileExistsDlg::SetDefault(download, overwrite ? CFileExistsNotification::overwrite : CFileExistsNotification::skip);
++	}
++	~rexx_overwrite()
++	{
++		CDefaultFileExistsDlg::SetDefault(download_, old_);
++	}
++
++private:
++	bool const download_;
++	CFileExistsNotification::OverwriteAction const old_;
++};
++
++void rexx_add_commands(wxARexxPort& p)
++{
++	p.Add("CONNECT", "URL/A,PORT/K/N,USER/K,PASSWORD/K,TIMEOUT/K/N", [](wxARexxCommand& c) {
++		CState* s = rexx_state();
++		if (!s || !s->engine_) {
++			c.SetError(20);
++			return;
++		}
++		Site site;
++		std::wstring error;
++		CServerPath path;
++		if (!site.ParseUrl(c.Str(0).ToStdWstring(), static_cast<unsigned int>(c.Number(1, 0)),
++				c.Str(2).ToStdWstring(), c.Str(3).ToStdWstring(), error, path))
++		{
++			c.SetError(10, E_ADDRESS);
++			return;
++		}
++		ServerProtocol const proto = site.server.GetProtocol();
++		if (proto == HTTP || proto == HTTPS || proto == S3) {
++			c.SetError(10, E_ADDRESS);
++			return;
++		}
++		if (site.credentials.logonType_ == LogonType::ask || site.credentials.logonType_ == LogonType::interactive) {
++			c.SetError(10, E_PASSWORD);
++			return;
++		}
++		if (!s->Connect(site, path)) {
++			c.SetError(10, E_LOGIN);
++			return;
++		}
++		if (!rexx_waited(c, rexx_idle, c.Number(4, rexx_server_timeout))) {
++			return;
++		}
++		s = rexx_state();
++		if (!s || !s->IsRemoteConnected()) {
++			c.SetError(10, E_LOGIN);
++		}
++	});
++
++	p.Add("DISCONNECT", "", [](wxARexxCommand& c) {
++		CState* s = rexx_state();
++		if (!s || !s->IsRemoteConnected()) {
++			c.SetError(5, E_NOTCONNECTED);
++			return;
++		}
++		s->Disconnect();
++		rexx_waited(c, rexx_idle, rexx_server_timeout);
++	});
++
++	p.Add("CD", "PATH/A,TIMEOUT/K/N", [](wxARexxCommand& c) {
++		std::wstring const dir = c.Str(0).ToStdWstring();
++		CState* s = rexx_ready_state(c);
++		if (!s) {
++			return;
++		}
++		CServerPath want = s->GetRemotePath();
++		if (!want.ChangePath(dir) || !s->ChangeRemoteDir(s->GetRemotePath(), dir)) {
++			c.SetError(10, E_DIRECTORY);
++			return;
++		}
++		if (!rexx_waited(c, rexx_idle, c.Number(1, rexx_server_timeout))) {
++			return;
++		}
++		s = rexx_state();
++		if (!s || !s->IsRemoteConnected()) {
++			c.SetError(10, E_NOTCONNECTED);
++			return;
++		}
++		// the paths' text: the listing's path carries the server's type
++		// (Unix, VMS ...), which the one made here does not yet
++		CServerPath const now = s->GetRemotePath();
++		if (now.GetPath() != want.GetPath()) {
++			// refused, or the server put us elsewhere (a link)
++			c.SetError(now.empty() ? 10 : 5, E_DIRECTORY);
++		}
++		c.SetResult(now.GetPath());
++	});
++
++	p.Add("LIST", "LONG/S,TIMEOUT/K/N", [](wxARexxCommand& c) {
++		bool const lng = c.Switch(0);
++		if (!rexx_waited(c, rexx_idle, c.Number(1, rexx_server_timeout))) {
++			return;
++		}
++		CState* s = rexx_state();
++		if (!s || !s->IsRemoteConnected()) {
++			c.SetError(10, E_NOTCONNECTED);
++			return;
++		}
++		auto listing = s->GetRemoteDir();
++		if (!listing) {
++			c.SetError(10, E_DIRECTORY);
++			return;
++		}
++		std::wstring out;
++		for (size_t i = 0; i < listing->size(); ++i) {
++			CDirentry const& e = (*listing)[i];
++			if (!out.empty()) {
++				out += L'\n';
++			}
++			if (lng) {
++				out += e.is_dir() ? std::wstring(L"DIR") : std::to_wstring(e.size);
++				out += L' ';
++			}
++			out += e.name;
++			if (e.is_dir()) {
++				out += L'/';
++			}
++		}
++		c.SetResult(out);
++	});
++
++	p.Add("GET", "FILE/A,TO/K,OVERWRITE/S,NOWAIT/S,TIMEOUT/K/N", [](wxARexxCommand& c) {
++		std::wstring const name = c.Str(0).ToStdWstring();
++		std::wstring const to = c.Str(1).ToStdWstring();
++		bool const overwrite = c.Switch(2);
++		CState* s = rexx_ready_state(c);
++		if (!s) {
++			return;
++		}
++		int64_t const size = rexx_remote_size(s, name);
++		if (size == -2) {
++			c.SetError(10, E_ISDIR);
++			return;
++		}
++		if (size == -1) {
++			c.SetError(10, E_NOFILE);
++			return;
++		}
++		CLocalPath local = s->GetLocalDir();
++		if (!to.empty() && !local.SetPath(to)) {
++			c.SetError(10, E_LOCALPATH);
++			return;
++		}
++		std::wstring const target = local.GetPath() + name;
++		if (!overwrite && fz::local_filesys::get_file_type(fz::to_native(target)) != fz::local_filesys::unknown) {
++			c.SetError(10, E_EXISTS);
++			return;
++		}
++		rexx_overwrite const policy(true, overwrite);
++		CQueueView* q = rexx_frame->GetQueue();
++		if (!q || !q->QueueFile(false, true, name, name, local, s->GetRemotePath(), s->GetSite(), size)) {
++			c.SetError(10, E_TRANSFER);
++			return;
++		}
++		q->QueueFile_Finish(true);
++		if (c.Switch(3)) {
++			// NOWAIT: the queue asks the default when it gets there
++			return;
++		}
++		if (!rexx_waited(c, rexx_transfers_done, c.Number(4, 0))) {
++			return;
++		}
++		if (fz::local_filesys::get_size(fz::to_native(target)) != size) {
++			c.SetError(10, E_TRANSFER);
++		}
++	});
++
++	p.Add("PUT", "FILE/A,OVERWRITE/S,NOWAIT/S,TIMEOUT/K/N", [](wxARexxCommand& c) {
++		std::wstring const file = c.Str(0).ToStdWstring();
++		bool const overwrite = c.Switch(1);
++		CState* s = rexx_ready_state(c);
++		if (!s) {
++			return;
++		}
++		// a name without a volume is in FileZilla's local directory
++		std::wstring const full = file.find(':') == std::wstring::npos ? s->GetLocalDir().GetPath() + file : file;
++		CLocalPath local;
++		std::wstring name;
++		if (!local.SetPath(full, &name) || name.empty()) {
++			c.SetError(10, E_LOCALPATH);
++			return;
++		}
++		int64_t const size = fz::local_filesys::get_size(fz::to_native(full));
++		if (size < 0) {
++			c.SetError(10, E_NOFILE);
++			return;
++		}
++		if (!overwrite && rexx_remote_size(s, name) != -1) {
++			c.SetError(10, E_EXISTS);
++			return;
++		}
++		rexx_overwrite const policy(false, overwrite);
++		CQueueView* q = rexx_frame->GetQueue();
++		if (!q || !q->QueueFile(false, false, name, name, local, s->GetRemotePath(), s->GetSite(), size)) {
++			c.SetError(10, E_TRANSFER);
++			return;
++		}
++		q->QueueFile_Finish(true);
++		if (c.Switch(2)) {
++			return;
++		}
++		long const timeout = c.Number(3, 0);
++		if (!rexx_waited(c, rexx_transfers_done, timeout)) {
++			return;
++		}
++		// the server's own listing says whether it all arrived
++		s = rexx_state();
++		if (!s || !s->RefreshRemote()) {
++			c.SetError(10, E_TRANSFER);
++			return;
++		}
++		if (!rexx_waited(c, rexx_idle, rexx_server_timeout)) {
++			return;
++		}
++		s = rexx_state();
++		if (!s || rexx_remote_size(s, name) != size) {
++			c.SetError(10, E_TRANSFER);
++		}
++	});
++
++	p.Add("STATUS", "", [](wxARexxCommand& c) {
++		CState* s = rexx_state();
++		if (!s || !s->GetSite()) {
++			c.SetResult("DISCONNECTED");
++			return;
++		}
++		bool const connected = s->IsRemoteConnected();
++		std::wstring r = connected ? L"CONNECTED" : L"CONNECTING";
++		r += !rexx_transfers_done() ? L" TRANSFERRING" : (s->IsRemoteIdle() ? L" IDLE" : L" BUSY");
++		r += L' ' + rexx_url(s);
++		if (connected) {
++			r += L' ' + s->GetRemotePath().GetPath();
++		}
++		c.SetResult(r);
++	});
++
++	// the toolkit's FAULT, with FileZilla's own numbers first
++	p.Add("FAULT", "CODE/N/A", [](wxARexxCommand& c) {
++		long const code = c.Number(0);
++		for (auto const& e : rexx_errors) {
++			if (e.code == code) {
++				c.SetResult(e.text);
++				return;
++			}
++		}
++		char buf[128];
++		fz_rexx_fault(code, buf, sizeof buf);
++		c.SetResult(wxString(buf, wxConvISO8859_1));
++	});
++}
++
++} // namespace
++
++// at the end of CMainFrame's constructor
++void fz_arexx_open(CMainFrame* frame)
++{
++	if (rexx_port) {
++		return;
++	}
++	rexx_frame = frame;
++	auto port = std::make_unique<wxARexxPort>("FILEZILLA", L"FileZilla " + GetFileZillaEngineVersion());
++	rexx_add_commands(*port);
++	if (port->Open()) {
++		rexx_port = std::move(port);
++	}
++}
++
++// when FileZilla starts closing: commands still waiting answer RC 20, new
++// ones find no state to work on
++void fz_arexx_closing()
++{
++	rexx_frame = nullptr;
++}
++
++// in CMainFrame's destructor: the port goes, unless a command is still on
++// its way out of a wait (the frame went inside it): then at exit
++void fz_arexx_close()
++{
++	rexx_frame = nullptr;
++	if (!rexx_waiting) {
++		rexx_port.reset();
++	}
++}

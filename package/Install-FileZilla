@@ -21,9 +21,10 @@
     (help @copyfiles-help)
     (source "")
     (dest #drawer)
-    (pattern "~(Install-FileZilla#?|FileZilla-drawer.info|Libs)")
+    (pattern "~(Install-FileZilla#?|FileZilla-drawer.info|Libs|Rexx)")
     (infos))
 (copyfiles (source "resources") (dest (tackon #drawer "resources")) (all))
+(copyfiles (source "Rexx") (dest (tackon #drawer "Rexx")) (all))
 
 ; GFOpenTLS and GFOpenCrypto: FileZilla's FTPS and SFTP; into LIBS: when
 ; the ones there are missing or older
