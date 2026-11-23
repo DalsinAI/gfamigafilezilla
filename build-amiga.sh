@@ -10,6 +10,8 @@
 # Copyright (c) 2026 AmiCradle Team
 set -eu
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# DalsinAI's private repositories from the git mirror where there is one (GF-88)
+. "$HERE/scripts/git-mirror.sh"
 . "$HERE/filezilla.lock"
 STOVE=${STOVE:-"$HOME/AmiCradle/stoves/os32-gcc16-open6"}
 # the work tree outside the checkout: Cradle cleans the checkout before each job
